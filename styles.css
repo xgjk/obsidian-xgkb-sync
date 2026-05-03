@@ -1,0 +1,28 @@
+/* XGKB Sync Plugin Styles */
+
+.xgkb-sync-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 4px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.xgkb-sync-status.syncing {
+  color: var(--text-accent);
+}
+
+.xgkb-sync-status.error {
+  color: var(--text-error);
+}
+
+.xgkb-settings-button-group {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.xgkb-settings .setting-item-description {
+  white-space: pre-line;
+}

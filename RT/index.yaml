@@ -1,0 +1,14 @@
+version: 1
+last_updated_at: 2026-05-03T21:10:00+0800
+
+items:
+  - id: RT-001
+    title: Obsidian 玄关知识库双向同步插件 MVP
+    type: Feature
+    status: planning
+    created_at: 2026-04-30T15:09:00+0800
+  - id: RT-002
+    title: 同步引擎增强 - 自动同步/附件/多空间
+    type: Feature
+    status: backlog
+    created_at: 2026-04-30T23:35:00+0800

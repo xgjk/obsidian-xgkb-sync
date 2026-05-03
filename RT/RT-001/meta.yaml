@@ -1,0 +1,113 @@
+title: Obsidian 玄关知识库双向同步插件 MVP
+type: Feature
+status: planning
+created_at: 2026-04-30T15:09:00+0800
+updated_at: 2026-05-03T21:10:00+0800
+assignee: Codex
+reporter: Evan
+
+# Intake 信息
+intake:
+  trigger: Evan 在 Discord 提出需求
+  context:
+    - 参考项目：Remotely Save（Obsidian 社区插件）
+    - 外部 API：玄关知识库 Open API（<https://github.com/xgjk/dev-guide/>）
+  raw_requirement: |
+    开发 Obsidian 插件，实现 Obsidian 与玄关知识库之间的双向同步。
+    - 同步方向：双向
+    - 同步范围：Obsidian 指定文件夹 ↔ 玄关指定项目空间的指定目录
+    - 支持各客户端（桌面 + 移动端）
+    - 格式以 Obsidian Markdown 为准
+    - 参考 Remotely Save 插件形式和实现
+    - appKey: 已提供
+
+# 需求分析
+analysis:
+  product_context:
+    - 玄关知识库是玄关健康的内部文档管理平台
+    - 有完整的 Open API（目录浏览、文件读写、搜索、上传）
+    - 认证方式：Header appKey
+    - Base URL: https://sg-al-cwork-web.mediportal.com.cn/open-api/
+  
+  technical_constraints:
+    - Obsidian 插件必须是 TypeScript
+    - 需要兼容 Obsidian 桌面端和移动端
+    - Obsidian 移动端有 50MB 文件限制
+    - 玄关 API 的文件内容获取返回 Markdown（天然兼容）
+  
+  risks:
+    - getFullFileContent 更新后有约 10s 延迟（RAG 索引缓存），需用 getDownloadInfo→downloadUrl 读取最新内容
+    - 双向同步冲突处理复杂度
+    - Obsidian 特殊语法（wiki-links、frontmatter）在玄关端的兼容性
+
+# API 实测结论（2026-05-03）
+api_validation:
+  date: 2026-05-03
+  status: all_core_apis_working
+  
+  verified_apis:
+    - name: 认证 (appKey Header)
+      status: OK
+      note: 之前 401 问题已修复
+    
+    - name: uploadContent (新建)
+      endpoint: POST /document-database/file/uploadContent
+      status: OK
+      note: 立即可读，返回 fileId/downloadUrl
+    
+    - name: uploadContent (更新 - updateFileId 模式)
+      endpoint: POST /document-database/file/uploadContent
+      status: OK
+      note: v1.13(2026-04-22) 新增，传 updateFileId 切换为版本更新模式。创建新版本记录，10s 内 getFullFileContent 生效，downloadUrl 立即生效
+    
+    - name: getFullFileContent
+      endpoint: GET /document-database/file/getFullFileContent?fileId={id}
+      status: OK
+      note: 官方确认双写缓存已跑通，所写即所读，新建/更新后立即可读。可能有 Page X of Y 尾部标记需清理
+    
+    - name: getDownloadInfo
+      endpoint: GET /document-database/file/getDownloadInfo?fileId={id}
+      status: OK
+      note: 返回下载链接和预览链接，同步场景不使用（直接用 getFullFileContent）
+    
+    - name: getChildFiles
+      endpoint: GET /document-database/file/getChildFiles?parentId={id}
+      status: OK
+      note: type=1 文件夹, type=2 文件，结构清晰
+    
+    - name: getLevel1Folders
+      endpoint: GET /document-database/file/getLevel1Folders?projectId={id}
+      status: OK
+    
+    - name: searchFile
+      endpoint: GET /document-database/file/searchFile
+      status: OK
+    
+    - name: deleteFile
+      endpoint: POST /document-database/file/deleteFile
+      status: OK
+    
+    - name: getVersionList / getLastVersion
+      status: OK
+    
+    - name: saveFileByParentId
+      endpoint: POST /document-database/file/saveFileByParentId
+      status: OK
+      note: 需传 projectId，同名文件报错（不幂等）
+    
+    - name: saveFileByPath
+      endpoint: POST /document-database/file/saveFileByPath
+      status: OK
+      note: 需传 projectId + path + name，同名报错
+
+  known_issues:
+    - updateFileVersion (4.25) 是底层重型 resourceId 物理分片逻辑，纯文本不需要。改用轻量级 uploadContent(updateFileId)
+    - batchGetContent 返回 no permission → 不使用
+    - saveFileByParentId/Path 同名报错 → uploadContent 不传 updateFileId 时每次新建（同步时需要先检查是否存在）
+
+  best_practices:
+    source: 官方确认（2026-05-03）
+    rules:
+      - 纯文本一律使用 uploadContent 轻量高速通道，不要走底层 resourceId 物理分片逻辑
+      - 更新已有文件务必传 updateFileId
+      - 读取用 getFullFileContent，双写缓存已跑通，所写即所读，无需 sleep

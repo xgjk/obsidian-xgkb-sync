@@ -1,0 +1,6 @@
+id: RT-002
+title: 同步引擎重构 - 完整双向同步机制
+type: Feature
+status: intaking
+created_at: 2026-04-30T23:35:00+0800
+profile: spec-lite
