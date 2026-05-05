@@ -74,3 +74,18 @@ export interface SyncStats {
 }
 
 export type ProgressCallback = (msg: string) => void;
+
+/** batchGetContent（4.15）请求项 */
+export interface BatchGetContentFileRef {
+	fileId: string;
+	relationId?: string;
+	fileType?: string;
+}
+
+/** batchGetContent 单项响应（文档 FileContentVO） */
+export interface FileContentVO {
+	fileId: string | number;
+	content: string | null;
+	status: string;
+	message?: string | null;
+}

@@ -49,7 +49,7 @@ export default class XgkbSyncPlugin extends Plugin {
 
 		new Notice("XGKB Sync: 开始同步...");
 		const db = new SyncStateDb();
-		let syncing = true;
+		let dbOpened = false;
 
 		try {
 			const dbResult = await db.open();
@@ -57,6 +57,7 @@ export default class XgkbSyncPlugin extends Plugin {
 				new Notice(`XGKB Sync: 数据库打开失败 - ${dbResult.error}`);
 				return;
 			}
+			dbOpened = true;
 
 			const api = new XgkbApi(this.settings.serverUrl, this.settings.appKey);
 			const fsLocal = new FsLocal(this.app, this.settings.syncFolder);
@@ -66,8 +67,6 @@ export default class XgkbSyncPlugin extends Plugin {
 			const stats = await engine.runSync((msg) => {
 				// 进度通知（静默更新）
 			});
-
-			syncing = false;
 
 			// 结果通知
 			const lines: string[] = [];
@@ -90,7 +89,7 @@ export default class XgkbSyncPlugin extends Plugin {
 			console.error("[XGKB Sync] 同步异常:", msg);
 			new Notice(`XGKB Sync 同步失败: ${msg}`, 8000);
 		} finally {
-			if (syncing) db.close();
+			if (dbOpened) db.close();
 		}
 	}
 }

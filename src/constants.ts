@@ -20,7 +20,12 @@ export const API_PATHS = {
 	getVersionList: "document-database/file/getVersionList",
 	getPersonalProjectId: "document-database/project/personal/getProjectId",
 	getProjectList: "document-database/project/list",
+	/** 见《03-AI与纯文本高速通道》4.15，建议单次不超过 10 个文件 */
+	batchGetContent: "document-database/ai/batchGetContent",
 } as const;
+
+/** batchGetContent 单次请求最大文件数（与官方文档一致） */
+export const BATCH_GET_CONTENT_MAX = 10;
 
 export const DB_NAME = "xgkb-sync-state";
 export const DB_VERSION = 1;

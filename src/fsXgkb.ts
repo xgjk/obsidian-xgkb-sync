@@ -1,6 +1,7 @@
 import { XgkbApi } from "./xgkbApi";
 import type { FileEntry, Result, XgkbFileVO } from "./types";
-import { cleanContent } from "./constants";
+import { BATCH_GET_CONTENT_MAX, cleanContent } from "./constants";
+import { sanitizePathSegment } from "./pathSanitize";
 
 /**
  * 云端文件系统操作（XGKB API 封装）
@@ -100,7 +101,8 @@ export class FsXgkb {
 				// 文件：只处理 .md
 				if (!item.name.endsWith(".md")) continue;
 				if (item.fileType && item.fileType !== "file") continue;
-				const relativePath = prefix ? `${prefix}/${item.name}` : item.name;
+				const seg = sanitizePathSegment(item.name);
+				const relativePath = prefix ? `${prefix}/${seg}` : seg;
 				entries.push({
 					path: relativePath,
 					name: item.name,
@@ -109,8 +111,9 @@ export class FsXgkb {
 					xgkbFolderId: item.parentId,
 				});
 			} else if (item.type === 1 && item.hasChild) {
-				// 文件夹：递归
-				const subPrefix = prefix ? `${prefix}/${item.name}` : item.name;
+				// 文件夹：递归（路径键与本地 Vault 合法名一致，与 FsLocal.resolve 规则相同）
+				const seg = sanitizePathSegment(item.name);
+				const subPrefix = prefix ? `${prefix}/${seg}` : seg;
 				const err = await this.collectMdFiles(item.id, subPrefix, entries);
 				if (err) return err;
 			}
@@ -126,6 +129,37 @@ export class FsXgkb {
 		if (!result.ok) return result;
 		// 清理尾部 "Page X of Y" 标记
 		return { ok: true, value: cleanContent(result.value) };
+	}
+
+	/**
+	 * 批量预取全文（4.15 `batchGetContent`）。
+	 * 不限个人空间，凭 fileId 与 appKey 权限拉取；建议每批不超过 {@link BATCH_GET_CONTENT_MAX} 个。
+	 * 若某项未命中或非 success，调用方应回退 {@link readFile}。
+	 */
+	async readFilesBatch(fileIds: string[]): Promise<Map<string, string>> {
+		const out = new Map<string, string>();
+		const unique = [...new Set(fileIds.filter(Boolean))];
+		for (let i = 0; i < unique.length; i += BATCH_GET_CONTENT_MAX) {
+			const chunk = unique.slice(i, i + BATCH_GET_CONTENT_MAX);
+			const r = await this.api.batchGetContent(chunk.map((fileId) => ({ fileId })));
+			if (!r.ok) {
+				console.warn("[XGKB Sync] batchGetContent 失败，未命中项将回退单文件拉取:", r.error);
+				continue;
+			}
+			let mergedThisChunk = 0;
+			for (const row of r.value || []) {
+				const id = String(row.fileId);
+				if (row.status === "success" && row.content != null) {
+					out.set(id, cleanContent(row.content));
+					mergedThisChunk++;
+				}
+			}
+			// Obsidian 的 requestUrl 通常不会出现在侧边栏开发者工具 Network 里，用本日志确认请求已发出并已返回
+			console.log(
+				`[XGKB Sync] batchGetContent 已返回: 本批 ${chunk.length} 个 fileId，接口响应 ${r.value?.length ?? 0} 条，可用正文 ${mergedThisChunk} 条`
+			);
+		}
+		return out;
 	}
 
 	/**

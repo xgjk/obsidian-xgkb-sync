@@ -1,5 +1,12 @@
 import { requestUrl, type RequestUrlParam } from "obsidian";
-import type { XgkbFileVO, UploadContentResult, UpdateFileResult, Result } from "./types";
+import type {
+	XgkbFileVO,
+	UploadContentResult,
+	UpdateFileResult,
+	Result,
+	FileContentVO,
+	BatchGetContentFileRef,
+} from "./types";
 import { API_PATHS, MAX_RETRIES, RETRY_BASE_DELAY_MS } from "./constants";
 
 /**
@@ -30,6 +37,7 @@ export class XgkbApi {
 	): Promise<Result<T>> {
 		const baseUrl = this.serverUrl + apiPath;
 		const options: RequestUrlParam = {
+			url: baseUrl,
 			method,
 			headers: {
 				"Content-Type": "application/json",
@@ -106,6 +114,14 @@ export class XgkbApi {
 	/** 读取文件全文（所写即所读，双写缓存已跑通） */
 	async getFullFileContent(fileId: string): Promise<Result<string>> {
 		return this.request<string>("GET", API_PATHS.getFullFileContent, { fileId });
+	}
+
+	/**
+	 * 批量获取多个文件的提纯全文（4.15）
+	 * 不限于个人空间，凭 fileId 与 appKey 权限拉取；建议单次 ≤10 个文件。
+	 */
+	async batchGetContent(files: BatchGetContentFileRef[]): Promise<Result<FileContentVO[]>> {
+		return this.request<FileContentVO[]>("POST", API_PATHS.batchGetContent, { files });
 	}
 
 	/**

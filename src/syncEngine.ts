@@ -73,7 +73,8 @@ export class SyncEngine {
 		const allPaths = new Set<string>([...localMap.keys(), ...remoteMap.keys()]);
 		prog(`共 ${allPaths.size} 个路径需要处理`);
 
-		// Step 5: 逐文件决策
+		// Step 5a: 逐路径决策（先不算执行）
+		const plans: SyncPlan[] = [];
 		let idx = 0;
 		for (const path of allPaths) {
 			idx++;
@@ -82,25 +83,43 @@ export class SyncEngine {
 			const record = await this.db.get(path);
 
 			if (idx % 50 === 0 || idx === allPaths.size) {
-				prog(`处理中 ${idx}/${allPaths.size}...`);
+				prog(`决策中 ${idx}/${allPaths.size}...`);
 			}
 
-			await this.syncOne(path, local, remote, record);
+			const op = this.decide(path, local, remote, record);
+			plans.push({ path, local, remote, record, op });
+		}
+
+		// Step 5b: 下载类操作批量预取正文（4.15 batchGetContent），减少往返
+		const downloadFileIds: string[] = [];
+		for (const p of plans) {
+			if (p.op === "download-new" || p.op === "download-update") {
+				const id = p.remote?.xgkbFileId;
+				if (id) downloadFileIds.push(id);
+			}
+		}
+		if (downloadFileIds.length > 0) {
+			prog(`批量拉取正文 ${downloadFileIds.length} 个文件...`);
+		}
+		const contentCache = await this.fsXgkb.readFilesBatch(downloadFileIds);
+
+		// Step 5c: 按原计划顺序执行（保证删除/上传等与下载顺序可控）
+		idx = 0;
+		for (const plan of plans) {
+			idx++;
+			if (idx % 50 === 0 || idx === plans.length) {
+				prog(`处理中 ${idx}/${plans.length}...`);
+			}
+			await this.executePlan(plan, contentCache);
 		}
 
 		prog(`完成: ↑${this.stats.uploaded} ↓${this.stats.downloaded} ✗${this.stats.deleted} ✗fail:${this.stats.failed} ∅${this.stats.skipped}`);
 		return this.stats;
 	}
 
-	private async syncOne(
-		path: string,
-		local: FileEntry | undefined,
-		remote: FileEntry | undefined,
-		record: SyncStateRecord | undefined
-	): Promise<void> {
+	private async executePlan(plan: SyncPlan, contentCache: Map<string, string>): Promise<void> {
+		const { path, local, remote, record, op } = plan;
 		try {
-			const op = this.decide(path, local, remote, record);
-
 			switch (op) {
 				case "upload-new":
 					await this.doUploadNew(path, local!);
@@ -109,10 +128,10 @@ export class SyncEngine {
 					await this.doUploadUpdate(path, local!, record!);
 					break;
 				case "download-new":
-					await this.doDownloadNew(path, remote!);
+					await this.doDownloadNew(path, remote!, contentCache);
 					break;
 				case "download-update":
-					await this.doDownloadUpdate(path, remote!, record!);
+					await this.doDownloadUpdate(path, remote!, record!, contentCache);
 					break;
 				case "delete-local":
 					await this.doDeleteLocal(path, record!);
@@ -247,11 +266,18 @@ export class SyncEngine {
 		this.progress(`↑ ${path}`);
 	}
 
-	private async doDownloadNew(path: string, remote: FileEntry): Promise<void> {
-		const contentResult = await this.fsXgkb.readFile(remote.xgkbFileId!);
-		if (!contentResult.ok) throw new Error(`下载失败: ${contentResult.error}`);
+	private async doDownloadNew(path: string, remote: FileEntry, contentCache: Map<string, string>): Promise<void> {
+		const fid = remote.xgkbFileId!;
+		let body: string;
+		if (contentCache.has(fid)) {
+			body = contentCache.get(fid)!;
+		} else {
+			const contentResult = await this.fsXgkb.readFile(fid);
+			if (!contentResult.ok) throw new Error(`下载失败: ${contentResult.error}`);
+			body = contentResult.value;
+		}
 
-		const actualMtime = await this.fsLocal.writeFile(path, contentResult.value);
+		const actualMtime = await this.fsLocal.writeFile(path, body);
 		await this.db.put({
 			localPath: path,
 			xgkbFileId: remote.xgkbFileId!,
@@ -265,11 +291,23 @@ export class SyncEngine {
 		this.progress(`↓ ${path}`);
 	}
 
-	private async doDownloadUpdate(path: string, remote: FileEntry, record: SyncStateRecord): Promise<void> {
-		const contentResult = await this.fsXgkb.readFile(remote.xgkbFileId!);
-		if (!contentResult.ok) throw new Error(`下载失败: ${contentResult.error}`);
+	private async doDownloadUpdate(
+		path: string,
+		remote: FileEntry,
+		record: SyncStateRecord,
+		contentCache: Map<string, string>
+	): Promise<void> {
+		const fid = remote.xgkbFileId!;
+		let body: string;
+		if (contentCache.has(fid)) {
+			body = contentCache.get(fid)!;
+		} else {
+			const contentResult = await this.fsXgkb.readFile(fid);
+			if (!contentResult.ok) throw new Error(`下载失败: ${contentResult.error}`);
+			body = contentResult.value;
+		}
 
-		const actualMtime = await this.fsLocal.writeFile(path, contentResult.value);
+		const actualMtime = await this.fsLocal.writeFile(path, body);
 		await this.db.put({
 			...record,
 			localMtime: actualMtime,
@@ -299,3 +337,11 @@ export class SyncEngine {
 }
 
 type SyncOp = "upload-new" | "upload-update" | "download-new" | "download-update" | "delete-local" | "delete-remote" | "skip";
+
+type SyncPlan = {
+	path: string;
+	local: FileEntry | undefined;
+	remote: FileEntry | undefined;
+	record: SyncStateRecord | undefined;
+	op: SyncOp;
+};
