@@ -6,10 +6,15 @@ export const DEFAULT_SETTINGS: XgkbPluginSettings = {
 	syncFolder: "",   // 空=同步整个 Vault
 	targetFolderName: "Obsidian",
 	syncDirection: "bidirectional",
+	autoSyncInterval: 0, // 默认关闭
 };
 
 export const API_PATHS = {
 	getChildFiles: "document-database/file/getChildFiles",
+	listDescendantFiles: "document-database/file/listDescendantFiles",
+	listChanges: "document-database/file/listChanges",
+	batchGetMeta: "document-database/file/batchGetMeta",
+	createFolder: "document-database/file/createFolder",
 	getDownloadInfo: "document-database/file/getDownloadInfo",
 	getFileContent: "document-database/file/getFileContent",
 	getFullFileContent: "document-database/file/getFullFileContent",
@@ -26,6 +31,12 @@ export const API_PATHS = {
 
 /** batchGetContent 单次请求最大文件数（与官方文档一致） */
 export const BATCH_GET_CONTENT_MAX = 10;
+
+/** batchGetMeta 单次请求最大文件数 */
+export const BATCH_GET_META_MAX = 50;
+
+/** listChanges 安全回拨窗口（毫秒）：since 往前多看 5 秒，防时钟偏差漏变更 */
+export const CHANGES_SAFETY_WINDOW_MS = 5000;
 
 export const DB_NAME = "xgkb-sync-state";
 export const DB_VERSION = 1;

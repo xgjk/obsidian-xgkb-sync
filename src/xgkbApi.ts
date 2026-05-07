@@ -6,6 +6,9 @@ import type {
 	Result,
 	FileContentVO,
 	BatchGetContentFileRef,
+	XgkbListDescendantFilesData,
+	XgkbListChangesData,
+	XgkbMetaItem,
 } from "./types";
 import { API_PATHS, MAX_RETRIES, RETRY_BASE_DELAY_MS } from "./constants";
 
@@ -100,6 +103,29 @@ export class XgkbApi {
 		return this.request<XgkbFileVO[]>("GET", API_PATHS.getChildFiles, params);
 	}
 
+	/** 子树扁平列举（4.21） */
+	async listDescendantFiles(params: {
+		rootFileId: string;
+		projectId?: string;
+		suffix?: string;
+		cursor?: string;
+		limit?: number;
+		includePath?: boolean;
+	}): Promise<Result<XgkbListDescendantFilesData>> {
+		return this.request<XgkbListDescendantFilesData>("GET", API_PATHS.listDescendantFiles, params);
+	}
+
+	/** 增量变更列表（4.22） */
+	async listChanges(params: {
+		projectId?: string;
+		rootFileId?: string;
+		since?: number;
+		cursor?: string;
+		limit?: number;
+	}): Promise<Result<XgkbListChangesData>> {
+		return this.request<XgkbListChangesData>("GET", API_PATHS.listChanges, params);
+	}
+
 	/** 搜索文件 */
 	async searchFile(nameKey: string): Promise<Result<XgkbFileVO[]>> {
 		const r = await this.request<{ folders: XgkbFileVO[]; files: XgkbFileVO[] }>(
@@ -122,6 +148,11 @@ export class XgkbApi {
 	 */
 	async batchGetContent(files: BatchGetContentFileRef[]): Promise<Result<FileContentVO[]>> {
 		return this.request<FileContentVO[]>("POST", API_PATHS.batchGetContent, { files });
+	}
+
+	/** 批量元数据（4.23） */
+	async batchGetMeta(fileIds: string[], projectId?: string): Promise<Result<XgkbMetaItem[]>> {
+		return this.request<XgkbMetaItem[]>("POST", API_PATHS.batchGetMeta, { fileIds, projectId });
 	}
 
 	/**
@@ -148,6 +179,19 @@ export class XgkbApi {
 		const r = await this.request<boolean>("POST", API_PATHS.deleteFile, { fileId });
 		if (!r.ok) return r;
 		return { ok: true, value: true };
+	}
+
+	/** 显式创建空目录（4.24） */
+	async createFolder(params: {
+		projectId: string;
+		parentId: string;
+		name: string;
+		cover?: boolean;
+		autoRename?: boolean;
+	}): Promise<Result<string>> {
+		const r = await this.request<string | number>("POST", API_PATHS.createFolder, params);
+		if (!r.ok) return r;
+		return { ok: true, value: String(r.value) };
 	}
 
 	/** 获取版本列表（调试用） */

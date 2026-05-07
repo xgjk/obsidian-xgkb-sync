@@ -86,6 +86,25 @@ export class XgkbPluginSettingTab extends PluginSettingTab {
 					})
 			);
 
+		new Setting(containerEl)
+			.setName("自动同步间隔")
+			.setDesc("定期自动执行同步，关闭则仅手动触发")
+			.addDropdown((dropdown) =>
+				dropdown
+					.addOption("0",  "关闭（手动同步）")
+					.addOption("5",  "每 5 分钟")
+					.addOption("10", "每 10 分钟")
+					.addOption("30", "每 30 分钟")
+					.addOption("60", "每 1 小时")
+					.addOption("120", "每 2 小时")
+					.setValue(String(this.plugin.settings.autoSyncInterval))
+					.onChange(async (value) => {
+						this.plugin.settings.autoSyncInterval = Number(value);
+						await this.plugin.saveSettings();
+						this.plugin.scheduleAutoSync();
+					})
+			);
+
 		// 按钮组
 		const btnGroup = containerEl.createDiv({ cls: "xgkb-settings-button-group" });
 		btnGroup.style.display = "flex";

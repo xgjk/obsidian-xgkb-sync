@@ -1,6 +1,6 @@
 import { XgkbApi } from "./xgkbApi";
-import type { FileEntry, Result, XgkbFileVO } from "./types";
-import { BATCH_GET_CONTENT_MAX, cleanContent } from "./constants";
+import type { FileEntry, Result, XgkbFileVO, XgkbChangeItem, XgkbMetaItem } from "./types";
+import { BATCH_GET_CONTENT_MAX, BATCH_GET_META_MAX, cleanContent } from "./constants";
 import { sanitizePathSegment } from "./pathSanitize";
 
 /**
@@ -8,6 +8,7 @@ import { sanitizePathSegment } from "./pathSanitize";
  */
 export class FsXgkb {
 	private rootId: string | null = null;
+	private projectId: string | null = null;
 
 	constructor(
 		private api: XgkbApi,
@@ -18,9 +19,13 @@ export class FsXgkb {
 		return this.rootId;
 	}
 
+	getProjectId(): string | null {
+		return this.projectId;
+	}
+
 	/**
 	 * 初始化：获取 Obsidian 文件夹 ID
-	 * 如果不存在，通过 uploadContent 创建占位文件来自动创建 Obsidian 文件夹
+	 * 如果不存在，使用 createFolder 显式创建
 	 */
 	async init(): Promise<Result<string>> {
 		// 1. 获取 projectId
@@ -29,6 +34,8 @@ export class FsXgkb {
 			return { ok: false, error: `获取 projectId 失败: ${projectResult.error}` };
 		}
 		const projectId = projectResult.value;
+		this.projectId = projectId;
+		console.log(`[XGKB Sync] init: projectId=${projectId}`);
 
 		// 2. 获取一级目录，找 Obsidian 文件夹
 		const foldersResult = await this.api.getLevel1Folders(projectId);
@@ -40,85 +47,70 @@ export class FsXgkb {
 
 		if (target) {
 			this.rootId = target.id;
+			console.log(`[XGKB Sync] init: 找到同步根目录 "${this.targetFolderName}" rootId=${target.id}`);
 			return { ok: true, value: target.id };
 		}
 
-		// 3. Obsidian 文件夹不存在，创建占位文件来自动创建
-		const createResult = await this.api.uploadContent({
-			content: "# XGKB Sync\n\n此文件由 XGKB Sync 插件自动创建，用于初始化同步目录。",
-			fileName: ".xgkb-sync-init.md",
-			fileSuffix: "md",
-			folderName: this.targetFolderName,
+		// 3. Obsidian 文件夹不存在，显式创建；createFolder 直接返回新目录的 fileId
+		console.log(`[XGKB Sync] init: 未找到 "${this.targetFolderName}"，调用 createFolder 新建...`);
+		const createResult = await this.api.createFolder({
+			projectId,
+			parentId: "0",
+			name: this.targetFolderName,
 		});
 
 		if (!createResult.ok) {
 			return { ok: false, error: `创建 Obsidian 目录失败: ${createResult.error}` };
 		}
 
-		// 4. 重新获取目录列表
-		const foldersResult2 = await this.api.getLevel1Folders(projectId);
-		if (!foldersResult2.ok) {
-			return { ok: false, error: `重新获取目录失败: ${foldersResult2.error}` };
-		}
-		const target2 = (foldersResult2.value || []).find(
-			(f) => f.name === this.targetFolderName && f.type === 1
-		);
-		if (!target2) {
-			return { ok: false, error: "目录创建后仍未找到 Obsidian 文件夹" };
-		}
-
-		this.rootId = target2.id;
-
-		// 5. 删除占位文件
-		if (createResult.value && "fileId" in createResult.value) {
-			await this.api.deleteFile(createResult.value.fileId);
-		}
-
-		return { ok: true, value: target2.id };
+		// createFolder 返回值即新目录 fileId，无需再 getLevel1Folders
+		this.rootId = createResult.value;
+		console.log(`[XGKB Sync] init: 新建同步根目录 "${this.targetFolderName}" rootId=${createResult.value}`);
+		return { ok: true, value: createResult.value };
 	}
 
 	/**
-	 * 递归列出 Obsidian 文件夹下所有 .md 文件
+	 * 通过 4.21 扁平列举同步根目录下所有 .md 文件
 	 */
 	async listFiles(): Promise<Result<FileEntry[]>> {
 		if (!this.rootId) return { ok: false, error: "未初始化" };
 		const entries: FileEntry[] = [];
-		const err = await this.collectMdFiles(this.rootId, "", entries);
-		if (err) return { ok: false, error: err };
-		return { ok: true, value: entries };
-	}
-
-	private async collectMdFiles(
-		parentId: string,
-		prefix: string,
-		entries: FileEntry[]
-	): Promise<string | null> {
-		const result = await this.api.getChildFiles(parentId);
-		if (!result.ok) return result.error;
-
-		for (const item of result.value || []) {
-			if (item.type === 2) {
-				// 文件：只处理 .md
-				if (!item.name.endsWith(".md")) continue;
-				if (item.fileType && item.fileType !== "file") continue;
-				const seg = sanitizePathSegment(item.name);
-				const relativePath = prefix ? `${prefix}/${seg}` : seg;
+		let cursor: string | undefined;
+		let page = 0;
+		do {
+			page++;
+			const r = await this.api.listDescendantFiles({
+				rootFileId: this.rootId,
+				projectId: this.projectId || undefined,
+				suffix: "md",
+				limit: 500,
+				cursor,
+				includePath: true,
+			});
+			if (!r.ok) return { ok: false, error: r.error };
+			const pageItems = r.value.files || [];
+			console.log(`[XGKB Sync] listDescendantFiles 第${page}页: 返回 ${pageItems.length} 条，nextCursor=${r.value.nextCursor ?? "null"}`);
+			for (const item of pageItems) {
+				const rawPath = item.relativePath || item.name;
+				const safePath = rawPath
+					.split("/")
+					.filter(Boolean)
+					.map((seg) => sanitizePathSegment(seg))
+					.join("/");
+				if (!safePath.endsWith(".md")) continue;
 				entries.push({
-					path: relativePath,
+					path: safePath,
 					name: item.name,
-					mtime: item.updateTime || item.createTime || 0,
-					xgkbFileId: item.id,
-					xgkbFolderId: item.parentId,
+					mtime: item.updateTime || 0,
+					size: item.size,
+					xgkbFileId: String(item.fileId),
+					xgkbFolderId: item.parentId != null ? String(item.parentId) : "",
 				});
-			} else if (item.type === 1 && item.hasChild) {
-				// 文件夹：递归（路径键与本地 Vault 合法名一致，与 FsLocal.resolve 规则相同）
-				const seg = sanitizePathSegment(item.name);
-				const subPrefix = prefix ? `${prefix}/${seg}` : seg;
-				const err = await this.collectMdFiles(item.id, subPrefix, entries);
-				if (err) return err;
 			}
-		}
-		return null;
+			cursor = r.value.nextCursor || undefined;
+		} while (cursor);
+		console.log(`[XGKB Sync] listDescendantFiles 完成: 共 ${entries.length} 个 .md 文件，${page} 页`);
+		return { ok: true, value: entries };
 	}
 
 	/**
@@ -166,9 +158,9 @@ export class FsXgkb {
 	 * 上传新文件（使用 uploadContent）
 	 * @param relativePath 相对路径（如 "日常学习/笔记.md"）
 	 * @param content Markdown 内容
+	 * @returns fileId 与 folderId（folderId 用于状态库，支撑增量同步路径缓存）
 	 */
-	async createFile(relativePath: string, content: string): Promise<Result<string>> {
-		// 从路径提取目录部分
+	async createFile(relativePath: string, content: string): Promise<Result<{ fileId: string; folderId: string }>> {
 		const lastSlash = relativePath.lastIndexOf("/");
 		const folderPath = lastSlash > 0 ? relativePath.substring(0, lastSlash) : "";
 		const fileName = lastSlash > 0 ? relativePath.substring(lastSlash + 1) : relativePath;
@@ -186,9 +178,15 @@ export class FsXgkb {
 
 		if (!result.ok) return { ok: false, error: `上传失败: ${result.error}` };
 
-		// 新建模式返回 UploadContentResult
-		const data = result.value as { fileId: string; fileName: string };
-		return { ok: true, value: data.fileId };
+		// 新建模式返回 UploadContentResult，含 fileId 与 folderId
+		const data = result.value as { fileId: string | number; folderId?: string | number };
+		return {
+			ok: true,
+			value: {
+				fileId: String(data.fileId),
+				folderId: data.folderId != null ? String(data.folderId) : "",
+			},
+		};
 	}
 
 	/**
@@ -214,5 +212,66 @@ export class FsXgkb {
 		return this.api.deleteFile(fileId).then((r) =>
 			r.ok ? { ok: true as const, value: undefined } : r
 		);
+	}
+
+	/**
+	 * 拉取所有增量变更（4.22）自动翻页，直到 nextCursor 为空。
+	 * @param since 毫秒时间戳（已含安全回拨）
+	 */
+	async listAllChanges(since: number): Promise<Result<{ items: XgkbChangeItem[]; serverTime?: number }>> {
+		if (!this.rootId || !this.projectId) return { ok: false, error: "未初始化" };
+		const sinceStr = new Date(since).toLocaleString("zh-CN");
+		console.log(`[XGKB Sync] listChanges: since=${since} (${sinceStr}), rootId=${this.rootId}`);
+		const allItems: XgkbChangeItem[] = [];
+		let cursor: string | undefined;
+		let serverTime: number | undefined;
+		let page = 0;
+		do {
+			page++;
+			const r = await this.api.listChanges({
+				projectId: this.projectId,
+				rootFileId: this.rootId,
+				since: cursor ? undefined : since,
+				cursor,
+				limit: 200,
+			});
+			if (!r.ok) return { ok: false, error: r.error };
+			const pageItems = r.value.items || [];
+			console.log(`[XGKB Sync] listChanges 第${page}页: ${pageItems.length} 条，nextCursor=${r.value.nextCursor ?? "null"}，serverTime=${r.value.serverTime ?? "-"}`);
+			allItems.push(...pageItems);
+			serverTime = r.value.serverTime ?? serverTime;
+			cursor = r.value.nextCursor || undefined;
+		} while (cursor);
+		const upsertCount = allItems.filter((i) => i.event !== "delete").length;
+		const deleteCount  = allItems.filter((i) => i.event === "delete").length;
+		console.log(`[XGKB Sync] listChanges 完成: 共 ${allItems.length} 条 (upsert:${upsertCount} delete:${deleteCount})，serverTime=${serverTime}`);
+		return { ok: true, value: { items: allItems, serverTime } };
+	}
+
+	/**
+	 * 分批调用 batchGetMeta（4.23），返回 fileId → 元数据的 Map。
+	 * 未返回的 fileId（不存在/无权限）不在 Map 中，调用方按删除处理。
+	 */
+	async batchGetMetaAll(fileIds: string[]): Promise<Map<string, XgkbMetaItem>> {
+		const out = new Map<string, XgkbMetaItem>();
+		const unique = [...new Set(fileIds.filter(Boolean))];
+		console.log(`[XGKB Sync] batchGetMeta: 请求 ${unique.length} 个 fileId，分 ${Math.ceil(unique.length / BATCH_GET_META_MAX)} 批`);
+		for (let i = 0; i < unique.length; i += BATCH_GET_META_MAX) {
+			const chunk = unique.slice(i, i + BATCH_GET_META_MAX);
+			const r = await this.api.batchGetMeta(chunk, this.projectId || undefined);
+			if (!r.ok) {
+				console.warn("[XGKB Sync] batchGetMeta 失败:", r.error);
+				continue;
+			}
+			let deletedCount = 0;
+			for (const item of r.value || []) {
+				out.set(String(item.fileId), item);
+				if (item.deleted) deletedCount++;
+			}
+			console.log(`[XGKB Sync] batchGetMeta 批次[${Math.floor(i / BATCH_GET_META_MAX) + 1}]: 请求 ${chunk.length} 个，返回 ${r.value?.length ?? 0} 条（其中 deleted:${deletedCount}）`);
+		}
+		const missingCount = unique.length - out.size;
+		console.log(`[XGKB Sync] batchGetMeta 完成: 命中 ${out.size} 个，未返回/无权限 ${missingCount} 个（将视为远端删除）`);
+		return out;
 	}
 }

@@ -4,6 +4,8 @@ export interface XgkbPluginSettings {
 	syncFolder: string;
 	targetFolderName: string;
 	syncDirection: "bidirectional" | "push" | "pull";
+	/** 自动同步间隔（分钟），0 = 关闭 */
+	autoSyncInterval: number;
 }
 
 export type SyncStatus = "done" | "failed";
@@ -43,6 +45,45 @@ export interface XgkbFileVO {
 	createTime?: number;
 	updateTime?: number;
 	fileType?: string;
+	relativePath?: string;
+}
+
+export interface XgkbListDescendantFileItem {
+	fileId: string | number;
+	parentId: string | number;
+	name: string;
+	updateTime?: number;
+	size?: number;
+	relativePath?: string;
+}
+
+export interface XgkbListDescendantFilesData {
+	files: XgkbListDescendantFileItem[];
+	nextCursor?: string | null;
+}
+
+export interface XgkbChangeItem {
+	fileId: string | number;
+	parentId?: string | number;
+	type?: number;
+	name?: string;
+	updateTime?: number;
+	event: "upsert" | "delete" | string;
+}
+
+export interface XgkbListChangesData {
+	items: XgkbChangeItem[];
+	nextCursor?: string | null;
+	serverTime?: number;
+}
+
+export interface XgkbMetaItem {
+	fileId: string | number;
+	parentId?: string | number;
+	name?: string;
+	updateTime?: number;
+	size?: number;
+	deleted?: boolean;
 }
 
 /** uploadContent 新建模式返回 */
@@ -71,6 +112,8 @@ export interface SyncStats {
 	skipped: number;
 	failed: number;
 	errors: string[];
+	/** 本轮同步结束后推荐的下次 since 水位（毫秒时间戳），由引擎写入，main 持久化 */
+	newSince?: number;
 }
 
 export type ProgressCallback = (msg: string) => void;
