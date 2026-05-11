@@ -1,4 +1,4 @@
-# XGKB API 接口映射表（obsidian-xgkb-sync 插件使用）
+# XGKB API 接口映射表（cms-xgkb-sync 插件使用）
 
 > **文档版本：v2.0**
 > **最后更新：2026-05-07**

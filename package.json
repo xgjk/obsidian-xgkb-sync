@@ -1,11 +1,12 @@
 {
-  "name": "obsidian-xgkb-sync",
+  "name": "cms-xgkb-sync",
   "version": "2.0.1",
   "description": "Sync Obsidian notes with 玄关知识库 (XGKB Knowledge Base)",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",
-    "build": "node esbuild.config.mjs production"
+    "sync:manifest-version": "node scripts/sync-manifest-version.mjs",
+    "build": "npm run sync:manifest-version && node esbuild.config.mjs production"
   },
   "keywords": [],
   "author": "Evan",
