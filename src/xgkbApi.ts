@@ -12,6 +12,12 @@ import type {
 } from "./types";
 import { API_PATHS, MAX_RETRIES, RETRY_BASE_DELAY_MS } from "./constants";
 
+interface XgkbApiResponse<T> {
+	resultCode: number;
+	resultMsg?: string;
+	data: T;
+}
+
 /**
  * XGKB API 客户端
  *
@@ -30,7 +36,7 @@ export class XgkbApi {
 	}
 
 	private async delay(ms: number): Promise<void> {
-		return new Promise((resolve) => setTimeout(resolve, ms));
+		return new Promise((resolve) => window.setTimeout(resolve, ms));
 	}
 
 	private async request<T>(
@@ -66,13 +72,13 @@ export class XgkbApi {
 			try {
 				if (attempt > 0) await this.delay(RETRY_BASE_DELAY_MS * Math.pow(2, attempt));
 				const resp = await requestUrl(options);
-				const result = resp.json;
+				const result = resp.json as unknown as XgkbApiResponse<T>;
 				if (result.resultCode !== 1) {
 					// 401 认证失败，不重试
 					if (result.resultCode === 401) {
-						return { ok: false, error: `认证失败(401): ${result.resultMsg}` };
+						return { ok: false, error: `认证失败(401): ${result.resultMsg ?? "Unknown error"}` };
 					}
-					return { ok: false, error: `API error ${result.resultCode}: ${result.resultMsg}` };
+					return { ok: false, error: `API error ${result.resultCode}: ${result.resultMsg ?? "Unknown error"}` };
 				}
 				return { ok: true, value: result.data };
 			} catch (e: unknown) {

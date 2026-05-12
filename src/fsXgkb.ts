@@ -1,5 +1,5 @@
 import { XgkbApi } from "./xgkbApi";
-import type { FileEntry, Result, XgkbFileVO, XgkbChangeItem, XgkbMetaItem } from "./types";
+import type { FileEntry, Result, XgkbChangeItem, XgkbMetaItem } from "./types";
 import { BATCH_GET_CONTENT_MAX, BATCH_GET_META_MAX, cleanContent } from "./constants";
 import { sanitizePathSegment } from "./pathSanitize";
 
@@ -35,7 +35,7 @@ export class FsXgkb {
 		}
 		const projectId = projectResult.value;
 		this.projectId = projectId;
-		console.log(`[XGKB Sync] init: projectId=${projectId}`);
+		console.debug(`[XGKB Sync] init: projectId=${projectId}`);
 
 		// 2. 获取一级目录，找 Obsidian 文件夹
 		const foldersResult = await this.api.getLevel1Folders(projectId);
@@ -47,12 +47,12 @@ export class FsXgkb {
 
 		if (target) {
 			this.rootId = target.id;
-			console.log(`[XGKB Sync] init: 找到同步根目录 "${this.targetFolderName}" rootId=${target.id}`);
+			console.debug(`[XGKB Sync] init: 找到同步根目录 "${this.targetFolderName}" rootId=${target.id}`);
 			return { ok: true, value: target.id };
 		}
 
 		// 3. Obsidian 文件夹不存在，显式创建；createFolder 直接返回新目录的 fileId
-		console.log(`[XGKB Sync] init: 未找到 "${this.targetFolderName}"，调用 createFolder 新建...`);
+		console.debug(`[XGKB Sync] init: 未找到 "${this.targetFolderName}"，调用 createFolder 新建...`);
 		const createResult = await this.api.createFolder({
 			projectId,
 			parentId: "0",
@@ -65,7 +65,7 @@ export class FsXgkb {
 
 		// createFolder 返回值即新目录 fileId，无需再 getLevel1Folders
 		this.rootId = createResult.value;
-		console.log(`[XGKB Sync] init: 新建同步根目录 "${this.targetFolderName}" rootId=${createResult.value}`);
+		console.debug(`[XGKB Sync] init: 新建同步根目录 "${this.targetFolderName}" rootId=${createResult.value}`);
 		return { ok: true, value: createResult.value };
 	}
 
@@ -89,7 +89,7 @@ export class FsXgkb {
 			});
 			if (!r.ok) return { ok: false, error: r.error };
 			const pageItems = r.value.files || [];
-			console.log(`[XGKB Sync] listDescendantFiles 第${page}页: 返回 ${pageItems.length} 条，nextCursor=${r.value.nextCursor ?? "null"}`);
+			console.debug(`[XGKB Sync] listDescendantFiles 第${page}页: 返回 ${pageItems.length} 条，nextCursor=${r.value.nextCursor ?? "null"}`);
 			for (const item of pageItems) {
 				const rawPath = item.relativePath || item.name;
 				const safePath = rawPath
@@ -109,7 +109,7 @@ export class FsXgkb {
 			}
 			cursor = r.value.nextCursor || undefined;
 		} while (cursor);
-		console.log(`[XGKB Sync] listDescendantFiles 完成: 共 ${entries.length} 个 .md 文件，${page} 页`);
+		console.debug(`[XGKB Sync] listDescendantFiles 完成: 共 ${entries.length} 个 .md 文件，${page} 页`);
 		return { ok: true, value: entries };
 	}
 
@@ -147,7 +147,7 @@ export class FsXgkb {
 				}
 			}
 			// Obsidian 的 requestUrl 通常不会出现在侧边栏开发者工具 Network 里，用本日志确认请求已发出并已返回
-			console.log(
+			console.debug(
 				`[XGKB Sync] batchGetContent 已返回: 本批 ${chunk.length} 个 fileId，接口响应 ${r.value?.length ?? 0} 条，可用正文 ${mergedThisChunk} 条`
 			);
 		}
@@ -221,7 +221,7 @@ export class FsXgkb {
 	async listAllChanges(since: number): Promise<Result<{ items: XgkbChangeItem[]; serverTime?: number }>> {
 		if (!this.rootId || !this.projectId) return { ok: false, error: "未初始化" };
 		const sinceStr = new Date(since).toLocaleString("zh-CN");
-		console.log(`[XGKB Sync] listChanges: since=${since} (${sinceStr}), rootId=${this.rootId}`);
+		console.debug(`[XGKB Sync] listChanges: since=${since} (${sinceStr}), rootId=${this.rootId}`);
 		const allItems: XgkbChangeItem[] = [];
 		let cursor: string | undefined;
 		let serverTime: number | undefined;
@@ -237,14 +237,14 @@ export class FsXgkb {
 			});
 			if (!r.ok) return { ok: false, error: r.error };
 			const pageItems = r.value.items || [];
-			console.log(`[XGKB Sync] listChanges 第${page}页: ${pageItems.length} 条，nextCursor=${r.value.nextCursor ?? "null"}，serverTime=${r.value.serverTime ?? "-"}`);
+			console.debug(`[XGKB Sync] listChanges 第${page}页: ${pageItems.length} 条，nextCursor=${r.value.nextCursor ?? "null"}，serverTime=${r.value.serverTime ?? "-"}`);
 			allItems.push(...pageItems);
 			serverTime = r.value.serverTime ?? serverTime;
 			cursor = r.value.nextCursor || undefined;
 		} while (cursor);
 		const upsertCount = allItems.filter((i) => i.event !== "delete").length;
 		const deleteCount  = allItems.filter((i) => i.event === "delete").length;
-		console.log(`[XGKB Sync] listChanges 完成: 共 ${allItems.length} 条 (upsert:${upsertCount} delete:${deleteCount})，serverTime=${serverTime}`);
+		console.debug(`[XGKB Sync] listChanges 完成: 共 ${allItems.length} 条 (upsert:${upsertCount} delete:${deleteCount})，serverTime=${serverTime}`);
 		return { ok: true, value: { items: allItems, serverTime } };
 	}
 
@@ -255,7 +255,7 @@ export class FsXgkb {
 	async batchGetMetaAll(fileIds: string[]): Promise<Map<string, XgkbMetaItem>> {
 		const out = new Map<string, XgkbMetaItem>();
 		const unique = [...new Set(fileIds.filter(Boolean))];
-		console.log(`[XGKB Sync] batchGetMeta: 请求 ${unique.length} 个 fileId，分 ${Math.ceil(unique.length / BATCH_GET_META_MAX)} 批`);
+		console.debug(`[XGKB Sync] batchGetMeta: 请求 ${unique.length} 个 fileId，分 ${Math.ceil(unique.length / BATCH_GET_META_MAX)} 批`);
 		for (let i = 0; i < unique.length; i += BATCH_GET_META_MAX) {
 			const chunk = unique.slice(i, i + BATCH_GET_META_MAX);
 			const r = await this.api.batchGetMeta(chunk, this.projectId || undefined);
@@ -268,10 +268,10 @@ export class FsXgkb {
 				out.set(String(item.fileId), item);
 				if (item.deleted) deletedCount++;
 			}
-			console.log(`[XGKB Sync] batchGetMeta 批次[${Math.floor(i / BATCH_GET_META_MAX) + 1}]: 请求 ${chunk.length} 个，返回 ${r.value?.length ?? 0} 条（其中 deleted:${deletedCount}）`);
+			console.debug(`[XGKB Sync] batchGetMeta 批次[${Math.floor(i / BATCH_GET_META_MAX) + 1}]: 请求 ${chunk.length} 个，返回 ${r.value?.length ?? 0} 条（其中 deleted:${deletedCount}）`);
 		}
 		const missingCount = unique.length - out.size;
-		console.log(`[XGKB Sync] batchGetMeta 完成: 命中 ${out.size} 个，未返回/无权限 ${missingCount} 个（将视为远端删除）`);
+		console.debug(`[XGKB Sync] batchGetMeta 完成: 命中 ${out.size} 个，未返回/无权限 ${missingCount} 个（将视为远端删除）`);
 		return out;
 	}
 }

@@ -68,7 +68,7 @@ export interface XgkbChangeItem {
 	type?: number;
 	name?: string;
 	updateTime?: number;
-	event: "upsert" | "delete" | string;
+	event: "upsert" | "delete" | (string & Record<never, never>);
 }
 
 export interface XgkbListChangesData {

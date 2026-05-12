@@ -1,4 +1,4 @@
-import type { App, TFile, TFolder } from "obsidian";
+import type { App, TFolder } from "obsidian";
 // 使用命名空间导入，避免 esbuild 误删对 obsidian 的运行时引用（instanceof 需要构造函数）
 import * as Obsidian from "obsidian";
 import type { FileEntry } from "./types";
@@ -20,7 +20,7 @@ export class FsLocal {
 	}
 
 	/** 列出 syncFolder 下所有 .md 文件（递归） */
-	async listFiles(): Promise<FileEntry[]> {
+	listFiles(): FileEntry[] {
 		const folder = this.app.vault.getAbstractFileByPath(this.basePath);
 		if (!folder || !(folder instanceof Obsidian.TFolder)) return [];
 		const entries: FileEntry[] = [];
@@ -72,7 +72,10 @@ export class FsLocal {
 			await this.app.vault.create(fullPath, content);
 		}
 		// 返回实际 mtime
-		const file = this.app.vault.getAbstractFileByPath(fullPath) as TFile;
+		const file = this.app.vault.getAbstractFileByPath(fullPath);
+		if (!(file instanceof Obsidian.TFile)) {
+			throw new Error(`写入后无法读取文件状态: ${fullPath}`);
+		}
 		return file.stat.mtime;
 	}
 
@@ -81,12 +84,7 @@ export class FsLocal {
 		const fullPath = this.resolve(relativePath);
 		const file = this.app.vault.getAbstractFileByPath(fullPath);
 		if (file instanceof Obsidian.TFile) {
-			// 尝试走回收站，不支持则直接删除
-			try {
-				await this.app.vault.trash(file, true);
-			} catch {
-				await this.app.vault.delete(file);
-			}
+			await this.app.fileManager.trashFile(file);
 		}
 	}
 

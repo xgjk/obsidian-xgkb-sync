@@ -9,7 +9,7 @@ import { FsXgkb } from "./fsXgkb";
 import { XgkbApi } from "./xgkbApi";
 
 export default class XgkbSyncPlugin extends Plugin {
-	settings: XgkbPluginSettings;
+	settings!: XgkbPluginSettings;
 
 	/** 上次同步成功后的水位时间戳（毫秒），持久化到 data.json */
 	private lastSyncTime: number | undefined;
@@ -24,14 +24,14 @@ export default class XgkbSyncPlugin extends Plugin {
 		await this.loadSettings();
 
 		// Ribbon 图标（使用 Obsidian 内置 Lucide 图标 refresh-cw）
-		this.addRibbonIcon("refresh-cw", "XGKB 同步", async () => {
+		this.addRibbonIcon("refresh-cw", "Sync xgkb", async () => {
 			await this.runSync();
 		});
 
 		// 命令面板
 		this.addCommand({
 			id: "xgkb-sync-now",
-			name: "立即同步",
+			name: "Sync now",
 			callback: async () => {
 				await this.runSync();
 			},
@@ -63,14 +63,14 @@ export default class XgkbSyncPlugin extends Plugin {
 		// registerInterval 会在插件卸载时自动 clearInterval
 		this.autoSyncHandle = this.registerInterval(
 			window.setInterval(() => {
-				this.runSync();
+				void this.runSync();
 			}, intervalMs)
 		);
-		console.log(`[XGKB Sync] 自动同步已启动，间隔 ${intervalMin} 分钟`);
+		console.debug(`[XGKB Sync] 自动同步已启动，间隔 ${intervalMin} 分钟`);
 	}
 
 	async loadSettings() {
-		const raw = (await this.loadData()) ?? {};
+		const raw: unknown = (await this.loadData()) ?? {};
 		// lastSyncTime 是运行状态，不放入 XgkbPluginSettings 接口，单独提取
 		const { lastSyncTime, ...rest } = raw as Record<string, unknown>;
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, rest);
@@ -84,13 +84,13 @@ export default class XgkbSyncPlugin extends Plugin {
 
 	private async runSync() {
 		if (!this.settings.appKey) {
-			new Notice("XGKB Sync: 请先在设置中配置 appKey");
+			new Notice("Xgkb sync: Configure app key first");
 			return;
 		}
 
 		// 防止并发：上一次同步尚未完成时跳过本次触发
 		if (this.isSyncing) {
-			console.log("[XGKB Sync] 上次同步仍在进行，跳过本次触发");
+			console.debug("[XGKB Sync] 上次同步仍在进行，跳过本次触发");
 			return;
 		}
 		this.isSyncing = true;
@@ -99,7 +99,7 @@ export default class XgkbSyncPlugin extends Plugin {
 		const sinceStr = this.lastSyncTime
 			? new Date(this.lastSyncTime).toLocaleString("zh-CN")
 			: "无（首次全量）";
-		console.log(`[XGKB Sync] ===== 开始同步 mode=${isIncremental ? "增量" : "全量"} lastSyncTime=${this.lastSyncTime ?? "-"} (${sinceStr}) =====`);
+		console.debug(`[XGKB Sync] ===== 开始同步 mode=${isIncremental ? "增量" : "全量"} lastSyncTime=${this.lastSyncTime ?? "-"} (${sinceStr}) =====`);
 		new Notice(`XGKB Sync: 开始${isIncremental ? "增量" : "全量"}同步...`);
 		const db = new SyncStateDb();
 		let dbOpened = false;
@@ -123,7 +123,7 @@ export default class XgkbSyncPlugin extends Plugin {
 			if (stats.newSince) {
 				this.lastSyncTime = stats.newSince;
 				await this.saveSettings();
-				console.log(`[XGKB Sync] 水位已更新: ${stats.newSince} (${new Date(stats.newSince).toLocaleString("zh-CN")})`);
+				console.debug(`[XGKB Sync] 水位已更新: ${stats.newSince} (${new Date(stats.newSince).toLocaleString("zh-CN")})`);
 			}
 
 			// 结果通知

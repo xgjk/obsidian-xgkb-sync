@@ -1,6 +1,10 @@
-import type { SyncStateRecord, SyncStatus } from "./types";
+import type { SyncStateRecord } from "./types";
 import { DB_NAME, DB_VERSION, DB_STORE_NAME } from "./constants";
 import type { Result } from "./types";
+
+function requestError(request: IDBRequest): Error {
+	return new Error(request.error?.message ?? "IndexedDB request failed");
+}
 
 /**
  * IndexedDB 状态持久化
@@ -44,7 +48,7 @@ export class SyncStateDb {
 			const tx = this.db!.transaction(DB_STORE_NAME, "readonly");
 			const store = tx.objectStore(DB_STORE_NAME);
 			const request = store.get(localPath);
-			request.onsuccess = () => resolve(request.result || undefined);
+			request.onsuccess = () => resolve((request.result as SyncStateRecord | undefined) || undefined);
 			request.onerror = () => resolve(undefined);
 		});
 	}
@@ -56,7 +60,7 @@ export class SyncStateDb {
 			const store = tx.objectStore(DB_STORE_NAME);
 			const index = store.index("xgkbFileId");
 			const request = index.get(xgkbFileId);
-			request.onsuccess = () => resolve(request.result || undefined);
+			request.onsuccess = () => resolve((request.result as SyncStateRecord | undefined) || undefined);
 			request.onerror = () => resolve(undefined);
 		});
 	}
@@ -68,7 +72,7 @@ export class SyncStateDb {
 			const store = tx.objectStore(DB_STORE_NAME);
 			const request = store.put(record);
 			request.onsuccess = () => resolve();
-			request.onerror = () => reject(request.error);
+			request.onerror = () => reject(requestError(request));
 		});
 	}
 
@@ -79,7 +83,7 @@ export class SyncStateDb {
 			const store = tx.objectStore(DB_STORE_NAME);
 			const request = store.delete(localPath);
 			request.onsuccess = () => resolve();
-			request.onerror = () => reject(request.error);
+			request.onerror = () => reject(requestError(request));
 		});
 	}
 
@@ -101,7 +105,7 @@ export class SyncStateDb {
 			const store = tx.objectStore(DB_STORE_NAME);
 			const request = store.clear();
 			request.onsuccess = () => resolve();
-			request.onerror = () => reject(request.error);
+			request.onerror = () => reject(requestError(request));
 		});
 	}
 }

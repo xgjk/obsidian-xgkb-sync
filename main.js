@@ -93,9 +93,10 @@ var XgkbApi = class {
     this.appKey = appKey;
   }
   async delay(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+    return new Promise((resolve) => window.setTimeout(resolve, ms));
   }
   async request(method, apiPath, params) {
+    var _a, _b;
     const baseUrl = this.serverUrl + apiPath;
     const options = {
       url: baseUrl,
@@ -123,9 +124,9 @@ var XgkbApi = class {
         const result = resp.json;
         if (result.resultCode !== 1) {
           if (result.resultCode === 401) {
-            return { ok: false, error: `\u8BA4\u8BC1\u5931\u8D25(401): ${result.resultMsg}` };
+            return { ok: false, error: `\u8BA4\u8BC1\u5931\u8D25(401): ${(_a = result.resultMsg) != null ? _a : "Unknown error"}` };
           }
-          return { ok: false, error: `API error ${result.resultCode}: ${result.resultMsg}` };
+          return { ok: false, error: `API error ${result.resultCode}: ${(_b = result.resultMsg) != null ? _b : "Unknown error"}` };
         }
         return { ok: true, value: result.data };
       } catch (e) {
@@ -225,7 +226,7 @@ var XgkbApi = class {
 var Obsidian = __toESM(require("obsidian"));
 
 // src/pathSanitize.ts
-var ILLEGAL_IN_SEGMENT = /[\*"\<\>\:\|\?\\]/g;
+var ILLEGAL_IN_SEGMENT = /[*"<>:|?\\]/g;
 function sanitizePathSegment(segment) {
   return segment.replace(ILLEGAL_IN_SEGMENT, "-");
 }
@@ -245,7 +246,7 @@ var FsLocal = class {
     return p.replace(/\\/g, "/").replace(/\/+/g, "/");
   }
   /** 列出 syncFolder 下所有 .md 文件（递归） */
-  async listFiles() {
+  listFiles() {
     const folder = this.app.vault.getAbstractFileByPath(this.basePath);
     if (!folder || !(folder instanceof Obsidian.TFolder))
       return [];
@@ -295,6 +296,9 @@ var FsLocal = class {
       await this.app.vault.create(fullPath, content);
     }
     const file = this.app.vault.getAbstractFileByPath(fullPath);
+    if (!(file instanceof Obsidian.TFile)) {
+      throw new Error(`\u5199\u5165\u540E\u65E0\u6CD5\u8BFB\u53D6\u6587\u4EF6\u72B6\u6001: ${fullPath}`);
+    }
     return file.stat.mtime;
   }
   /** 删除文件（走 Vault 回收站） */
@@ -302,11 +306,7 @@ var FsLocal = class {
     const fullPath = this.resolve(relativePath);
     const file = this.app.vault.getAbstractFileByPath(fullPath);
     if (file instanceof Obsidian.TFile) {
-      try {
-        await this.app.vault.trash(file, true);
-      } catch (e) {
-        await this.app.vault.delete(file);
-      }
+      await this.app.fileManager.trashFile(file);
     }
   }
   /** 获取文件的 mtime */
@@ -365,7 +365,7 @@ var FsXgkb = class {
     }
     const projectId = projectResult.value;
     this.projectId = projectId;
-    console.log(`[XGKB Sync] init: projectId=${projectId}`);
+    console.debug(`[XGKB Sync] init: projectId=${projectId}`);
     const foldersResult = await this.api.getLevel1Folders(projectId);
     if (!foldersResult.ok) {
       return { ok: false, error: `\u83B7\u53D6\u76EE\u5F55\u5217\u8868\u5931\u8D25: ${foldersResult.error}` };
@@ -374,10 +374,10 @@ var FsXgkb = class {
     const target = folders.find((f) => f.name === this.targetFolderName && f.type === 1);
     if (target) {
       this.rootId = target.id;
-      console.log(`[XGKB Sync] init: \u627E\u5230\u540C\u6B65\u6839\u76EE\u5F55 "${this.targetFolderName}" rootId=${target.id}`);
+      console.debug(`[XGKB Sync] init: \u627E\u5230\u540C\u6B65\u6839\u76EE\u5F55 "${this.targetFolderName}" rootId=${target.id}`);
       return { ok: true, value: target.id };
     }
-    console.log(`[XGKB Sync] init: \u672A\u627E\u5230 "${this.targetFolderName}"\uFF0C\u8C03\u7528 createFolder \u65B0\u5EFA...`);
+    console.debug(`[XGKB Sync] init: \u672A\u627E\u5230 "${this.targetFolderName}"\uFF0C\u8C03\u7528 createFolder \u65B0\u5EFA...`);
     const createResult = await this.api.createFolder({
       projectId,
       parentId: "0",
@@ -387,7 +387,7 @@ var FsXgkb = class {
       return { ok: false, error: `\u521B\u5EFA Obsidian \u76EE\u5F55\u5931\u8D25: ${createResult.error}` };
     }
     this.rootId = createResult.value;
-    console.log(`[XGKB Sync] init: \u65B0\u5EFA\u540C\u6B65\u6839\u76EE\u5F55 "${this.targetFolderName}" rootId=${createResult.value}`);
+    console.debug(`[XGKB Sync] init: \u65B0\u5EFA\u540C\u6B65\u6839\u76EE\u5F55 "${this.targetFolderName}" rootId=${createResult.value}`);
     return { ok: true, value: createResult.value };
   }
   /**
@@ -413,7 +413,7 @@ var FsXgkb = class {
       if (!r.ok)
         return { ok: false, error: r.error };
       const pageItems = r.value.files || [];
-      console.log(`[XGKB Sync] listDescendantFiles \u7B2C${page}\u9875: \u8FD4\u56DE ${pageItems.length} \u6761\uFF0CnextCursor=${(_a = r.value.nextCursor) != null ? _a : "null"}`);
+      console.debug(`[XGKB Sync] listDescendantFiles \u7B2C${page}\u9875: \u8FD4\u56DE ${pageItems.length} \u6761\uFF0CnextCursor=${(_a = r.value.nextCursor) != null ? _a : "null"}`);
       for (const item of pageItems) {
         const rawPath = item.relativePath || item.name;
         const safePath = rawPath.split("/").filter(Boolean).map((seg) => sanitizePathSegment(seg)).join("/");
@@ -430,7 +430,7 @@ var FsXgkb = class {
       }
       cursor = r.value.nextCursor || void 0;
     } while (cursor);
-    console.log(`[XGKB Sync] listDescendantFiles \u5B8C\u6210: \u5171 ${entries.length} \u4E2A .md \u6587\u4EF6\uFF0C${page} \u9875`);
+    console.debug(`[XGKB Sync] listDescendantFiles \u5B8C\u6210: \u5171 ${entries.length} \u4E2A .md \u6587\u4EF6\uFF0C${page} \u9875`);
     return { ok: true, value: entries };
   }
   /**
@@ -466,7 +466,7 @@ var FsXgkb = class {
           mergedThisChunk++;
         }
       }
-      console.log(
+      console.debug(
         `[XGKB Sync] batchGetContent \u5DF2\u8FD4\u56DE: \u672C\u6279 ${chunk.length} \u4E2A fileId\uFF0C\u63A5\u53E3\u54CD\u5E94 ${(_b = (_a = r.value) == null ? void 0 : _a.length) != null ? _b : 0} \u6761\uFF0C\u53EF\u7528\u6B63\u6587 ${mergedThisChunk} \u6761`
       );
     }
@@ -531,7 +531,7 @@ var FsXgkb = class {
     if (!this.rootId || !this.projectId)
       return { ok: false, error: "\u672A\u521D\u59CB\u5316" };
     const sinceStr = new Date(since).toLocaleString("zh-CN");
-    console.log(`[XGKB Sync] listChanges: since=${since} (${sinceStr}), rootId=${this.rootId}`);
+    console.debug(`[XGKB Sync] listChanges: since=${since} (${sinceStr}), rootId=${this.rootId}`);
     const allItems = [];
     let cursor;
     let serverTime;
@@ -548,14 +548,14 @@ var FsXgkb = class {
       if (!r.ok)
         return { ok: false, error: r.error };
       const pageItems = r.value.items || [];
-      console.log(`[XGKB Sync] listChanges \u7B2C${page}\u9875: ${pageItems.length} \u6761\uFF0CnextCursor=${(_a = r.value.nextCursor) != null ? _a : "null"}\uFF0CserverTime=${(_b = r.value.serverTime) != null ? _b : "-"}`);
+      console.debug(`[XGKB Sync] listChanges \u7B2C${page}\u9875: ${pageItems.length} \u6761\uFF0CnextCursor=${(_a = r.value.nextCursor) != null ? _a : "null"}\uFF0CserverTime=${(_b = r.value.serverTime) != null ? _b : "-"}`);
       allItems.push(...pageItems);
       serverTime = (_c = r.value.serverTime) != null ? _c : serverTime;
       cursor = r.value.nextCursor || void 0;
     } while (cursor);
     const upsertCount = allItems.filter((i) => i.event !== "delete").length;
     const deleteCount = allItems.filter((i) => i.event === "delete").length;
-    console.log(`[XGKB Sync] listChanges \u5B8C\u6210: \u5171 ${allItems.length} \u6761 (upsert:${upsertCount} delete:${deleteCount})\uFF0CserverTime=${serverTime}`);
+    console.debug(`[XGKB Sync] listChanges \u5B8C\u6210: \u5171 ${allItems.length} \u6761 (upsert:${upsertCount} delete:${deleteCount})\uFF0CserverTime=${serverTime}`);
     return { ok: true, value: { items: allItems, serverTime } };
   }
   /**
@@ -566,7 +566,7 @@ var FsXgkb = class {
     var _a, _b;
     const out = /* @__PURE__ */ new Map();
     const unique = [...new Set(fileIds.filter(Boolean))];
-    console.log(`[XGKB Sync] batchGetMeta: \u8BF7\u6C42 ${unique.length} \u4E2A fileId\uFF0C\u5206 ${Math.ceil(unique.length / BATCH_GET_META_MAX)} \u6279`);
+    console.debug(`[XGKB Sync] batchGetMeta: \u8BF7\u6C42 ${unique.length} \u4E2A fileId\uFF0C\u5206 ${Math.ceil(unique.length / BATCH_GET_META_MAX)} \u6279`);
     for (let i = 0; i < unique.length; i += BATCH_GET_META_MAX) {
       const chunk = unique.slice(i, i + BATCH_GET_META_MAX);
       const r = await this.api.batchGetMeta(chunk, this.projectId || void 0);
@@ -580,10 +580,10 @@ var FsXgkb = class {
         if (item.deleted)
           deletedCount++;
       }
-      console.log(`[XGKB Sync] batchGetMeta \u6279\u6B21[${Math.floor(i / BATCH_GET_META_MAX) + 1}]: \u8BF7\u6C42 ${chunk.length} \u4E2A\uFF0C\u8FD4\u56DE ${(_b = (_a = r.value) == null ? void 0 : _a.length) != null ? _b : 0} \u6761\uFF08\u5176\u4E2D deleted:${deletedCount}\uFF09`);
+      console.debug(`[XGKB Sync] batchGetMeta \u6279\u6B21[${Math.floor(i / BATCH_GET_META_MAX) + 1}]: \u8BF7\u6C42 ${chunk.length} \u4E2A\uFF0C\u8FD4\u56DE ${(_b = (_a = r.value) == null ? void 0 : _a.length) != null ? _b : 0} \u6761\uFF08\u5176\u4E2D deleted:${deletedCount}\uFF09`);
     }
     const missingCount = unique.length - out.size;
-    console.log(`[XGKB Sync] batchGetMeta \u5B8C\u6210: \u547D\u4E2D ${out.size} \u4E2A\uFF0C\u672A\u8FD4\u56DE/\u65E0\u6743\u9650 ${missingCount} \u4E2A\uFF08\u5C06\u89C6\u4E3A\u8FDC\u7AEF\u5220\u9664\uFF09`);
+    console.debug(`[XGKB Sync] batchGetMeta \u5B8C\u6210: \u547D\u4E2D ${out.size} \u4E2A\uFF0C\u672A\u8FD4\u56DE/\u65E0\u6743\u9650 ${missingCount} \u4E2A\uFF08\u5C06\u89C6\u4E3A\u8FDC\u7AEF\u5220\u9664\uFF09`);
     return out;
   }
 };
@@ -597,9 +597,8 @@ var XgkbPluginSettingTab = class extends import_obsidian2.PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
-    containerEl.createEl("h2", { text: "XGKB Sync \u8BBE\u7F6E" });
-    new import_obsidian2.Setting(containerEl).setName("AppKey").setDesc("\u7384\u5173\u77E5\u8BC6\u5E93 API \u5BC6\u94A5").addText(
-      (text) => text.setPlaceholder("\u8F93\u5165 appKey").setValue(this.plugin.settings.appKey).onChange(async (value) => {
+    new import_obsidian2.Setting(containerEl).setName("App key").setDesc("\u7384\u5173\u77E5\u8BC6\u5E93 API \u5BC6\u94A5").addText(
+      (text) => text.setPlaceholder("Enter app key").setValue(this.plugin.settings.appKey).onChange(async (value) => {
         this.plugin.settings.appKey = value;
         await this.plugin.saveSettings();
       })
@@ -610,48 +609,45 @@ var XgkbPluginSettingTab = class extends import_obsidian2.PluginSettingTab {
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian2.Setting(containerEl).setName("\u540C\u6B65\u6587\u4EF6\u5939").setDesc("Obsidian \u4E2D\u7528\u4E8E\u540C\u6B65\u7684\u6587\u4EF6\u5939\u8DEF\u5F84\uFF08\u7A7A = \u540C\u6B65\u6574\u4E2A Vault\uFF09").addText(
-      (text) => text.setPlaceholder("\u5982\uFF1ANotes").setValue(this.plugin.settings.syncFolder).onChange(async (value) => {
+    new import_obsidian2.Setting(containerEl).setName("Sync folder").setDesc("Obsidian \u4E2D\u7528\u4E8E\u540C\u6B65\u7684\u6587\u4EF6\u5939\u8DEF\u5F84\uFF08\u7A7A = \u540C\u6B65\u6574\u4E2A vault\uFF09").addText(
+      (text) => text.setPlaceholder("Example: Notes").setValue(this.plugin.settings.syncFolder).onChange(async (value) => {
         this.plugin.settings.syncFolder = value;
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian2.Setting(containerEl).setName("\u4E91\u7AEF\u76EE\u6807\u76EE\u5F55").setDesc("\u7384\u5173\u77E5\u8BC6\u5E93\u4E2D\u76EE\u6807\u6587\u4EF6\u5939\u540D\u79F0").addText(
+    new import_obsidian2.Setting(containerEl).setName("Cloud target folder").setDesc("\u7384\u5173\u77E5\u8BC6\u5E93\u4E2D\u76EE\u6807\u6587\u4EF6\u5939\u540D\u79F0").addText(
       (text) => text.setPlaceholder("Obsidian").setValue(this.plugin.settings.targetFolderName).onChange(async (value) => {
         this.plugin.settings.targetFolderName = value || "Obsidian";
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian2.Setting(containerEl).setName("\u540C\u6B65\u65B9\u5411").setDesc("\u53CC\u5411\u540C\u6B65 / \u4EC5\u63A8\u9001 / \u4EC5\u62C9\u53D6").addDropdown(
-      (dropdown) => dropdown.addOption("bidirectional", "\u53CC\u5411 (Bidirectional)").addOption("push", "\u4EC5\u63A8\u9001 (Push)").addOption("pull", "\u4EC5\u62C9\u53D6 (Pull)").setValue(this.plugin.settings.syncDirection).onChange(async (value) => {
+    new import_obsidian2.Setting(containerEl).setName("Sync direction").setDesc("\u53CC\u5411\u540C\u6B65 / \u4EC5\u63A8\u9001 / \u4EC5\u62C9\u53D6").addDropdown(
+      (dropdown) => dropdown.addOption("bidirectional", "Bidirectional").addOption("push", "Push only").addOption("pull", "Pull only").setValue(this.plugin.settings.syncDirection).onChange(async (value) => {
         this.plugin.settings.syncDirection = value;
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian2.Setting(containerEl).setName("\u81EA\u52A8\u540C\u6B65\u95F4\u9694").setDesc("\u5B9A\u671F\u81EA\u52A8\u6267\u884C\u540C\u6B65\uFF0C\u5173\u95ED\u5219\u4EC5\u624B\u52A8\u89E6\u53D1").addDropdown(
-      (dropdown) => dropdown.addOption("0", "\u5173\u95ED\uFF08\u624B\u52A8\u540C\u6B65\uFF09").addOption("5", "\u6BCF 5 \u5206\u949F").addOption("10", "\u6BCF 10 \u5206\u949F").addOption("30", "\u6BCF 30 \u5206\u949F").addOption("60", "\u6BCF 1 \u5C0F\u65F6").addOption("120", "\u6BCF 2 \u5C0F\u65F6").setValue(String(this.plugin.settings.autoSyncInterval)).onChange(async (value) => {
+    new import_obsidian2.Setting(containerEl).setName("Automatic sync interval").setDesc("\u5B9A\u671F\u81EA\u52A8\u6267\u884C\u540C\u6B65\uFF0C\u5173\u95ED\u5219\u4EC5\u624B\u52A8\u89E6\u53D1").addDropdown(
+      (dropdown) => dropdown.addOption("0", "Off (manual sync)").addOption("5", "Every 5 minutes").addOption("10", "Every 10 minutes").addOption("30", "Every 30 minutes").addOption("60", "Every hour").addOption("120", "Every 2 hours").setValue(String(this.plugin.settings.autoSyncInterval)).onChange(async (value) => {
         this.plugin.settings.autoSyncInterval = Number(value);
         await this.plugin.saveSettings();
         this.plugin.scheduleAutoSync();
       })
     );
     const btnGroup = containerEl.createDiv({ cls: "xgkb-settings-button-group" });
-    btnGroup.style.display = "flex";
-    btnGroup.style.gap = "8px";
-    btnGroup.style.marginTop = "16px";
-    const testBtn = btnGroup.createEl("button", { text: "\u6D4B\u8BD5\u8FDE\u63A5", cls: "mod-cta" });
-    testBtn.addEventListener("click", async () => {
-      await this.testConnection();
+    const testBtn = btnGroup.createEl("button", { text: "Test connection", cls: "mod-cta" });
+    testBtn.addEventListener("click", () => {
+      void this.testConnection();
     });
-    const debugBtn = btnGroup.createEl("button", { text: "\u{1F50D} \u8BCA\u65AD" });
-    debugBtn.addEventListener("click", async () => {
-      await this.debugSync();
+    const debugBtn = btnGroup.createEl("button", { text: "Diagnostics" });
+    debugBtn.addEventListener("click", () => {
+      void this.debugSync();
     });
   }
   async testConnection() {
     const { appKey, serverUrl, targetFolderName } = this.plugin.settings;
     if (!appKey) {
-      new import_obsidian2.Notice("\u8BF7\u5148\u8F93\u5165 AppKey");
+      new import_obsidian2.Notice("Enter app key first");
       return;
     }
     new import_obsidian2.Notice("\u6D4B\u8BD5\u8FDE\u63A5\u4E2D...");
@@ -686,7 +682,7 @@ var XgkbPluginSettingTab = class extends import_obsidian2.PluginSettingTab {
   async debugSync() {
     const { appKey, serverUrl, targetFolderName, syncFolder, syncDirection } = this.plugin.settings;
     if (!appKey) {
-      new import_obsidian2.Notice("\u8BF7\u5148\u8F93\u5165 AppKey");
+      new import_obsidian2.Notice("Enter app key first");
       return;
     }
     new import_obsidian2.Notice("\u8BCA\u65AD\u4E2D...");
@@ -700,7 +696,7 @@ var XgkbPluginSettingTab = class extends import_obsidian2.PluginSettingTab {
     try {
       const fsLocal = new FsLocal(this.plugin.app, syncFolder);
       const fsXgkb = new FsXgkb(api, targetFolderName);
-      const localFiles = await fsLocal.listFiles();
+      const localFiles = fsLocal.listFiles();
       lines.push(`\u672C\u5730 .md \u6587\u4EF6: ${localFiles.length} \u4E2A`);
       for (const f of localFiles.slice(0, 10)) {
         lines.push(`  \u{1F4C4} ${f.path}  (${new Date(f.mtime).toLocaleString()})`);
@@ -750,16 +746,17 @@ var XgkbPluginSettingTab = class extends import_obsidian2.PluginSettingTab {
       lines.push(`
 \u8BCA\u65AD\u5B8C\u6210\u3002`);
     } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
       lines.push(`
-\u8BCA\u65AD\u5F02\u5E38: ${e}`);
+\u8BCA\u65AD\u5F02\u5E38: ${message}`);
     }
     const fullText = lines.join("\n");
-    console.log(fullText);
+    console.debug(fullText);
     try {
       const logPath = ".xgkb-sync-debug.log";
       const existing = this.plugin.app.vault.getAbstractFileByPath(logPath);
       if (existing)
-        await this.plugin.app.vault.delete(existing);
+        await this.plugin.app.fileManager.trashFile(existing);
       await this.plugin.app.vault.create(logPath, fullText);
     } catch (e) {
     }
@@ -791,7 +788,7 @@ var SyncEngine = class {
     this.progress = onProgress || (() => {
     });
     const prog = (msg) => {
-      console.log(`[XGKB Sync] ${msg}`);
+      console.debug(`[XGKB Sync] ${msg}`);
       this.progress(msg);
     };
     prog("\u8FDE\u63A5\u7384\u5173\u77E5\u8BC6\u5E93...");
@@ -799,7 +796,7 @@ var SyncEngine = class {
     if (!initResult.ok)
       throw new Error(`\u521D\u59CB\u5316\u5931\u8D25: ${initResult.error}`);
     prog("\u626B\u63CF\u672C\u5730\u6587\u4EF6...");
-    const localFiles = await this.fsLocal.listFiles();
+    const localFiles = this.fsLocal.listFiles();
     prog(`\u672C\u5730: ${localFiles.length} \u4E2A .md \u6587\u4EF6`);
     const { map: remoteMap, newSince } = await this.buildRemoteMap(since, prog);
     prog(`\u4E91\u7AEF: ${remoteMap.size} \u4E2A .md \u6587\u4EF6\uFF08\u6C34\u4F4D ${newSince}\uFF09`);
@@ -977,7 +974,7 @@ var SyncEngine = class {
     for (const f of remoteResult.value)
       map.set(f.path, f);
     const newSince = Date.now();
-    console.log(`[XGKB Sync] \u5168\u91CF\u626B\u63CF\u5B8C\u6210: ${map.size} \u4E2A\u6587\u4EF6\uFF0C\u65B0\u6C34\u4F4D=${newSince} (${new Date(newSince).toLocaleString("zh-CN")})`);
+    console.debug(`[XGKB Sync] \u5168\u91CF\u626B\u63CF\u5B8C\u6210: ${map.size} \u4E2A\u6587\u4EF6\uFF0C\u65B0\u6C34\u4F4D=${newSince} (${new Date(newSince).toLocaleString("zh-CN")})`);
     return { map, newSince };
   }
   // ==================== 计划执行 ====================
@@ -1153,6 +1150,10 @@ var SyncEngine = class {
 };
 
 // src/syncStateDb.ts
+function requestError(request) {
+  var _a, _b;
+  return new Error((_b = (_a = request.error) == null ? void 0 : _a.message) != null ? _b : "IndexedDB request failed");
+}
 var SyncStateDb = class {
   constructor() {
     this.db = null;
@@ -1214,7 +1215,7 @@ var SyncStateDb = class {
       const store = tx.objectStore(DB_STORE_NAME);
       const request = store.put(record);
       request.onsuccess = () => resolve();
-      request.onerror = () => reject(request.error);
+      request.onerror = () => reject(requestError(request));
     });
   }
   async delete(localPath) {
@@ -1225,7 +1226,7 @@ var SyncStateDb = class {
       const store = tx.objectStore(DB_STORE_NAME);
       const request = store.delete(localPath);
       request.onsuccess = () => resolve();
-      request.onerror = () => reject(request.error);
+      request.onerror = () => reject(requestError(request));
     });
   }
   async getAll() {
@@ -1247,7 +1248,7 @@ var SyncStateDb = class {
       const store = tx.objectStore(DB_STORE_NAME);
       const request = store.clear();
       request.onsuccess = () => resolve();
-      request.onerror = () => reject(request.error);
+      request.onerror = () => reject(requestError(request));
     });
   }
 };
@@ -1261,12 +1262,12 @@ var XgkbSyncPlugin = class extends import_obsidian3.Plugin {
   }
   async onload() {
     await this.loadSettings();
-    this.addRibbonIcon("refresh-cw", "XGKB \u540C\u6B65", async () => {
+    this.addRibbonIcon("refresh-cw", "Sync xgkb", async () => {
       await this.runSync();
     });
     this.addCommand({
       id: "xgkb-sync-now",
-      name: "\u7ACB\u5373\u540C\u6B65",
+      name: "Sync now",
       callback: async () => {
         await this.runSync();
       }
@@ -1291,10 +1292,10 @@ var XgkbSyncPlugin = class extends import_obsidian3.Plugin {
     const intervalMs = intervalMin * 60 * 1e3;
     this.autoSyncHandle = this.registerInterval(
       window.setInterval(() => {
-        this.runSync();
+        void this.runSync();
       }, intervalMs)
     );
-    console.log(`[XGKB Sync] \u81EA\u52A8\u540C\u6B65\u5DF2\u542F\u52A8\uFF0C\u95F4\u9694 ${intervalMin} \u5206\u949F`);
+    console.debug(`[XGKB Sync] \u81EA\u52A8\u540C\u6B65\u5DF2\u542F\u52A8\uFF0C\u95F4\u9694 ${intervalMin} \u5206\u949F`);
   }
   async loadSettings() {
     var _a;
@@ -1309,17 +1310,17 @@ var XgkbSyncPlugin = class extends import_obsidian3.Plugin {
   async runSync() {
     var _a;
     if (!this.settings.appKey) {
-      new import_obsidian3.Notice("XGKB Sync: \u8BF7\u5148\u5728\u8BBE\u7F6E\u4E2D\u914D\u7F6E appKey");
+      new import_obsidian3.Notice("Xgkb sync: Configure app key first");
       return;
     }
     if (this.isSyncing) {
-      console.log("[XGKB Sync] \u4E0A\u6B21\u540C\u6B65\u4ECD\u5728\u8FDB\u884C\uFF0C\u8DF3\u8FC7\u672C\u6B21\u89E6\u53D1");
+      console.debug("[XGKB Sync] \u4E0A\u6B21\u540C\u6B65\u4ECD\u5728\u8FDB\u884C\uFF0C\u8DF3\u8FC7\u672C\u6B21\u89E6\u53D1");
       return;
     }
     this.isSyncing = true;
     const isIncremental = this.lastSyncTime !== void 0;
     const sinceStr = this.lastSyncTime ? new Date(this.lastSyncTime).toLocaleString("zh-CN") : "\u65E0\uFF08\u9996\u6B21\u5168\u91CF\uFF09";
-    console.log(`[XGKB Sync] ===== \u5F00\u59CB\u540C\u6B65 mode=${isIncremental ? "\u589E\u91CF" : "\u5168\u91CF"} lastSyncTime=${(_a = this.lastSyncTime) != null ? _a : "-"} (${sinceStr}) =====`);
+    console.debug(`[XGKB Sync] ===== \u5F00\u59CB\u540C\u6B65 mode=${isIncremental ? "\u589E\u91CF" : "\u5168\u91CF"} lastSyncTime=${(_a = this.lastSyncTime) != null ? _a : "-"} (${sinceStr}) =====`);
     new import_obsidian3.Notice(`XGKB Sync: \u5F00\u59CB${isIncremental ? "\u589E\u91CF" : "\u5168\u91CF"}\u540C\u6B65...`);
     const db = new SyncStateDb();
     let dbOpened = false;
@@ -1338,7 +1339,7 @@ var XgkbSyncPlugin = class extends import_obsidian3.Plugin {
       if (stats.newSince) {
         this.lastSyncTime = stats.newSince;
         await this.saveSettings();
-        console.log(`[XGKB Sync] \u6C34\u4F4D\u5DF2\u66F4\u65B0: ${stats.newSince} (${new Date(stats.newSince).toLocaleString("zh-CN")})`);
+        console.debug(`[XGKB Sync] \u6C34\u4F4D\u5DF2\u66F4\u65B0: ${stats.newSince} (${new Date(stats.newSince).toLocaleString("zh-CN")})`);
       }
       const lines = [];
       if (stats.uploaded > 0)

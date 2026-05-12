@@ -4,7 +4,6 @@ import type {
 	SyncStateRecord,
 	SyncStats,
 	ProgressCallback,
-	Result,
 } from "./types";
 import { SyncStateDb } from "./syncStateDb";
 import { FsLocal } from "./fsLocal";
@@ -59,7 +58,7 @@ export class SyncEngine {
 		this.stats = this.emptyStats();
 		this.progress = onProgress || (() => {});
 		const prog = (msg: string) => {
-			console.log(`[XGKB Sync] ${msg}`);
+			console.debug(`[XGKB Sync] ${msg}`);
 			this.progress(msg);
 		};
 
@@ -70,7 +69,7 @@ export class SyncEngine {
 
 		// Step 2: 扫描本地文件
 		prog("扫描本地文件...");
-		const localFiles = await this.fsLocal.listFiles();
+		const localFiles = this.fsLocal.listFiles();
 		prog(`本地: ${localFiles.length} 个 .md 文件`);
 
 		// Step 3: 构建云端视图（增量优先，失败降级全量）
@@ -283,7 +282,7 @@ export class SyncEngine {
 		const map = new Map<string, FileEntry>();
 		for (const f of remoteResult.value) map.set(f.path, f);
 		const newSince = Date.now();
-		console.log(`[XGKB Sync] 全量扫描完成: ${map.size} 个文件，新水位=${newSince} (${new Date(newSince).toLocaleString("zh-CN")})`);
+		console.debug(`[XGKB Sync] 全量扫描完成: ${map.size} 个文件，新水位=${newSince} (${new Date(newSince).toLocaleString("zh-CN")})`);
 		return { map, newSince };
 	}
 

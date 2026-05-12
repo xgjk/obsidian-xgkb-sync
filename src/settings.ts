@@ -17,14 +17,13 @@ export class XgkbPluginSettingTab extends PluginSettingTab {
 	display(): void {
 		const { containerEl } = this;
 		containerEl.empty();
-		containerEl.createEl("h2", { text: "XGKB Sync 设置" });
 
 		new Setting(containerEl)
-			.setName("AppKey")
+			.setName("App key")
 			.setDesc("玄关知识库 API 密钥")
 			.addText((text) =>
 				text
-					.setPlaceholder("输入 appKey")
+					.setPlaceholder("Enter app key")
 					.setValue(this.plugin.settings.appKey)
 					.onChange(async (value) => {
 						this.plugin.settings.appKey = value;
@@ -46,11 +45,11 @@ export class XgkbPluginSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-			.setName("同步文件夹")
-			.setDesc("Obsidian 中用于同步的文件夹路径（空 = 同步整个 Vault）")
+			.setName("Sync folder")
+			.setDesc("Obsidian 中用于同步的文件夹路径（空 = 同步整个 vault）")
 			.addText((text) =>
 				text
-					.setPlaceholder("如：Notes")
+					.setPlaceholder("Example: Notes")
 					.setValue(this.plugin.settings.syncFolder)
 					.onChange(async (value) => {
 						this.plugin.settings.syncFolder = value;
@@ -59,7 +58,7 @@ export class XgkbPluginSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-			.setName("云端目标目录")
+			.setName("Cloud target folder")
 			.setDesc("玄关知识库中目标文件夹名称")
 			.addText((text) =>
 				text
@@ -72,13 +71,13 @@ export class XgkbPluginSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-			.setName("同步方向")
+			.setName("Sync direction")
 			.setDesc("双向同步 / 仅推送 / 仅拉取")
 			.addDropdown((dropdown) =>
 				dropdown
-					.addOption("bidirectional", "双向 (Bidirectional)")
-					.addOption("push", "仅推送 (Push)")
-					.addOption("pull", "仅拉取 (Pull)")
+					.addOption("bidirectional", "Bidirectional")
+					.addOption("push", "Push only")
+					.addOption("pull", "Pull only")
 					.setValue(this.plugin.settings.syncDirection)
 					.onChange(async (value) => {
 						this.plugin.settings.syncDirection = value as XgkbPluginSettings["syncDirection"];
@@ -87,16 +86,16 @@ export class XgkbPluginSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-			.setName("自动同步间隔")
+			.setName("Automatic sync interval")
 			.setDesc("定期自动执行同步，关闭则仅手动触发")
 			.addDropdown((dropdown) =>
 				dropdown
-					.addOption("0",  "关闭（手动同步）")
-					.addOption("5",  "每 5 分钟")
-					.addOption("10", "每 10 分钟")
-					.addOption("30", "每 30 分钟")
-					.addOption("60", "每 1 小时")
-					.addOption("120", "每 2 小时")
+					.addOption("0",  "Off (manual sync)")
+					.addOption("5",  "Every 5 minutes")
+					.addOption("10", "Every 10 minutes")
+					.addOption("30", "Every 30 minutes")
+					.addOption("60", "Every hour")
+					.addOption("120", "Every 2 hours")
 					.setValue(String(this.plugin.settings.autoSyncInterval))
 					.onChange(async (value) => {
 						this.plugin.settings.autoSyncInterval = Number(value);
@@ -107,25 +106,22 @@ export class XgkbPluginSettingTab extends PluginSettingTab {
 
 		// 按钮组
 		const btnGroup = containerEl.createDiv({ cls: "xgkb-settings-button-group" });
-		btnGroup.style.display = "flex";
-		btnGroup.style.gap = "8px";
-		btnGroup.style.marginTop = "16px";
 
-		const testBtn = btnGroup.createEl("button", { text: "测试连接", cls: "mod-cta" });
-		testBtn.addEventListener("click", async () => {
-			await this.testConnection();
+		const testBtn = btnGroup.createEl("button", { text: "Test connection", cls: "mod-cta" });
+		testBtn.addEventListener("click", () => {
+			void this.testConnection();
 		});
 
-		const debugBtn = btnGroup.createEl("button", { text: "🔍 诊断" });
-		debugBtn.addEventListener("click", async () => {
-			await this.debugSync();
+		const debugBtn = btnGroup.createEl("button", { text: "Diagnostics" });
+		debugBtn.addEventListener("click", () => {
+			void this.debugSync();
 		});
 	}
 
 	private async testConnection(): Promise<void> {
 		const { appKey, serverUrl, targetFolderName } = this.plugin.settings;
 		if (!appKey) {
-			new Notice("请先输入 AppKey");
+			new Notice("Enter app key first");
 			return;
 		}
 
@@ -168,7 +164,7 @@ export class XgkbPluginSettingTab extends PluginSettingTab {
 	private async debugSync(): Promise<void> {
 		const { appKey, serverUrl, targetFolderName, syncFolder, syncDirection } = this.plugin.settings;
 		if (!appKey) {
-			new Notice("请先输入 AppKey");
+			new Notice("Enter app key first");
 			return;
 		}
 
@@ -184,7 +180,7 @@ export class XgkbPluginSettingTab extends PluginSettingTab {
 			const fsXgkb = new FsXgkb(api, targetFolderName);
 
 			// 本地文件
-			const localFiles = await fsLocal.listFiles();
+			const localFiles = fsLocal.listFiles();
 			lines.push(`本地 .md 文件: ${localFiles.length} 个`);
 			for (const f of localFiles.slice(0, 10)) {
 				lines.push(`  📄 ${f.path}  (${new Date(f.mtime).toLocaleString()})`);
@@ -230,17 +226,18 @@ export class XgkbPluginSettingTab extends PluginSettingTab {
 
 			lines.push(`\n诊断完成。`);
 		} catch (e) {
-			lines.push(`\n诊断异常: ${e}`);
+			const message = e instanceof Error ? e.message : String(e);
+			lines.push(`\n诊断异常: ${message}`);
 		}
 
 		const fullText = lines.join("\n");
-		console.log(fullText);
+		console.debug(fullText);
 
 		// 写入日志文件
 		try {
 			const logPath = ".xgkb-sync-debug.log";
 			const existing = this.plugin.app.vault.getAbstractFileByPath(logPath);
-			if (existing) await this.plugin.app.vault.delete(existing);
+			if (existing) await this.plugin.app.fileManager.trashFile(existing);
 			await this.plugin.app.vault.create(logPath, fullText);
 		} catch { /* ignore */ }
 

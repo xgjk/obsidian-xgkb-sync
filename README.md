@@ -34,7 +34,7 @@ After enabling the plugin, open plugin settings and configure:
 
 ## Compatibility
 
-- `minAppVersion`: `1.0.0`
+- `minAppVersion`: `1.6.6`
 - Plugin ID: `cms-xgkb-sync`
 
 ## Development
