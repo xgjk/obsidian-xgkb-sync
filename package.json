@@ -1,7 +1,7 @@
 {
   "name": "cms-xgkb-sync",
-  "version": "2.0.1",
-  "description": "Sync notes with 玄关知识库 (XGKB Knowledge Base)",
+  "version": "2.0.2",
+  "description": "Sync notes with XGKB Knowledge Base",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",
