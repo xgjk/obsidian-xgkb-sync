@@ -610,7 +610,7 @@ var XgkbPluginSettingTab = class extends import_obsidian2.PluginSettingTab {
       })
     );
     new import_obsidian2.Setting(containerEl).setName("Sync folder").setDesc("Obsidian \u4E2D\u7528\u4E8E\u540C\u6B65\u7684\u6587\u4EF6\u5939\u8DEF\u5F84\uFF08\u7A7A = \u540C\u6B65\u6574\u4E2A vault\uFF09").addText(
-      (text) => text.setPlaceholder("Example: Notes").setValue(this.plugin.settings.syncFolder).onChange(async (value) => {
+      (text) => text.setPlaceholder("Example: notes").setValue(this.plugin.settings.syncFolder).onChange(async (value) => {
         this.plugin.settings.syncFolder = value;
         await this.plugin.saveSettings();
       })
@@ -1310,7 +1310,7 @@ var XgkbSyncPlugin = class extends import_obsidian3.Plugin {
   async runSync() {
     var _a;
     if (!this.settings.appKey) {
-      new import_obsidian3.Notice("Xgkb sync: Configure app key first");
+      new import_obsidian3.Notice("Xgkb sync: configure app key first");
       return;
     }
     if (this.isSyncing) {

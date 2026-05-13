@@ -49,7 +49,7 @@ export class XgkbPluginSettingTab extends PluginSettingTab {
 			.setDesc("Obsidian 中用于同步的文件夹路径（空 = 同步整个 vault）")
 			.addText((text) =>
 				text
-					.setPlaceholder("Example: Notes")
+					.setPlaceholder("Example: notes")
 					.setValue(this.plugin.settings.syncFolder)
 					.onChange(async (value) => {
 						this.plugin.settings.syncFolder = value;

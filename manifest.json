@@ -3,7 +3,7 @@
   "name": "XGKB Sync",
   "version": "2.0.1",
   "minAppVersion": "1.6.6",
-  "description": "Sync notes with 玄关知识库 (XGKB Knowledge Base)",
-  "author": "Evan",
+  "description": "Sync notes with XGKB Knowledge Base",
+  "author": "cwei001",
   "isDesktopOnly": false
 }

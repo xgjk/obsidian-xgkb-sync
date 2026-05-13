@@ -84,7 +84,7 @@ export default class XgkbSyncPlugin extends Plugin {
 
 	private async runSync() {
 		if (!this.settings.appKey) {
-			new Notice("Xgkb sync: Configure app key first");
+			new Notice("Xgkb sync: configure app key first");
 			return;
 		}
 
