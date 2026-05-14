@@ -1,7 +1,7 @@
 {
   "name": "cms-xgkb-sync",
   "version": "2.0.2",
-  "description": "Sync notes with XGKB Knowledge Base",
+  "description": "Sync notes with XGKB Knowledge Base.",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",
@@ -9,7 +9,7 @@
     "build": "npm run sync:manifest-version && node esbuild.config.mjs production"
   },
   "keywords": [],
-  "author": "Evan",
+  "author": "cwei001",
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^16.11.6",
