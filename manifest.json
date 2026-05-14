@@ -3,7 +3,7 @@
   "name": "XGKB Sync",
   "version": "2.0.2",
   "minAppVersion": "1.6.6",
-  "description": "Sync notes with XGKB Knowledge Base",
+  "description": "Sync notes with XGKB Knowledge Base.",
   "author": "cwei001",
   "isDesktopOnly": false
 }
