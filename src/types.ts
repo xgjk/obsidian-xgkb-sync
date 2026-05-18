@@ -10,10 +10,27 @@ export interface XgkbPluginSettings {
 	autoSyncInterval: number;
 }
 
+/** 同步作用域身份快照（用于展示与持久化） */
+export interface SyncScopeFingerprint {
+	serverUrl: string;
+	projectId: string;
+	targetFolderName: string;
+	syncFolder: string;
+}
+
+/** 单个同步作用域的运行时状态（按 scopeKey 隔离水位） */
+export interface SyncScopeEntry {
+	lastSyncTime?: number;
+	rootFileId?: string;
+	lastSuccessAt?: number;
+	fingerprint?: SyncScopeFingerprint;
+}
+
 export type SyncStatus = "done" | "failed";
 
 export interface SyncStateRecord {
-	localPath: string;         // 主键：相对路径，如 "日常学习/笔记.md"
+	scopeKey: string;          // 复合主键之一：同步作用域
+	localPath: string;         // 复合主键之一：相对路径，如 "日常学习/笔记.md"
 	xgkbFileId: string;        // 玄关文件 ID（统一 string）
 	xgkbFolderId: string;      // 玄关父文件夹 ID
 	localMtime: number;        // 上次同步后的本地 mtime（毫秒）

@@ -74,7 +74,7 @@ var BATCH_GET_CONTENT_MAX = 10;
 var BATCH_GET_META_MAX = 50;
 var CHANGES_SAFETY_WINDOW_MS = 5e3;
 var DB_NAME = "xgkb-sync-state";
-var DB_VERSION = 1;
+var DB_VERSION = 2;
 var DB_STORE_NAME = "syncState";
 var MAX_RETRIES = 3;
 var RETRY_BASE_DELAY_MS = 1e3;
@@ -663,35 +663,35 @@ var XgkbPluginSettingTab = class extends import_obsidian2.PluginSettingTab {
     new import_obsidian2.Setting(containerEl).setName("App key").setDesc("\u7384\u5173\u77E5\u8BC6\u5E93 API \u5BC6\u94A5").addText(
       (text) => text.setPlaceholder("Enter app key").setValue(this.plugin.settings.appKey).onChange(async (value) => {
         this.plugin.settings.appKey = value;
-        await this.plugin.saveSettings();
+        await this.plugin.onScopeIdentityChanged();
       })
     );
     new import_obsidian2.Setting(containerEl).setName("Server URL").setDesc("\u7384\u5173\u77E5\u8BC6\u5E93 API \u5730\u5740").addText(
       (text) => text.setPlaceholder(DEFAULT_SETTINGS.serverUrl).setValue(this.plugin.settings.serverUrl).onChange(async (value) => {
         this.plugin.settings.serverUrl = value || DEFAULT_SETTINGS.serverUrl;
-        await this.plugin.saveSettings();
+        await this.plugin.onScopeIdentityChanged();
       })
     );
-    new import_obsidian2.Setting(containerEl).setName("Project ID").setDesc("\u76EE\u6807\u77E5\u8BC6\u5E93\u7A7A\u95F4 ID\uFF1B\u7559\u7A7A\u5219\u540C\u6B65\u5230\u4E2A\u4EBA\u77E5\u8BC6\u5E93\u3002\u5207\u6362\u7A7A\u95F4\u540E\u5EFA\u8BAE\u91CD\u65B0\u5168\u91CF\u540C\u6B65\u3002").addText(
+    new import_obsidian2.Setting(containerEl).setName("Project ID").setDesc("\u76EE\u6807\u77E5\u8BC6\u5E93\u7A7A\u95F4 ID\uFF1B\u7559\u7A7A\u5219\u540C\u6B65\u5230\u4E2A\u4EBA\u77E5\u8BC6\u5E93\u3002\u5207\u6362\u7A7A\u95F4\u5C06\u81EA\u52A8\u4F7F\u7528\u72EC\u7ACB\u6C34\u4F4D\u3002").addText(
       (text) => {
         var _a;
         return text.setPlaceholder("\u7559\u7A7A = \u4E2A\u4EBA\u77E5\u8BC6\u5E93").setValue((_a = this.plugin.settings.projectId) != null ? _a : "").onChange(async (value) => {
           this.plugin.settings.projectId = value.trim();
-          await this.plugin.saveSettings();
+          await this.plugin.onScopeIdentityChanged();
         });
       }
     );
     new import_obsidian2.Setting(containerEl).setName("Sync folder").setDesc("Obsidian \u4E2D\u7528\u4E8E\u540C\u6B65\u7684\u6587\u4EF6\u5939\u8DEF\u5F84\uFF08\u7A7A = \u540C\u6B65\u6574\u4E2A vault\uFF09").addText(
       (text) => text.setPlaceholder("Example: notes").setValue(this.plugin.settings.syncFolder).onChange(async (value) => {
         this.plugin.settings.syncFolder = value;
-        await this.plugin.saveSettings();
+        await this.plugin.onScopeIdentityChanged();
       })
     );
     new import_obsidian2.Setting(containerEl).setName("Cloud target folder").setDesc("\u77E5\u8BC6\u5E93\u4E2D\u7684\u540C\u6B65\u6839\u76EE\u5F55\uFF1B\u652F\u6301\u591A\u7EA7\u8DEF\u5F84\uFF0C\u5982 Obsidian \u6216 A/B\uFF08\u4E0D\u5B58\u5728\u65F6\u81EA\u52A8\u521B\u5EFA\uFF09").addText(
       (text) => text.setPlaceholder("Obsidian \u6216 A/B").setValue(this.plugin.settings.targetFolderName).onChange(async (value) => {
         const normalized = normalizeTargetFolderPath(value);
         this.plugin.settings.targetFolderName = normalized || "Obsidian";
-        await this.plugin.saveSettings();
+        await this.plugin.onScopeIdentityChanged();
       })
     );
     new import_obsidian2.Setting(containerEl).setName("Sync direction").setDesc("\u53CC\u5411\u540C\u6B65 / \u4EC5\u63A8\u9001 / \u4EC5\u62C9\u53D6").addDropdown(
@@ -715,6 +715,14 @@ var XgkbPluginSettingTab = class extends import_obsidian2.PluginSettingTab {
     const debugBtn = btnGroup.createEl("button", { text: "Diagnostics" });
     debugBtn.addEventListener("click", () => {
       void this.debugSync();
+    });
+    const resetScopeBtn = btnGroup.createEl("button", { text: "Reset current scope" });
+    resetScopeBtn.addEventListener("click", () => {
+      void this.plugin.resetCurrentSyncScope();
+    });
+    const resetAllBtn = btnGroup.createEl("button", { text: "Reset all scopes" });
+    resetAllBtn.addEventListener("click", () => {
+      void this.plugin.resetAllSyncScopes();
     });
   }
   async testConnection() {
@@ -766,8 +774,11 @@ var XgkbPluginSettingTab = class extends import_obsidian2.PluginSettingTab {
     lines.push(`\u540C\u6B65\u65B9\u5411: ${syncDirection}`);
     lines.push(`SyncFolder: "${syncFolder || "(\u6574\u4E2AVault)"}"`);
     lines.push(`TargetFolder: "${targetFolderName}"`);
-    lines.push(`ProjectId: "${(projectId == null ? void 0 : projectId.trim()) || "(\u4E2A\u4EBA\u77E5\u8BC6\u5E93)"}"
-`);
+    lines.push(`ProjectId: "${(projectId == null ? void 0 : projectId.trim()) || "(\u4E2A\u4EBA\u77E5\u8BC6\u5E93)"}"`);
+    for (const line of this.plugin.getScopeDiagnosticLines()) {
+      lines.push(line);
+    }
+    lines.push("");
     try {
       const fsLocal = new FsLocal(this.plugin.app, syncFolder);
       const fsXgkb = new FsXgkb(api, targetFolderName, projectId);
@@ -841,13 +852,14 @@ var XgkbPluginSettingTab = class extends import_obsidian2.PluginSettingTab {
 
 // src/syncEngine.ts
 var SyncEngine = class {
-  constructor(fsLocal, fsXgkb, db, settings) {
+  constructor(fsLocal, fsXgkb, db, settings, scopeKey) {
     this.progress = () => {
     };
     this.fsLocal = fsLocal;
     this.fsXgkb = fsXgkb;
     this.db = db;
     this.settings = { ...DEFAULT_SETTINGS, ...settings };
+    this.scopeKey = scopeKey;
     this.stats = this.emptyStats();
   }
   emptyStats() {
@@ -889,7 +901,7 @@ var SyncEngine = class {
         prog(`\u51B3\u7B56\u4E2D ${idx}/${allPaths.size}...`);
       const local = localMap.get(path);
       const remote = remoteMap.get(path);
-      const record = await this.db.get(path);
+      const record = await this.db.get(this.scopeKey, path);
       const op = this.decide(path, local, remote, record);
       plans.push({ path, local, remote, record, op });
     }
@@ -956,7 +968,7 @@ var SyncEngine = class {
       else
         upsertById.set(id, item);
     }
-    const allRecords = await this.db.getAll();
+    const allRecords = await this.db.getAll(this.scopeKey);
     const fileIdToRecord = /* @__PURE__ */ new Map();
     for (const r of allRecords)
       fileIdToRecord.set(r.xgkbFileId, r);
@@ -1061,7 +1073,7 @@ var SyncEngine = class {
           await this.doUploadNew(path, local);
           break;
         case "upload-update":
-          await this.doUploadUpdate(path, local, record);
+          await this.doUploadUpdate(path, local, remote, record);
           break;
         case "download-new":
           await this.doDownloadNew(path, remote, contentCache);
@@ -1135,37 +1147,55 @@ var SyncEngine = class {
     return "skip";
   }
   // ==================== 操作执行 ====================
+  /** 保证 IndexedDB 复合主键 scopeKey + localPath 始终存在 */
+  buildDbRecord(path, partial) {
+    var _a;
+    return {
+      scopeKey: this.scopeKey,
+      localPath: path,
+      xgkbFileId: partial.xgkbFileId,
+      xgkbFolderId: partial.xgkbFolderId,
+      localMtime: partial.localMtime,
+      remoteMtime: partial.remoteMtime,
+      syncStatus: (_a = partial.syncStatus) != null ? _a : "done",
+      lastSyncAt: Date.now(),
+      ...partial.lastError !== void 0 ? { lastError: partial.lastError } : {}
+    };
+  }
   async doUploadNew(path, local) {
     const content = await this.fsLocal.readFile(path);
     const result = await this.fsXgkb.createFile(path, content);
     if (!result.ok)
       throw new Error(`\u4E0A\u4F20\u5931\u8D25: ${result.error}`);
-    await this.db.put({
-      localPath: path,
-      xgkbFileId: result.value.fileId,
-      xgkbFolderId: result.value.folderId,
-      localMtime: local.mtime,
-      remoteMtime: Date.now(),
-      syncStatus: "done",
-      lastSyncAt: Date.now()
-    });
+    await this.db.put(
+      this.buildDbRecord(path, {
+        xgkbFileId: result.value.fileId,
+        xgkbFolderId: result.value.folderId,
+        localMtime: local.mtime,
+        remoteMtime: Date.now()
+      })
+    );
     this.stats.uploaded++;
     this.progress(`\u2191 ${path}`);
   }
-  async doUploadUpdate(path, local, record) {
+  async doUploadUpdate(path, local, remote, record) {
+    var _a, _b, _c;
+    const fileId = (_a = record == null ? void 0 : record.xgkbFileId) != null ? _a : remote.xgkbFileId;
+    if (!fileId)
+      throw new Error("\u7F3A\u5C11\u4E91\u7AEF\u6587\u4EF6 ID\uFF0C\u65E0\u6CD5\u66F4\u65B0");
     const content = await this.fsLocal.readFile(path);
     const fileName = path.split("/").pop() || path;
-    const result = await this.fsXgkb.updateFile(record.xgkbFileId, fileName, content);
+    const result = await this.fsXgkb.updateFile(fileId, fileName, content);
     if (!result.ok)
       throw new Error(`\u66F4\u65B0\u5931\u8D25: ${result.error}`);
-    await this.db.put({
-      ...record,
-      localMtime: local.mtime,
-      remoteMtime: Date.now(),
-      syncStatus: "done",
-      lastSyncAt: Date.now(),
-      lastError: void 0
-    });
+    await this.db.put(
+      this.buildDbRecord(path, {
+        xgkbFileId: fileId,
+        xgkbFolderId: (_c = (_b = record == null ? void 0 : record.xgkbFolderId) != null ? _b : remote.xgkbFolderId) != null ? _c : "",
+        localMtime: local.mtime,
+        remoteMtime: Date.now()
+      })
+    );
     this.stats.uploaded++;
     this.progress(`\u2191 ${path}`);
   }
@@ -1177,19 +1207,19 @@ var SyncEngine = class {
       return r.value;
     });
     const actualMtime = await this.fsLocal.writeFile(path, body);
-    await this.db.put({
-      localPath: path,
-      xgkbFileId: remote.xgkbFileId,
-      xgkbFolderId: remote.xgkbFolderId || "",
-      localMtime: actualMtime,
-      remoteMtime: remote.mtime,
-      syncStatus: "done",
-      lastSyncAt: Date.now()
-    });
+    await this.db.put(
+      this.buildDbRecord(path, {
+        xgkbFileId: remote.xgkbFileId,
+        xgkbFolderId: remote.xgkbFolderId || "",
+        localMtime: actualMtime,
+        remoteMtime: remote.mtime
+      })
+    );
     this.stats.downloaded++;
     this.progress(`\u2193 ${path}`);
   }
   async doDownloadUpdate(path, remote, record, contentCache) {
+    var _a, _b;
     const fid = remote.xgkbFileId;
     const body = contentCache.has(fid) ? contentCache.get(fid) : await this.fsXgkb.readFile(fid).then((r) => {
       if (!r.ok)
@@ -1197,20 +1227,20 @@ var SyncEngine = class {
       return r.value;
     });
     const actualMtime = await this.fsLocal.writeFile(path, body);
-    await this.db.put({
-      ...record,
-      localMtime: actualMtime,
-      remoteMtime: remote.mtime,
-      syncStatus: "done",
-      lastSyncAt: Date.now(),
-      lastError: void 0
-    });
+    await this.db.put(
+      this.buildDbRecord(path, {
+        xgkbFileId: fid,
+        xgkbFolderId: (_b = (_a = record == null ? void 0 : record.xgkbFolderId) != null ? _a : remote.xgkbFolderId) != null ? _b : "",
+        localMtime: actualMtime,
+        remoteMtime: remote.mtime
+      })
+    );
     this.stats.downloaded++;
     this.progress(`\u2193 ${path}`);
   }
   async doDeleteLocal(path, record) {
     await this.fsLocal.trashFile(path);
-    await this.db.delete(path);
+    await this.db.delete(this.scopeKey, path);
     this.stats.deleted++;
     this.progress(`\u2717 \u672C\u5730\u5220\u9664 ${path}`);
   }
@@ -1218,7 +1248,7 @@ var SyncEngine = class {
     const result = await this.fsXgkb.deleteFile(record.xgkbFileId);
     if (!result.ok)
       throw new Error(`\u5220\u9664\u4E91\u7AEF\u5931\u8D25: ${result.error}`);
-    await this.db.delete(record.localPath);
+    await this.db.delete(this.scopeKey, record.localPath);
     this.stats.deleted++;
     this.progress(`\u2717 \u4E91\u7AEF\u5220\u9664 ${record.localPath}`);
   }
@@ -1236,11 +1266,18 @@ var SyncStateDb = class {
   async open() {
     return new Promise((resolve) => {
       const request = indexedDB.open(DB_NAME, DB_VERSION);
-      request.onupgradeneeded = () => {
+      request.onupgradeneeded = (event) => {
         const db = request.result;
+        const oldVersion = event.oldVersion;
+        if (oldVersion > 0 && oldVersion < DB_VERSION && db.objectStoreNames.contains(DB_STORE_NAME)) {
+          db.deleteObjectStore(DB_STORE_NAME);
+        }
         if (!db.objectStoreNames.contains(DB_STORE_NAME)) {
-          const store = db.createObjectStore(DB_STORE_NAME, { keyPath: "localPath" });
+          const store = db.createObjectStore(DB_STORE_NAME, {
+            keyPath: ["scopeKey", "localPath"]
+          });
           store.createIndex("xgkbFileId", "xgkbFileId", { unique: false });
+          store.createIndex("scopeKey", "scopeKey", { unique: false });
         }
       };
       request.onsuccess = () => {
@@ -1259,25 +1296,13 @@ var SyncStateDb = class {
       this.db = null;
     }
   }
-  async get(localPath) {
+  async get(scopeKey, localPath) {
     if (!this.db)
       return void 0;
     return new Promise((resolve) => {
       const tx = this.db.transaction(DB_STORE_NAME, "readonly");
       const store = tx.objectStore(DB_STORE_NAME);
-      const request = store.get(localPath);
-      request.onsuccess = () => resolve(request.result || void 0);
-      request.onerror = () => resolve(void 0);
-    });
-  }
-  async getByXgkbFileId(xgkbFileId) {
-    if (!this.db)
-      return void 0;
-    return new Promise((resolve) => {
-      const tx = this.db.transaction(DB_STORE_NAME, "readonly");
-      const store = tx.objectStore(DB_STORE_NAME);
-      const index = store.index("xgkbFileId");
-      const request = index.get(xgkbFileId);
+      const request = store.get([scopeKey, localPath]);
       request.onsuccess = () => resolve(request.result || void 0);
       request.onerror = () => resolve(void 0);
     });
@@ -1293,26 +1318,48 @@ var SyncStateDb = class {
       request.onerror = () => reject(requestError(request));
     });
   }
-  async delete(localPath) {
+  async delete(scopeKey, localPath) {
     if (!this.db)
       return;
     return new Promise((resolve, reject) => {
       const tx = this.db.transaction(DB_STORE_NAME, "readwrite");
       const store = tx.objectStore(DB_STORE_NAME);
-      const request = store.delete(localPath);
+      const request = store.delete([scopeKey, localPath]);
       request.onsuccess = () => resolve();
       request.onerror = () => reject(requestError(request));
     });
   }
-  async getAll() {
+  async getAll(scopeKey) {
     if (!this.db)
       return [];
     return new Promise((resolve) => {
       const tx = this.db.transaction(DB_STORE_NAME, "readonly");
       const store = tx.objectStore(DB_STORE_NAME);
-      const request = store.getAll();
+      const index = store.index("scopeKey");
+      const request = index.getAll(scopeKey);
       request.onsuccess = () => resolve(request.result || []);
       request.onerror = () => resolve([]);
+    });
+  }
+  async deleteAllForScope(scopeKey) {
+    if (!this.db)
+      return;
+    const records = await this.getAll(scopeKey);
+    if (records.length === 0)
+      return;
+    return new Promise((resolve, reject) => {
+      const tx = this.db.transaction(DB_STORE_NAME, "readwrite");
+      const store = tx.objectStore(DB_STORE_NAME);
+      let pending = records.length;
+      for (const r of records) {
+        const request = store.delete([scopeKey, r.localPath]);
+        request.onsuccess = () => {
+          pending--;
+          if (pending === 0)
+            resolve();
+        };
+        request.onerror = () => reject(requestError(request));
+      }
     });
   }
   async clear() {
@@ -1328,10 +1375,60 @@ var SyncStateDb = class {
   }
 };
 
+// src/syncScope.ts
+var DATA_SCHEMA_VERSION = 2;
+function buildScopeFingerprint(settings) {
+  return {
+    serverUrl: (settings.serverUrl || "").trim(),
+    projectId: (settings.projectId || "").trim(),
+    targetFolderName: normalizeTargetFolderPath(settings.targetFolderName) || "Obsidian",
+    syncFolder: (settings.syncFolder || "").trim()
+  };
+}
+function buildScopeMaterial(settings) {
+  const fp = buildScopeFingerprint(settings);
+  const appKeyPart = settings.appKey.trim() ? `appKey:${settings.appKey.trim()}` : "appKey:";
+  const projectPart = fp.projectId || "__personal__";
+  return [fp.serverUrl, appKeyPart, projectPart, fp.targetFolderName, fp.syncFolder].join("\0");
+}
+async function computeScopeKey(settings) {
+  const material = buildScopeMaterial(settings);
+  const data = new TextEncoder().encode(material);
+  const hash = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(hash)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+function formatScopeLabel(fingerprint) {
+  if (!fingerprint)
+    return "(\u672A\u77E5)";
+  const proj = fingerprint.projectId || "\u4E2A\u4EBA\u5E93";
+  const folder = fingerprint.targetFolderName || "Obsidian";
+  const local = fingerprint.syncFolder || "(\u6574\u4E2A Vault)";
+  return `target=${folder} projectId=${proj} syncFolder=${local}`;
+}
+function isLegacyPersistedData(raw) {
+  const ver = raw.dataSchemaVersion;
+  if (typeof ver === "number" && ver >= DATA_SCHEMA_VERSION)
+    return false;
+  if (raw.syncScopes && typeof raw.syncScopes === "object")
+    return false;
+  if (typeof raw.lastSyncTime === "number")
+    return true;
+  if (typeof ver === "number" && ver < DATA_SCHEMA_VERSION)
+    return true;
+  return false;
+}
+
 // src/main.ts
+function stripPersistedMeta(raw) {
+  const { lastSyncTime, dataSchemaVersion, activeScopeKey, syncScopes, ...rest } = raw;
+  return rest;
+}
 var XgkbSyncPlugin = class extends import_obsidian3.Plugin {
   constructor() {
     super(...arguments);
+    this.dataSchemaVersion = DATA_SCHEMA_VERSION;
+    this.activeScopeKey = "";
+    this.syncScopes = {};
     /** 防止并发执行多次同步 */
     this.isSyncing = false;
   }
@@ -1350,11 +1447,6 @@ var XgkbSyncPlugin = class extends import_obsidian3.Plugin {
     this.addSettingTab(new XgkbPluginSettingTab(this.app, this));
     this.scheduleAutoSync();
   }
-  /**
-   * 注册/重置自动同步定时器。
-   * 设置页修改间隔时调用，或插件加载时调用。
-   * 使用 Plugin.registerInterval 确保插件卸载时自动清理。
-   */
   scheduleAutoSync() {
     var _a;
     if (this.autoSyncHandle !== void 0) {
@@ -1375,12 +1467,112 @@ var XgkbSyncPlugin = class extends import_obsidian3.Plugin {
   async loadSettings() {
     var _a;
     const raw = (_a = await this.loadData()) != null ? _a : {};
-    const { lastSyncTime, ...rest } = raw;
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, rest);
-    this.lastSyncTime = typeof lastSyncTime === "number" ? lastSyncTime : void 0;
+    if (isLegacyPersistedData(raw)) {
+      await this.migrateToSchemaV2(raw);
+      return;
+    }
+    const { dataSchemaVersion, activeScopeKey, syncScopes, ...rest } = raw;
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, stripPersistedMeta(rest));
+    this.dataSchemaVersion = typeof dataSchemaVersion === "number" ? dataSchemaVersion : DATA_SCHEMA_VERSION;
+    this.syncScopes = syncScopes && typeof syncScopes === "object" ? syncScopes : {};
+    this.activeScopeKey = typeof activeScopeKey === "string" ? activeScopeKey : await computeScopeKey(this.settings);
+  }
+  async migrateToSchemaV2(raw) {
+    const db = new SyncStateDb();
+    const dbResult = await db.open();
+    if (dbResult.ok)
+      await db.clear();
+    db.close();
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, stripPersistedMeta(raw));
+    const scopeKey = await computeScopeKey(this.settings);
+    this.dataSchemaVersion = DATA_SCHEMA_VERSION;
+    this.syncScopes = {
+      [scopeKey]: { fingerprint: buildScopeFingerprint(this.settings) }
+    };
+    this.activeScopeKey = scopeKey;
+    await this.saveSettings();
+    new import_obsidian3.Notice(
+      "\u5DF2\u5347\u7EA7\u5230\u591A\u4F5C\u7528\u57DF\u540C\u6B65\uFF1A\u65E7\u6C34\u4F4D\u672A\u8FC1\u79FB\uFF0C\u4E0B\u6B21\u5C06\u6267\u884C\u5168\u91CF\u5BF9\u8D26",
+      8e3
+    );
   }
   async saveSettings() {
-    await this.saveData({ ...this.settings, lastSyncTime: this.lastSyncTime });
+    await this.saveData({
+      ...this.settings,
+      dataSchemaVersion: this.dataSchemaVersion,
+      activeScopeKey: this.activeScopeKey,
+      syncScopes: this.syncScopes
+    });
+  }
+  /** 身份相关设置变更后更新作用域并提示 */
+  async onScopeIdentityChanged() {
+    const newKey = await computeScopeKey(this.settings);
+    const prevKey = this.activeScopeKey;
+    this.activeScopeKey = newKey;
+    if (newKey === prevKey && this.syncScopes[newKey]) {
+      await this.saveSettings();
+      return;
+    }
+    if (!this.syncScopes[newKey]) {
+      this.syncScopes[newKey] = { fingerprint: buildScopeFingerprint(this.settings) };
+      new import_obsidian3.Notice("\u65B0\u7684\u540C\u6B65\u76EE\u6807\uFF0C\u9996\u6B21\u5C06\u6267\u884C\u5168\u91CF\u5BF9\u8D26", 6e3);
+    } else {
+      const entry = this.syncScopes[newKey];
+      const when = entry.lastSuccessAt ? new Date(entry.lastSuccessAt).toLocaleString("zh-CN") : "\u672A\u77E5";
+      new import_obsidian3.Notice(
+        `\u5DF2\u5207\u6362\u5230\u6B64\u524D\u4F7F\u7528\u8FC7\u7684\u540C\u6B65\u76EE\u6807\uFF08\u4E0A\u6B21\u6210\u529F: ${when}\uFF09\uFF0C\u5C06\u6CBF\u7528\u8BE5\u76EE\u6807\u7684\u6C34\u4F4D`,
+        6e3
+      );
+    }
+    await this.saveSettings();
+  }
+  async resetCurrentSyncScope() {
+    const key = await computeScopeKey(this.settings);
+    delete this.syncScopes[key];
+    this.activeScopeKey = key;
+    const db = new SyncStateDb();
+    const dbResult = await db.open();
+    if (dbResult.ok)
+      await db.deleteAllForScope(key);
+    db.close();
+    await this.saveSettings();
+    new import_obsidian3.Notice("\u5DF2\u91CD\u7F6E\u5F53\u524D\u540C\u6B65\u4F5C\u7528\u57DF\uFF0C\u4E0B\u6B21\u5C06\u5168\u91CF\u5BF9\u8D26", 6e3);
+  }
+  async resetAllSyncScopes() {
+    this.syncScopes = {};
+    this.activeScopeKey = await computeScopeKey(this.settings);
+    this.syncScopes[this.activeScopeKey] = {
+      fingerprint: buildScopeFingerprint(this.settings)
+    };
+    const db = new SyncStateDb();
+    const dbResult = await db.open();
+    if (dbResult.ok)
+      await db.clear();
+    db.close();
+    await this.saveSettings();
+    new import_obsidian3.Notice("\u5DF2\u91CD\u7F6E\u5168\u90E8\u540C\u6B65\u4F5C\u7528\u57DF\uFF0C\u4E0B\u6B21\u5C06\u5168\u91CF\u5BF9\u8D26", 6e3);
+  }
+  getScopeDiagnosticLines() {
+    var _a;
+    const entry = this.syncScopes[this.activeScopeKey];
+    const fp = (_a = entry == null ? void 0 : entry.fingerprint) != null ? _a : buildScopeFingerprint(this.settings);
+    const lines = [];
+    lines.push(`activeScopeKey: ${this.activeScopeKey.slice(0, 16)}...`);
+    lines.push(`scope: ${formatScopeLabel(fp)}`);
+    if ((entry == null ? void 0 : entry.lastSyncTime) != null) {
+      lines.push(
+        `lastSyncTime: ${new Date(entry.lastSyncTime).toLocaleString("zh-CN")} (\u672C\u4F5C\u7528\u57DF)`
+      );
+    } else {
+      lines.push("lastSyncTime: (\u65E0\uFF0C\u4E0B\u6B21\u5168\u91CF)");
+    }
+    const labels = Object.values(this.syncScopes).map((e) => {
+      var _a2;
+      return (_a2 = e.fingerprint) == null ? void 0 : _a2.targetFolderName;
+    }).filter(Boolean);
+    const unique = [...new Set(labels)];
+    lines.push(`knownScopes: ${Object.keys(this.syncScopes).length} \u4E2A\uFF08${unique.join(", ") || "\u2014"}\uFF09`);
+    return lines;
   }
   async runSync() {
     var _a;
@@ -1393,9 +1585,17 @@ var XgkbSyncPlugin = class extends import_obsidian3.Plugin {
       return;
     }
     this.isSyncing = true;
-    const isIncremental = this.lastSyncTime !== void 0;
-    const sinceStr = this.lastSyncTime ? new Date(this.lastSyncTime).toLocaleString("zh-CN") : "\u65E0\uFF08\u9996\u6B21\u5168\u91CF\uFF09";
-    console.debug(`[XGKB Sync] ===== \u5F00\u59CB\u540C\u6B65 mode=${isIncremental ? "\u589E\u91CF" : "\u5168\u91CF"} lastSyncTime=${(_a = this.lastSyncTime) != null ? _a : "-"} (${sinceStr}) =====`);
+    const scopeKey = await computeScopeKey(this.settings);
+    this.activeScopeKey = scopeKey;
+    if (!this.syncScopes[scopeKey]) {
+      this.syncScopes[scopeKey] = { fingerprint: buildScopeFingerprint(this.settings) };
+    }
+    const since = (_a = this.syncScopes[scopeKey]) == null ? void 0 : _a.lastSyncTime;
+    const isIncremental = since !== void 0;
+    const sinceStr = since ? new Date(since).toLocaleString("zh-CN") : "\u65E0\uFF08\u9996\u6B21\u5168\u91CF\uFF09";
+    console.debug(
+      `[XGKB Sync] ===== \u5F00\u59CB\u540C\u6B65 scope=${scopeKey.slice(0, 8)}... mode=${isIncremental ? "\u589E\u91CF" : "\u5168\u91CF"} lastSyncTime=${since != null ? since : "-"} (${sinceStr}) =====`
+    );
     new import_obsidian3.Notice(`XGKB Sync: \u5F00\u59CB${isIncremental ? "\u589E\u91CF" : "\u5168\u91CF"}\u540C\u6B65...`);
     const db = new SyncStateDb();
     let dbOpened = false;
@@ -1409,12 +1609,21 @@ var XgkbSyncPlugin = class extends import_obsidian3.Plugin {
       const api = new XgkbApi(this.settings.serverUrl, this.settings.appKey);
       const fsLocal = new FsLocal(this.app, this.settings.syncFolder);
       const fsXgkb = new FsXgkb(api, this.settings.targetFolderName, this.settings.projectId);
-      const engine = new SyncEngine(fsLocal, fsXgkb, db, this.settings);
-      const stats = await engine.runSync(void 0, this.lastSyncTime);
+      const engine = new SyncEngine(fsLocal, fsXgkb, db, this.settings, scopeKey);
+      const stats = await engine.runSync(void 0, since);
       if (stats.newSince) {
-        this.lastSyncTime = stats.newSince;
+        const rootId = fsXgkb.getRootId();
+        this.syncScopes[scopeKey] = {
+          ...this.syncScopes[scopeKey],
+          lastSyncTime: stats.newSince,
+          rootFileId: rootId != null ? rootId : void 0,
+          lastSuccessAt: Date.now(),
+          fingerprint: buildScopeFingerprint(this.settings)
+        };
         await this.saveSettings();
-        console.debug(`[XGKB Sync] \u6C34\u4F4D\u5DF2\u66F4\u65B0: ${stats.newSince} (${new Date(stats.newSince).toLocaleString("zh-CN")})`);
+        console.debug(
+          `[XGKB Sync] \u4F5C\u7528\u57DF\u6C34\u4F4D\u5DF2\u66F4\u65B0: ${stats.newSince} (${new Date(stats.newSince).toLocaleString("zh-CN")})`
+        );
       }
       const lines = [];
       if (stats.uploaded > 0)

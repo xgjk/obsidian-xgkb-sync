@@ -40,7 +40,7 @@ export const BATCH_GET_META_MAX = 50;
 export const CHANGES_SAFETY_WINDOW_MS = 5000;
 
 export const DB_NAME = "xgkb-sync-state";
-export const DB_VERSION = 1;
+export const DB_VERSION = 2;
 export const DB_STORE_NAME = "syncState";
 
 export const MAX_RETRIES = 3;

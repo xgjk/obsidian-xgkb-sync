@@ -1,5 +1,5 @@
 import { Notice, Plugin } from "obsidian";
-import type { XgkbPluginSettings } from "./types";
+import type { XgkbPluginSettings, SyncScopeEntry } from "./types";
 import { DEFAULT_SETTINGS } from "./constants";
 import { XgkbPluginSettingTab } from "./settings";
 import { SyncEngine } from "./syncEngine";
@@ -7,12 +7,25 @@ import { SyncStateDb } from "./syncStateDb";
 import { FsLocal } from "./fsLocal";
 import { FsXgkb } from "./fsXgkb";
 import { XgkbApi } from "./xgkbApi";
+import {
+	DATA_SCHEMA_VERSION,
+	computeScopeKey,
+	buildScopeFingerprint,
+	isLegacyPersistedData,
+	formatScopeLabel,
+} from "./syncScope";
+
+function stripPersistedMeta(raw: Record<string, unknown>): Partial<XgkbPluginSettings> {
+	const { lastSyncTime, dataSchemaVersion, activeScopeKey, syncScopes, ...rest } = raw;
+	return rest as Partial<XgkbPluginSettings>;
+}
 
 export default class XgkbSyncPlugin extends Plugin {
 	settings!: XgkbPluginSettings;
 
-	/** 上次同步成功后的水位时间戳（毫秒），持久化到 data.json */
-	private lastSyncTime: number | undefined;
+	dataSchemaVersion = DATA_SCHEMA_VERSION;
+	activeScopeKey = "";
+	syncScopes: Record<string, SyncScopeEntry> = {};
 
 	/** 自动同步定时器句柄（window.setInterval 返回值） */
 	private autoSyncHandle: number | undefined;
@@ -23,12 +36,10 @@ export default class XgkbSyncPlugin extends Plugin {
 	async onload() {
 		await this.loadSettings();
 
-		// Ribbon 图标（使用 Obsidian 内置 Lucide 图标 refresh-cw）
 		this.addRibbonIcon("refresh-cw", "Sync xgkb", async () => {
 			await this.runSync();
 		});
 
-		// 命令面板
 		this.addCommand({
 			id: "xgkb-sync-now",
 			name: "Sync now",
@@ -37,20 +48,12 @@ export default class XgkbSyncPlugin extends Plugin {
 			},
 		});
 
-		// 设置面板
 		this.addSettingTab(new XgkbPluginSettingTab(this.app, this));
 
-		// 启动自动同步定时器
 		this.scheduleAutoSync();
 	}
 
-	/**
-	 * 注册/重置自动同步定时器。
-	 * 设置页修改间隔时调用，或插件加载时调用。
-	 * 使用 Plugin.registerInterval 确保插件卸载时自动清理。
-	 */
 	scheduleAutoSync(): void {
-		// 清除旧定时器
 		if (this.autoSyncHandle !== undefined) {
 			window.clearInterval(this.autoSyncHandle);
 			this.autoSyncHandle = undefined;
@@ -60,7 +63,6 @@ export default class XgkbSyncPlugin extends Plugin {
 		if (intervalMin <= 0) return;
 
 		const intervalMs = intervalMin * 60 * 1000;
-		// registerInterval 会在插件卸载时自动 clearInterval
 		this.autoSyncHandle = this.registerInterval(
 			window.setInterval(() => {
 				void this.runSync();
@@ -70,16 +72,133 @@ export default class XgkbSyncPlugin extends Plugin {
 	}
 
 	async loadSettings() {
-		const raw: unknown = (await this.loadData()) ?? {};
-		// lastSyncTime 是运行状态，不放入 XgkbPluginSettings 接口，单独提取
-		const { lastSyncTime, ...rest } = raw as Record<string, unknown>;
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, rest);
-		this.lastSyncTime = typeof lastSyncTime === "number" ? lastSyncTime : undefined;
+		const raw = ((await this.loadData()) ?? {}) as Record<string, unknown>;
+
+		if (isLegacyPersistedData(raw)) {
+			await this.migrateToSchemaV2(raw);
+			return;
+		}
+
+		const { dataSchemaVersion, activeScopeKey, syncScopes, ...rest } = raw;
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, stripPersistedMeta(rest));
+		this.dataSchemaVersion =
+			typeof dataSchemaVersion === "number" ? dataSchemaVersion : DATA_SCHEMA_VERSION;
+		this.syncScopes =
+			syncScopes && typeof syncScopes === "object"
+				? (syncScopes as Record<string, SyncScopeEntry>)
+				: {};
+		this.activeScopeKey =
+			typeof activeScopeKey === "string"
+				? activeScopeKey
+				: await computeScopeKey(this.settings);
+	}
+
+	private async migrateToSchemaV2(raw: Record<string, unknown>): Promise<void> {
+		const db = new SyncStateDb();
+		const dbResult = await db.open();
+		if (dbResult.ok) await db.clear();
+		db.close();
+
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, stripPersistedMeta(raw));
+		const scopeKey = await computeScopeKey(this.settings);
+		this.dataSchemaVersion = DATA_SCHEMA_VERSION;
+		this.syncScopes = {
+			[scopeKey]: { fingerprint: buildScopeFingerprint(this.settings) },
+		};
+		this.activeScopeKey = scopeKey;
+		await this.saveSettings();
+		new Notice(
+			"已升级到多作用域同步：旧水位未迁移，下次将执行全量对账",
+			8000
+		);
 	}
 
 	async saveSettings() {
-		// settings 与 lastSyncTime 合并保存到同一份 data.json
-		await this.saveData({ ...this.settings, lastSyncTime: this.lastSyncTime });
+		await this.saveData({
+			...this.settings,
+			dataSchemaVersion: this.dataSchemaVersion,
+			activeScopeKey: this.activeScopeKey,
+			syncScopes: this.syncScopes,
+		});
+	}
+
+	/** 身份相关设置变更后更新作用域并提示 */
+	async onScopeIdentityChanged(): Promise<void> {
+		const newKey = await computeScopeKey(this.settings);
+		const prevKey = this.activeScopeKey;
+		this.activeScopeKey = newKey;
+
+		if (newKey === prevKey && this.syncScopes[newKey]) {
+			await this.saveSettings();
+			return;
+		}
+
+		if (!this.syncScopes[newKey]) {
+			this.syncScopes[newKey] = { fingerprint: buildScopeFingerprint(this.settings) };
+			new Notice("新的同步目标，首次将执行全量对账", 6000);
+		} else {
+			const entry = this.syncScopes[newKey];
+			const when = entry.lastSuccessAt
+				? new Date(entry.lastSuccessAt).toLocaleString("zh-CN")
+				: "未知";
+			new Notice(
+				`已切换到此前使用过的同步目标（上次成功: ${when}），将沿用该目标的水位`,
+				6000
+			);
+		}
+
+		await this.saveSettings();
+	}
+
+	async resetCurrentSyncScope(): Promise<void> {
+		const key = await computeScopeKey(this.settings);
+		delete this.syncScopes[key];
+		this.activeScopeKey = key;
+
+		const db = new SyncStateDb();
+		const dbResult = await db.open();
+		if (dbResult.ok) await db.deleteAllForScope(key);
+		db.close();
+
+		await this.saveSettings();
+		new Notice("已重置当前同步作用域，下次将全量对账", 6000);
+	}
+
+	async resetAllSyncScopes(): Promise<void> {
+		this.syncScopes = {};
+		this.activeScopeKey = await computeScopeKey(this.settings);
+		this.syncScopes[this.activeScopeKey] = {
+			fingerprint: buildScopeFingerprint(this.settings),
+		};
+
+		const db = new SyncStateDb();
+		const dbResult = await db.open();
+		if (dbResult.ok) await db.clear();
+		db.close();
+
+		await this.saveSettings();
+		new Notice("已重置全部同步作用域，下次将全量对账", 6000);
+	}
+
+	getScopeDiagnosticLines(): string[] {
+		const entry = this.syncScopes[this.activeScopeKey];
+		const fp = entry?.fingerprint ?? buildScopeFingerprint(this.settings);
+		const lines: string[] = [];
+		lines.push(`activeScopeKey: ${this.activeScopeKey.slice(0, 16)}...`);
+		lines.push(`scope: ${formatScopeLabel(fp)}`);
+		if (entry?.lastSyncTime != null) {
+			lines.push(
+				`lastSyncTime: ${new Date(entry.lastSyncTime).toLocaleString("zh-CN")} (本作用域)`
+			);
+		} else {
+			lines.push("lastSyncTime: (无，下次全量)");
+		}
+		const labels = Object.values(this.syncScopes)
+			.map((e) => e.fingerprint?.targetFolderName)
+			.filter(Boolean) as string[];
+		const unique = [...new Set(labels)];
+		lines.push(`knownScopes: ${Object.keys(this.syncScopes).length} 个（${unique.join(", ") || "—"}）`);
+		return lines;
 	}
 
 	private async runSync() {
@@ -88,18 +207,26 @@ export default class XgkbSyncPlugin extends Plugin {
 			return;
 		}
 
-		// 防止并发：上一次同步尚未完成时跳过本次触发
 		if (this.isSyncing) {
 			console.debug("[XGKB Sync] 上次同步仍在进行，跳过本次触发");
 			return;
 		}
 		this.isSyncing = true;
 
-		const isIncremental = this.lastSyncTime !== undefined;
-		const sinceStr = this.lastSyncTime
-			? new Date(this.lastSyncTime).toLocaleString("zh-CN")
+		const scopeKey = await computeScopeKey(this.settings);
+		this.activeScopeKey = scopeKey;
+		if (!this.syncScopes[scopeKey]) {
+			this.syncScopes[scopeKey] = { fingerprint: buildScopeFingerprint(this.settings) };
+		}
+
+		const since = this.syncScopes[scopeKey]?.lastSyncTime;
+		const isIncremental = since !== undefined;
+		const sinceStr = since
+			? new Date(since).toLocaleString("zh-CN")
 			: "无（首次全量）";
-		console.debug(`[XGKB Sync] ===== 开始同步 mode=${isIncremental ? "增量" : "全量"} lastSyncTime=${this.lastSyncTime ?? "-"} (${sinceStr}) =====`);
+		console.debug(
+			`[XGKB Sync] ===== 开始同步 scope=${scopeKey.slice(0, 8)}... mode=${isIncremental ? "增量" : "全量"} lastSyncTime=${since ?? "-"} (${sinceStr}) =====`
+		);
 		new Notice(`XGKB Sync: 开始${isIncremental ? "增量" : "全量"}同步...`);
 		const db = new SyncStateDb();
 		let dbOpened = false;
@@ -115,18 +242,25 @@ export default class XgkbSyncPlugin extends Plugin {
 			const api = new XgkbApi(this.settings.serverUrl, this.settings.appKey);
 			const fsLocal = new FsLocal(this.app, this.settings.syncFolder);
 			const fsXgkb = new FsXgkb(api, this.settings.targetFolderName, this.settings.projectId);
-			const engine = new SyncEngine(fsLocal, fsXgkb, db, this.settings);
+			const engine = new SyncEngine(fsLocal, fsXgkb, db, this.settings, scopeKey);
 
-			const stats = await engine.runSync(undefined, this.lastSyncTime);
+			const stats = await engine.runSync(undefined, since);
 
-			// 同步成功后更新水位
 			if (stats.newSince) {
-				this.lastSyncTime = stats.newSince;
+				const rootId = fsXgkb.getRootId();
+				this.syncScopes[scopeKey] = {
+					...this.syncScopes[scopeKey],
+					lastSyncTime: stats.newSince,
+					rootFileId: rootId ?? undefined,
+					lastSuccessAt: Date.now(),
+					fingerprint: buildScopeFingerprint(this.settings),
+				};
 				await this.saveSettings();
-				console.debug(`[XGKB Sync] 水位已更新: ${stats.newSince} (${new Date(stats.newSince).toLocaleString("zh-CN")})`);
+				console.debug(
+					`[XGKB Sync] 作用域水位已更新: ${stats.newSince} (${new Date(stats.newSince).toLocaleString("zh-CN")})`
+				);
 			}
 
-			// 结果通知
 			const lines: string[] = [];
 			if (stats.uploaded > 0) lines.push(`↑${stats.uploaded}`);
 			if (stats.downloaded > 0) lines.push(`↓${stats.downloaded}`);
@@ -145,11 +279,9 @@ export default class XgkbSyncPlugin extends Plugin {
 			const msg = e instanceof Error ? e.message : String(e);
 			console.error("[XGKB Sync] 同步异常:", msg);
 			new Notice(`XGKB Sync 同步失败: ${msg}`, 8000);
-			// 同步失败不更新水位，下次仍用旧水位（或全量）重试
 		} finally {
 			if (dbOpened) db.close();
 			this.isSyncing = false;
 		}
 	}
 }
-

@@ -30,6 +30,7 @@ export class SyncEngine {
 	private fsLocal: FsLocal;
 	private fsXgkb: FsXgkb;
 	private settings: XgkbPluginSettings;
+	private scopeKey: string;
 	private stats: SyncStats;
 	private progress: ProgressCallback = () => {};
 
@@ -37,12 +38,14 @@ export class SyncEngine {
 		fsLocal: FsLocal,
 		fsXgkb: FsXgkb,
 		db: SyncStateDb,
-		settings: XgkbPluginSettings
+		settings: XgkbPluginSettings,
+		scopeKey: string
 	) {
 		this.fsLocal = fsLocal;
 		this.fsXgkb = fsXgkb;
 		this.db = db;
 		this.settings = { ...DEFAULT_SETTINGS, ...settings };
+		this.scopeKey = scopeKey;
 		this.stats = this.emptyStats();
 	}
 
@@ -93,7 +96,7 @@ export class SyncEngine {
 			if (idx % 50 === 0 || idx === allPaths.size) prog(`决策中 ${idx}/${allPaths.size}...`);
 			const local = localMap.get(path);
 			const remote = remoteMap.get(path);
-			const record = await this.db.get(path);
+			const record = await this.db.get(this.scopeKey, path);
 			const op = this.decide(path, local, remote, record);
 			plans.push({ path, local, remote, record, op });
 		}
@@ -174,7 +177,7 @@ export class SyncEngine {
 		}
 
 		// 加载全部本地状态，建双向索引
-		const allRecords = await this.db.getAll();
+		const allRecords = await this.db.getAll(this.scopeKey);
 		const fileIdToRecord = new Map<string, SyncStateRecord>();
 		for (const r of allRecords) fileIdToRecord.set(r.xgkbFileId, r);
 
@@ -293,9 +296,9 @@ export class SyncEngine {
 		try {
 			switch (op) {
 				case "upload-new":    await this.doUploadNew(path, local!); break;
-				case "upload-update": await this.doUploadUpdate(path, local!, record!); break;
+				case "upload-update": await this.doUploadUpdate(path, local!, remote!, record); break;
 				case "download-new":  await this.doDownloadNew(path, remote!, contentCache); break;
-				case "download-update": await this.doDownloadUpdate(path, remote!, record!, contentCache); break;
+				case "download-update": await this.doDownloadUpdate(path, remote!, record, contentCache); break;
 				case "delete-local":  await this.doDeleteLocal(path, record!); break;
 				case "delete-remote": await this.doDeleteRemote(record!); break;
 				case "skip":          this.stats.skipped++; break;
@@ -364,36 +367,61 @@ export class SyncEngine {
 
 	// ==================== 操作执行 ====================
 
+	/** 保证 IndexedDB 复合主键 scopeKey + localPath 始终存在 */
+	private buildDbRecord(
+		path: string,
+		partial: Pick<SyncStateRecord, "xgkbFileId" | "xgkbFolderId" | "localMtime" | "remoteMtime"> &
+			Partial<Pick<SyncStateRecord, "syncStatus" | "lastError">>
+	): SyncStateRecord {
+		return {
+			scopeKey: this.scopeKey,
+			localPath: path,
+			xgkbFileId: partial.xgkbFileId,
+			xgkbFolderId: partial.xgkbFolderId,
+			localMtime: partial.localMtime,
+			remoteMtime: partial.remoteMtime,
+			syncStatus: partial.syncStatus ?? "done",
+			lastSyncAt: Date.now(),
+			...(partial.lastError !== undefined ? { lastError: partial.lastError } : {}),
+		};
+	}
+
 	private async doUploadNew(path: string, local: FileEntry): Promise<void> {
 		const content = await this.fsLocal.readFile(path);
 		const result = await this.fsXgkb.createFile(path, content);
 		if (!result.ok) throw new Error(`上传失败: ${result.error}`);
-		await this.db.put({
-			localPath: path,
-			xgkbFileId: result.value.fileId,
-			xgkbFolderId: result.value.folderId,
-			localMtime: local.mtime,
-			remoteMtime: Date.now(),
-			syncStatus: "done",
-			lastSyncAt: Date.now(),
-		});
+		await this.db.put(
+			this.buildDbRecord(path, {
+				xgkbFileId: result.value.fileId,
+				xgkbFolderId: result.value.folderId,
+				localMtime: local.mtime,
+				remoteMtime: Date.now(),
+			})
+		);
 		this.stats.uploaded++;
 		this.progress(`↑ ${path}`);
 	}
 
-	private async doUploadUpdate(path: string, local: FileEntry, record: SyncStateRecord): Promise<void> {
+	private async doUploadUpdate(
+		path: string,
+		local: FileEntry,
+		remote: FileEntry,
+		record: SyncStateRecord | undefined
+	): Promise<void> {
+		const fileId = record?.xgkbFileId ?? remote.xgkbFileId;
+		if (!fileId) throw new Error("缺少云端文件 ID，无法更新");
 		const content = await this.fsLocal.readFile(path);
 		const fileName = path.split("/").pop() || path;
-		const result = await this.fsXgkb.updateFile(record.xgkbFileId, fileName, content);
+		const result = await this.fsXgkb.updateFile(fileId, fileName, content);
 		if (!result.ok) throw new Error(`更新失败: ${result.error}`);
-		await this.db.put({
-			...record,
-			localMtime: local.mtime,
-			remoteMtime: Date.now(),
-			syncStatus: "done",
-			lastSyncAt: Date.now(),
-			lastError: undefined,
-		});
+		await this.db.put(
+			this.buildDbRecord(path, {
+				xgkbFileId: fileId,
+				xgkbFolderId: record?.xgkbFolderId ?? remote.xgkbFolderId ?? "",
+				localMtime: local.mtime,
+				remoteMtime: Date.now(),
+			})
+		);
 		this.stats.uploaded++;
 		this.progress(`↑ ${path}`);
 	}
@@ -407,15 +435,14 @@ export class SyncEngine {
 				return r.value;
 			  });
 		const actualMtime = await this.fsLocal.writeFile(path, body);
-		await this.db.put({
-			localPath: path,
-			xgkbFileId: remote.xgkbFileId!,
-			xgkbFolderId: remote.xgkbFolderId || "",
-			localMtime: actualMtime,
-			remoteMtime: remote.mtime,
-			syncStatus: "done",
-			lastSyncAt: Date.now(),
-		});
+		await this.db.put(
+			this.buildDbRecord(path, {
+				xgkbFileId: remote.xgkbFileId!,
+				xgkbFolderId: remote.xgkbFolderId || "",
+				localMtime: actualMtime,
+				remoteMtime: remote.mtime,
+			})
+		);
 		this.stats.downloaded++;
 		this.progress(`↓ ${path}`);
 	}
@@ -423,7 +450,7 @@ export class SyncEngine {
 	private async doDownloadUpdate(
 		path: string,
 		remote: FileEntry,
-		record: SyncStateRecord,
+		record: SyncStateRecord | undefined,
 		contentCache: Map<string, string>
 	): Promise<void> {
 		const fid = remote.xgkbFileId!;
@@ -434,21 +461,21 @@ export class SyncEngine {
 				return r.value;
 			  });
 		const actualMtime = await this.fsLocal.writeFile(path, body);
-		await this.db.put({
-			...record,
-			localMtime: actualMtime,
-			remoteMtime: remote.mtime,
-			syncStatus: "done",
-			lastSyncAt: Date.now(),
-			lastError: undefined,
-		});
+		await this.db.put(
+			this.buildDbRecord(path, {
+				xgkbFileId: fid,
+				xgkbFolderId: record?.xgkbFolderId ?? remote.xgkbFolderId ?? "",
+				localMtime: actualMtime,
+				remoteMtime: remote.mtime,
+			})
+		);
 		this.stats.downloaded++;
 		this.progress(`↓ ${path}`);
 	}
 
 	private async doDeleteLocal(path: string, record: SyncStateRecord): Promise<void> {
 		await this.fsLocal.trashFile(path);
-		await this.db.delete(path);
+		await this.db.delete(this.scopeKey, path);
 		this.stats.deleted++;
 		this.progress(`✗ 本地删除 ${path}`);
 	}
@@ -456,7 +483,7 @@ export class SyncEngine {
 	private async doDeleteRemote(record: SyncStateRecord): Promise<void> {
 		const result = await this.fsXgkb.deleteFile(record.xgkbFileId);
 		if (!result.ok) throw new Error(`删除云端失败: ${result.error}`);
-		await this.db.delete(record.localPath);
+		await this.db.delete(this.scopeKey, record.localPath);
 		this.stats.deleted++;
 		this.progress(`✗ 云端删除 ${record.localPath}`);
 	}

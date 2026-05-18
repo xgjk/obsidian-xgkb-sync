@@ -28,7 +28,7 @@ export class XgkbPluginSettingTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.appKey)
 					.onChange(async (value) => {
 						this.plugin.settings.appKey = value;
-						await this.plugin.saveSettings();
+						await this.plugin.onScopeIdentityChanged();
 					})
 			);
 
@@ -41,20 +41,20 @@ export class XgkbPluginSettingTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.serverUrl)
 					.onChange(async (value) => {
 						this.plugin.settings.serverUrl = value || DEFAULT_SETTINGS.serverUrl;
-						await this.plugin.saveSettings();
+						await this.plugin.onScopeIdentityChanged();
 					})
 			);
 
 		new Setting(containerEl)
 			.setName("Project ID")
-			.setDesc("目标知识库空间 ID；留空则同步到个人知识库。切换空间后建议重新全量同步。")
+			.setDesc("目标知识库空间 ID；留空则同步到个人知识库。切换空间将自动使用独立水位。")
 			.addText((text) =>
 				text
 					.setPlaceholder("留空 = 个人知识库")
 					.setValue(this.plugin.settings.projectId ?? "")
 					.onChange(async (value) => {
 						this.plugin.settings.projectId = value.trim();
-						await this.plugin.saveSettings();
+						await this.plugin.onScopeIdentityChanged();
 					})
 			);
 
@@ -67,7 +67,7 @@ export class XgkbPluginSettingTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.syncFolder)
 					.onChange(async (value) => {
 						this.plugin.settings.syncFolder = value;
-						await this.plugin.saveSettings();
+						await this.plugin.onScopeIdentityChanged();
 					})
 			);
 
@@ -81,7 +81,7 @@ export class XgkbPluginSettingTab extends PluginSettingTab {
 					.onChange(async (value) => {
 						const normalized = normalizeTargetFolderPath(value);
 						this.plugin.settings.targetFolderName = normalized || "Obsidian";
-						await this.plugin.saveSettings();
+						await this.plugin.onScopeIdentityChanged();
 					})
 			);
 
@@ -130,6 +130,16 @@ export class XgkbPluginSettingTab extends PluginSettingTab {
 		const debugBtn = btnGroup.createEl("button", { text: "Diagnostics" });
 		debugBtn.addEventListener("click", () => {
 			void this.debugSync();
+		});
+
+		const resetScopeBtn = btnGroup.createEl("button", { text: "Reset current scope" });
+		resetScopeBtn.addEventListener("click", () => {
+			void this.plugin.resetCurrentSyncScope();
+		});
+
+		const resetAllBtn = btnGroup.createEl("button", { text: "Reset all scopes" });
+		resetAllBtn.addEventListener("click", () => {
+			void this.plugin.resetAllSyncScopes();
 		});
 	}
 
@@ -189,7 +199,11 @@ export class XgkbPluginSettingTab extends PluginSettingTab {
 		lines.push(`同步方向: ${syncDirection}`);
 		lines.push(`SyncFolder: "${syncFolder || "(整个Vault)"}"`);
 		lines.push(`TargetFolder: "${targetFolderName}"`);
-		lines.push(`ProjectId: "${projectId?.trim() || "(个人知识库)"}"\n`);
+		lines.push(`ProjectId: "${projectId?.trim() || "(个人知识库)"}"`);
+		for (const line of this.plugin.getScopeDiagnosticLines()) {
+			lines.push(line);
+		}
+		lines.push("");
 
 		try {
 			const fsLocal = new FsLocal(this.plugin.app, syncFolder);
