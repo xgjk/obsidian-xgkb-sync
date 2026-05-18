@@ -97,6 +97,13 @@ export class XgkbApi {
 		return { ok: true, value: String(r.value) };
 	}
 
+	/** 配置的空间 ID 优先，否则回退个人知识库 */
+	async resolveProjectId(configured?: string): Promise<Result<string>> {
+		const trimmed = configured?.trim();
+		if (trimmed) return { ok: true, value: trimmed };
+		return this.getPersonalProjectId();
+	}
+
 	/** 获取一级目录 */
 	async getLevel1Folders(projectId: string): Promise<Result<XgkbFileVO[]>> {
 		return this.request<XgkbFileVO[]>("GET", API_PATHS.getLevel1Folders, { projectId });
@@ -172,6 +179,7 @@ export class XgkbApi {
 		fileName: string;
 		fileSuffix?: string;
 		folderName?: string;
+		projectId?: string;
 		updateFileId?: string;
 		versionRemark?: string;
 	}): Promise<Result<UploadContentResult | UpdateFileResult>> {

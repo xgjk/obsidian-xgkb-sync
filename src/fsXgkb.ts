@@ -1,7 +1,7 @@
 import { XgkbApi } from "./xgkbApi";
 import type { FileEntry, Result, XgkbChangeItem, XgkbMetaItem } from "./types";
 import { BATCH_GET_CONTENT_MAX, BATCH_GET_META_MAX, cleanContent } from "./constants";
-import { sanitizePathSegment } from "./pathSanitize";
+import { normalizeTargetFolderPath, parseTargetFolderSegments, sanitizePathSegment } from "./pathSanitize";
 
 /**
  * 云端文件系统操作（XGKB API 封装）
@@ -9,11 +9,16 @@ import { sanitizePathSegment } from "./pathSanitize";
 export class FsXgkb {
 	private rootId: string | null = null;
 	private projectId: string | null = null;
+	/** 规范化后的目标路径，如 `A/B`（用于 folderName 前缀） */
+	private readonly targetFolderPath: string;
 
 	constructor(
 		private api: XgkbApi,
-		private targetFolderName: string
-	) {}
+		targetFolderName: string,
+		private configuredProjectId?: string
+	) {
+		this.targetFolderPath = normalizeTargetFolderPath(targetFolderName) || "Obsidian";
+	}
 
 	getRootId(): string | null {
 		return this.rootId;
@@ -28,45 +33,96 @@ export class FsXgkb {
 	 * 如果不存在，使用 createFolder 显式创建
 	 */
 	async init(): Promise<Result<string>> {
-		// 1. 获取 projectId
-		const projectResult = await this.api.getPersonalProjectId();
+		// 1. 获取 projectId（配置优先，否则个人知识库）
+		const projectResult = await this.api.resolveProjectId(this.configuredProjectId);
 		if (!projectResult.ok) {
 			return { ok: false, error: `获取 projectId 失败: ${projectResult.error}` };
 		}
 		const projectId = projectResult.value;
 		this.projectId = projectId;
-		console.debug(`[XGKB Sync] init: projectId=${projectId}`);
+		const source = this.configuredProjectId?.trim() ? "配置" : "个人知识库";
+		console.debug(`[XGKB Sync] init: projectId=${projectId} (${source})`);
 
-		// 2. 获取一级目录，找 Obsidian 文件夹
-		const foldersResult = await this.api.getLevel1Folders(projectId);
-		if (!foldersResult.ok) {
-			return { ok: false, error: `获取目录列表失败: ${foldersResult.error}` };
+		// 2. 解析/创建多级目标目录（如 A/B）
+		const resolveResult = await this.resolveFolderIdFromPath(projectId, this.targetFolderPath);
+		if (!resolveResult.ok) {
+			return { ok: false, error: resolveResult.error };
 		}
-		const folders = foldersResult.value || [];
-		const target = folders.find((f) => f.name === this.targetFolderName && f.type === 1);
+		this.rootId = resolveResult.value;
+		console.debug(`[XGKB Sync] init: 同步根目录 "${this.targetFolderPath}" rootId=${this.rootId}`);
+		return { ok: true, value: this.rootId };
+	}
 
-		if (target) {
-			this.rootId = target.id;
-			console.debug(`[XGKB Sync] init: 找到同步根目录 "${this.targetFolderName}" rootId=${target.id}`);
-			return { ok: true, value: target.id };
-		}
-
-		// 3. Obsidian 文件夹不存在，显式创建；createFolder 直接返回新目录的 fileId
-		console.debug(`[XGKB Sync] init: 未找到 "${this.targetFolderName}"，调用 createFolder 新建...`);
-		const createResult = await this.api.createFolder({
-			projectId,
-			parentId: "0",
-			name: this.targetFolderName,
-		});
-
-		if (!createResult.ok) {
-			return { ok: false, error: `创建 Obsidian 目录失败: ${createResult.error}` };
+	/**
+	 * 将逻辑目录路径解析为 folderId；缺失的各级目录会逐级 createFolder。
+	 * @param folderPath 如 `Obsidian` 或 `A/B`
+	 */
+	private async resolveFolderIdFromPath(
+		projectId: string,
+		folderPath: string
+	): Promise<Result<string>> {
+		const segments = parseTargetFolderSegments(folderPath);
+		if (segments.length === 0) {
+			return { ok: false, error: "云端目标目录路径不能为空" };
 		}
 
-		// createFolder 返回值即新目录 fileId，无需再 getLevel1Folders
-		this.rootId = createResult.value;
-		console.debug(`[XGKB Sync] init: 新建同步根目录 "${this.targetFolderName}" rootId=${createResult.value}`);
-		return { ok: true, value: createResult.value };
+		const level1Result = await this.api.getLevel1Folders(projectId);
+		if (!level1Result.ok) {
+			return { ok: false, error: `获取目录列表失败: ${level1Result.error}` };
+		}
+
+		const folders = level1Result.value || [];
+		const firstSeg = segments[0];
+		let firstFolder = folders.find((f) => f.name === firstSeg && f.type === 1);
+
+		if (!firstFolder) {
+			console.debug(`[XGKB Sync] 一级目录 "${firstSeg}" 不存在，正在创建...`);
+			const createResult = await this.api.createFolder({
+				projectId,
+				parentId: "0",
+				name: firstSeg,
+			});
+			if (!createResult.ok) {
+				return { ok: false, error: `创建目录 "${firstSeg}" 失败: ${createResult.error}` };
+			}
+			firstFolder = { id: createResult.value, name: firstSeg, type: 1, parentId: "0" };
+		}
+
+		let currentId = firstFolder.id;
+
+		for (let i = 1; i < segments.length; i++) {
+			const seg = segments[i];
+			const childResult = await this.api.getChildFiles(currentId, 1);
+			if (!childResult.ok) {
+				return {
+					ok: false,
+					error: `获取子目录失败(parentId=${currentId}): ${childResult.error}`,
+				};
+			}
+
+			const children = childResult.value || [];
+			const found = children.find((f) => f.name === seg && f.type === 1);
+			if (!found) {
+				const parentPath = segments.slice(0, i).join("/");
+				console.debug(`[XGKB Sync] 目录 "${parentPath}" 下无 "${seg}"，正在创建...`);
+				const createResult = await this.api.createFolder({
+					projectId,
+					parentId: currentId,
+					name: seg,
+				});
+				if (!createResult.ok) {
+					return {
+						ok: false,
+						error: `创建目录 "${seg}"（位于 ${parentPath}）失败: ${createResult.error}`,
+					};
+				}
+				currentId = createResult.value;
+			} else {
+				currentId = found.id;
+			}
+		}
+
+		return { ok: true, value: currentId };
 	}
 
 	/**
@@ -166,14 +222,15 @@ export class FsXgkb {
 		const fileName = lastSlash > 0 ? relativePath.substring(lastSlash + 1) : relativePath;
 
 		const folderName = folderPath
-			? `${this.targetFolderName}/${folderPath}`
-			: this.targetFolderName;
+			? `${this.targetFolderPath}/${folderPath}`
+			: this.targetFolderPath;
 
 		const result = await this.api.uploadContent({
 			content,
 			fileName,
 			fileSuffix: "md",
 			folderName,
+			projectId: this.projectId || undefined,
 		});
 
 		if (!result.ok) return { ok: false, error: `上传失败: ${result.error}` };

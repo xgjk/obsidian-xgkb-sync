@@ -1,6 +1,8 @@
 export interface XgkbPluginSettings {
 	appKey: string;
 	serverUrl: string;
+	/** 知识库空间 ID；不填则使用当前用户的个人知识库 */
+	projectId: string;
 	syncFolder: string;
 	targetFolderName: string;
 	syncDirection: "bidirectional" | "push" | "pull";

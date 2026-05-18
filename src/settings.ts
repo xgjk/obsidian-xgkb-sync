@@ -5,6 +5,7 @@ import { DEFAULT_SETTINGS } from "./constants";
 import { XgkbApi } from "./xgkbApi";
 import { FsLocal } from "./fsLocal";
 import { FsXgkb } from "./fsXgkb";
+import { normalizeTargetFolderPath } from "./pathSanitize";
 
 export class XgkbPluginSettingTab extends PluginSettingTab {
 	private plugin: XgkbSyncPlugin;
@@ -45,6 +46,19 @@ export class XgkbPluginSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
+			.setName("Project ID")
+			.setDesc("目标知识库空间 ID；留空则同步到个人知识库。切换空间后建议重新全量同步。")
+			.addText((text) =>
+				text
+					.setPlaceholder("留空 = 个人知识库")
+					.setValue(this.plugin.settings.projectId ?? "")
+					.onChange(async (value) => {
+						this.plugin.settings.projectId = value.trim();
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
 			.setName("Sync folder")
 			.setDesc("Obsidian 中用于同步的文件夹路径（空 = 同步整个 vault）")
 			.addText((text) =>
@@ -59,13 +73,14 @@ export class XgkbPluginSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Cloud target folder")
-			.setDesc("玄关知识库中目标文件夹名称")
+			.setDesc("知识库中的同步根目录；支持多级路径，如 Obsidian 或 A/B（不存在时自动创建）")
 			.addText((text) =>
 				text
-					.setPlaceholder("Obsidian")
+					.setPlaceholder("Obsidian 或 A/B")
 					.setValue(this.plugin.settings.targetFolderName)
 					.onChange(async (value) => {
-						this.plugin.settings.targetFolderName = value || "Obsidian";
+						const normalized = normalizeTargetFolderPath(value);
+						this.plugin.settings.targetFolderName = normalized || "Obsidian";
 						await this.plugin.saveSettings();
 					})
 			);
@@ -119,7 +134,7 @@ export class XgkbPluginSettingTab extends PluginSettingTab {
 	}
 
 	private async testConnection(): Promise<void> {
-		const { appKey, serverUrl, targetFolderName } = this.plugin.settings;
+		const { appKey, serverUrl, targetFolderName, projectId } = this.plugin.settings;
 		if (!appKey) {
 			new Notice("Enter app key first");
 			return;
@@ -128,28 +143,25 @@ export class XgkbPluginSettingTab extends PluginSettingTab {
 		new Notice("测试连接中...");
 		const api = new XgkbApi(serverUrl, appKey);
 
-		const projectIdResult = await api.getPersonalProjectId();
+		const projectIdResult = await api.resolveProjectId(projectId);
 		if (!projectIdResult.ok) {
 			new Notice(`❌ 连接失败: ${projectIdResult.error}`, 5000);
 			return;
 		}
 
-		const foldersResult = await api.getLevel1Folders(projectIdResult.value);
-		if (!foldersResult.ok) {
-			new Notice(`❌ 获取目录失败: ${foldersResult.error}`, 5000);
+		const resolvedId = projectIdResult.value;
+		const spaceLabel = projectId?.trim() ? `空间 ${resolvedId}` : `个人知识库 (${resolvedId})`;
+
+		const fsXgkb = new FsXgkb(api, targetFolderName, projectId);
+		const initResult = await fsXgkb.init();
+		if (!initResult.ok) {
+			new Notice(`❌ 目录解析失败: ${initResult.error}`, 8000);
 			return;
 		}
 
-		const folders = foldersResult.value || [];
-		const target = folders.find((f) => f.name === targetFolderName && f.type === 1);
-
-		if (!target) {
-			const names = folders.map((f) => f.name).join(", ");
-			new Notice(`❌ 目录 "${targetFolderName}" 不存在。现有: ${names || "(空)"}`, 8000);
-			return;
-		}
-
-		const filesResult = await api.getChildFiles(target.id);
+		const rootId = initResult.value;
+		const displayPath = normalizeTargetFolderPath(targetFolderName) || "Obsidian";
+		const filesResult = await api.getChildFiles(rootId);
 		if (!filesResult.ok) {
 			new Notice(`❌ 目录访问失败: ${filesResult.error}`, 5000);
 			return;
@@ -158,11 +170,14 @@ export class XgkbPluginSettingTab extends PluginSettingTab {
 		const items = filesResult.value || [];
 		const mdCount = items.filter((f) => f.type === 2 && f.suffix === "md").length;
 		const folderCount = items.filter((f) => f.type === 1).length;
-		new Notice(`✅ 连接成功！"${targetFolderName}" 含 ${mdCount} 个 .md 文件、${folderCount} 个子文件夹`, 5000);
+		new Notice(
+			`✅ 连接成功（${spaceLabel}）！"${displayPath}" 含 ${mdCount} 个 .md 文件、${folderCount} 个子文件夹`,
+			5000
+		);
 	}
 
 	private async debugSync(): Promise<void> {
-		const { appKey, serverUrl, targetFolderName, syncFolder, syncDirection } = this.plugin.settings;
+		const { appKey, serverUrl, targetFolderName, syncFolder, syncDirection, projectId } = this.plugin.settings;
 		if (!appKey) {
 			new Notice("Enter app key first");
 			return;
@@ -173,11 +188,12 @@ export class XgkbPluginSettingTab extends PluginSettingTab {
 		const lines: string[] = [`=== XGKB Sync 诊断 ===\n`];
 		lines.push(`同步方向: ${syncDirection}`);
 		lines.push(`SyncFolder: "${syncFolder || "(整个Vault)"}"`);
-		lines.push(`TargetFolder: "${targetFolderName}"\n`);
+		lines.push(`TargetFolder: "${targetFolderName}"`);
+		lines.push(`ProjectId: "${projectId?.trim() || "(个人知识库)"}"\n`);
 
 		try {
 			const fsLocal = new FsLocal(this.plugin.app, syncFolder);
-			const fsXgkb = new FsXgkb(api, targetFolderName);
+			const fsXgkb = new FsXgkb(api, targetFolderName, projectId);
 
 			// 本地文件
 			const localFiles = fsLocal.listFiles();

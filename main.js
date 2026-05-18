@@ -43,6 +43,7 @@ var import_obsidian3 = require("obsidian");
 var DEFAULT_SETTINGS = {
   appKey: "",
   serverUrl: "https://sg-al-cwork-web.mediportal.com.cn/open-api/",
+  projectId: "",
   syncFolder: "",
   // 空=同步整个 Vault
   targetFolderName: "Obsidian",
@@ -143,6 +144,13 @@ var XgkbApi = class {
       return r;
     return { ok: true, value: String(r.value) };
   }
+  /** 配置的空间 ID 优先，否则回退个人知识库 */
+  async resolveProjectId(configured) {
+    const trimmed = configured == null ? void 0 : configured.trim();
+    if (trimmed)
+      return { ok: true, value: trimmed };
+    return this.getPersonalProjectId();
+  }
   /** 获取一级目录 */
   async getLevel1Folders(projectId) {
     return this.request("GET", API_PATHS.getLevel1Folders, { projectId });
@@ -234,6 +242,12 @@ function sanitizeRelativePath(relativePath) {
   if (!relativePath)
     return relativePath;
   return relativePath.split("/").map((seg) => sanitizePathSegment(seg)).join("/");
+}
+function parseTargetFolderSegments(folderPath) {
+  return folderPath.replace(/\\/g, "/").split("/").map((seg) => seg.trim()).filter(Boolean).map((seg) => sanitizePathSegment(seg));
+}
+function normalizeTargetFolderPath(folderPath) {
+  return parseTargetFolderSegments(folderPath).join("/");
 }
 
 // src/fsLocal.ts
@@ -342,11 +356,12 @@ var FsLocal = class {
 
 // src/fsXgkb.ts
 var FsXgkb = class {
-  constructor(api, targetFolderName) {
+  constructor(api, targetFolderName, configuredProjectId) {
     this.api = api;
-    this.targetFolderName = targetFolderName;
+    this.configuredProjectId = configuredProjectId;
     this.rootId = null;
     this.projectId = null;
+    this.targetFolderPath = normalizeTargetFolderPath(targetFolderName) || "Obsidian";
   }
   getRootId() {
     return this.rootId;
@@ -359,36 +374,83 @@ var FsXgkb = class {
    * 如果不存在，使用 createFolder 显式创建
    */
   async init() {
-    const projectResult = await this.api.getPersonalProjectId();
+    var _a;
+    const projectResult = await this.api.resolveProjectId(this.configuredProjectId);
     if (!projectResult.ok) {
       return { ok: false, error: `\u83B7\u53D6 projectId \u5931\u8D25: ${projectResult.error}` };
     }
     const projectId = projectResult.value;
     this.projectId = projectId;
-    console.debug(`[XGKB Sync] init: projectId=${projectId}`);
-    const foldersResult = await this.api.getLevel1Folders(projectId);
-    if (!foldersResult.ok) {
-      return { ok: false, error: `\u83B7\u53D6\u76EE\u5F55\u5217\u8868\u5931\u8D25: ${foldersResult.error}` };
+    const source = ((_a = this.configuredProjectId) == null ? void 0 : _a.trim()) ? "\u914D\u7F6E" : "\u4E2A\u4EBA\u77E5\u8BC6\u5E93";
+    console.debug(`[XGKB Sync] init: projectId=${projectId} (${source})`);
+    const resolveResult = await this.resolveFolderIdFromPath(projectId, this.targetFolderPath);
+    if (!resolveResult.ok) {
+      return { ok: false, error: resolveResult.error };
     }
-    const folders = foldersResult.value || [];
-    const target = folders.find((f) => f.name === this.targetFolderName && f.type === 1);
-    if (target) {
-      this.rootId = target.id;
-      console.debug(`[XGKB Sync] init: \u627E\u5230\u540C\u6B65\u6839\u76EE\u5F55 "${this.targetFolderName}" rootId=${target.id}`);
-      return { ok: true, value: target.id };
+    this.rootId = resolveResult.value;
+    console.debug(`[XGKB Sync] init: \u540C\u6B65\u6839\u76EE\u5F55 "${this.targetFolderPath}" rootId=${this.rootId}`);
+    return { ok: true, value: this.rootId };
+  }
+  /**
+   * 将逻辑目录路径解析为 folderId；缺失的各级目录会逐级 createFolder。
+   * @param folderPath 如 `Obsidian` 或 `A/B`
+   */
+  async resolveFolderIdFromPath(projectId, folderPath) {
+    const segments = parseTargetFolderSegments(folderPath);
+    if (segments.length === 0) {
+      return { ok: false, error: "\u4E91\u7AEF\u76EE\u6807\u76EE\u5F55\u8DEF\u5F84\u4E0D\u80FD\u4E3A\u7A7A" };
     }
-    console.debug(`[XGKB Sync] init: \u672A\u627E\u5230 "${this.targetFolderName}"\uFF0C\u8C03\u7528 createFolder \u65B0\u5EFA...`);
-    const createResult = await this.api.createFolder({
-      projectId,
-      parentId: "0",
-      name: this.targetFolderName
-    });
-    if (!createResult.ok) {
-      return { ok: false, error: `\u521B\u5EFA Obsidian \u76EE\u5F55\u5931\u8D25: ${createResult.error}` };
+    const level1Result = await this.api.getLevel1Folders(projectId);
+    if (!level1Result.ok) {
+      return { ok: false, error: `\u83B7\u53D6\u76EE\u5F55\u5217\u8868\u5931\u8D25: ${level1Result.error}` };
     }
-    this.rootId = createResult.value;
-    console.debug(`[XGKB Sync] init: \u65B0\u5EFA\u540C\u6B65\u6839\u76EE\u5F55 "${this.targetFolderName}" rootId=${createResult.value}`);
-    return { ok: true, value: createResult.value };
+    const folders = level1Result.value || [];
+    const firstSeg = segments[0];
+    let firstFolder = folders.find((f) => f.name === firstSeg && f.type === 1);
+    if (!firstFolder) {
+      console.debug(`[XGKB Sync] \u4E00\u7EA7\u76EE\u5F55 "${firstSeg}" \u4E0D\u5B58\u5728\uFF0C\u6B63\u5728\u521B\u5EFA...`);
+      const createResult = await this.api.createFolder({
+        projectId,
+        parentId: "0",
+        name: firstSeg
+      });
+      if (!createResult.ok) {
+        return { ok: false, error: `\u521B\u5EFA\u76EE\u5F55 "${firstSeg}" \u5931\u8D25: ${createResult.error}` };
+      }
+      firstFolder = { id: createResult.value, name: firstSeg, type: 1, parentId: "0" };
+    }
+    let currentId = firstFolder.id;
+    for (let i = 1; i < segments.length; i++) {
+      const seg = segments[i];
+      const childResult = await this.api.getChildFiles(currentId, 1);
+      if (!childResult.ok) {
+        return {
+          ok: false,
+          error: `\u83B7\u53D6\u5B50\u76EE\u5F55\u5931\u8D25(parentId=${currentId}): ${childResult.error}`
+        };
+      }
+      const children = childResult.value || [];
+      const found = children.find((f) => f.name === seg && f.type === 1);
+      if (!found) {
+        const parentPath = segments.slice(0, i).join("/");
+        console.debug(`[XGKB Sync] \u76EE\u5F55 "${parentPath}" \u4E0B\u65E0 "${seg}"\uFF0C\u6B63\u5728\u521B\u5EFA...`);
+        const createResult = await this.api.createFolder({
+          projectId,
+          parentId: currentId,
+          name: seg
+        });
+        if (!createResult.ok) {
+          return {
+            ok: false,
+            error: `\u521B\u5EFA\u76EE\u5F55 "${seg}"\uFF08\u4F4D\u4E8E ${parentPath}\uFF09\u5931\u8D25: ${createResult.error}`
+          };
+        }
+        currentId = createResult.value;
+      } else {
+        currentId = found.id;
+      }
+    }
+    return { ok: true, value: currentId };
   }
   /**
    * 通过 4.21 扁平列举同步根目录下所有 .md 文件
@@ -482,12 +544,13 @@ var FsXgkb = class {
     const lastSlash = relativePath.lastIndexOf("/");
     const folderPath = lastSlash > 0 ? relativePath.substring(0, lastSlash) : "";
     const fileName = lastSlash > 0 ? relativePath.substring(lastSlash + 1) : relativePath;
-    const folderName = folderPath ? `${this.targetFolderName}/${folderPath}` : this.targetFolderName;
+    const folderName = folderPath ? `${this.targetFolderPath}/${folderPath}` : this.targetFolderPath;
     const result = await this.api.uploadContent({
       content,
       fileName,
       fileSuffix: "md",
-      folderName
+      folderName,
+      projectId: this.projectId || void 0
     });
     if (!result.ok)
       return { ok: false, error: `\u4E0A\u4F20\u5931\u8D25: ${result.error}` };
@@ -609,15 +672,25 @@ var XgkbPluginSettingTab = class extends import_obsidian2.PluginSettingTab {
         await this.plugin.saveSettings();
       })
     );
+    new import_obsidian2.Setting(containerEl).setName("Project ID").setDesc("\u76EE\u6807\u77E5\u8BC6\u5E93\u7A7A\u95F4 ID\uFF1B\u7559\u7A7A\u5219\u540C\u6B65\u5230\u4E2A\u4EBA\u77E5\u8BC6\u5E93\u3002\u5207\u6362\u7A7A\u95F4\u540E\u5EFA\u8BAE\u91CD\u65B0\u5168\u91CF\u540C\u6B65\u3002").addText(
+      (text) => {
+        var _a;
+        return text.setPlaceholder("\u7559\u7A7A = \u4E2A\u4EBA\u77E5\u8BC6\u5E93").setValue((_a = this.plugin.settings.projectId) != null ? _a : "").onChange(async (value) => {
+          this.plugin.settings.projectId = value.trim();
+          await this.plugin.saveSettings();
+        });
+      }
+    );
     new import_obsidian2.Setting(containerEl).setName("Sync folder").setDesc("Obsidian \u4E2D\u7528\u4E8E\u540C\u6B65\u7684\u6587\u4EF6\u5939\u8DEF\u5F84\uFF08\u7A7A = \u540C\u6B65\u6574\u4E2A vault\uFF09").addText(
       (text) => text.setPlaceholder("Example: notes").setValue(this.plugin.settings.syncFolder).onChange(async (value) => {
         this.plugin.settings.syncFolder = value;
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian2.Setting(containerEl).setName("Cloud target folder").setDesc("\u7384\u5173\u77E5\u8BC6\u5E93\u4E2D\u76EE\u6807\u6587\u4EF6\u5939\u540D\u79F0").addText(
-      (text) => text.setPlaceholder("Obsidian").setValue(this.plugin.settings.targetFolderName).onChange(async (value) => {
-        this.plugin.settings.targetFolderName = value || "Obsidian";
+    new import_obsidian2.Setting(containerEl).setName("Cloud target folder").setDesc("\u77E5\u8BC6\u5E93\u4E2D\u7684\u540C\u6B65\u6839\u76EE\u5F55\uFF1B\u652F\u6301\u591A\u7EA7\u8DEF\u5F84\uFF0C\u5982 Obsidian \u6216 A/B\uFF08\u4E0D\u5B58\u5728\u65F6\u81EA\u52A8\u521B\u5EFA\uFF09").addText(
+      (text) => text.setPlaceholder("Obsidian \u6216 A/B").setValue(this.plugin.settings.targetFolderName).onChange(async (value) => {
+        const normalized = normalizeTargetFolderPath(value);
+        this.plugin.settings.targetFolderName = normalized || "Obsidian";
         await this.plugin.saveSettings();
       })
     );
@@ -645,31 +718,29 @@ var XgkbPluginSettingTab = class extends import_obsidian2.PluginSettingTab {
     });
   }
   async testConnection() {
-    const { appKey, serverUrl, targetFolderName } = this.plugin.settings;
+    const { appKey, serverUrl, targetFolderName, projectId } = this.plugin.settings;
     if (!appKey) {
       new import_obsidian2.Notice("Enter app key first");
       return;
     }
     new import_obsidian2.Notice("\u6D4B\u8BD5\u8FDE\u63A5\u4E2D...");
     const api = new XgkbApi(serverUrl, appKey);
-    const projectIdResult = await api.getPersonalProjectId();
+    const projectIdResult = await api.resolveProjectId(projectId);
     if (!projectIdResult.ok) {
       new import_obsidian2.Notice(`\u274C \u8FDE\u63A5\u5931\u8D25: ${projectIdResult.error}`, 5e3);
       return;
     }
-    const foldersResult = await api.getLevel1Folders(projectIdResult.value);
-    if (!foldersResult.ok) {
-      new import_obsidian2.Notice(`\u274C \u83B7\u53D6\u76EE\u5F55\u5931\u8D25: ${foldersResult.error}`, 5e3);
+    const resolvedId = projectIdResult.value;
+    const spaceLabel = (projectId == null ? void 0 : projectId.trim()) ? `\u7A7A\u95F4 ${resolvedId}` : `\u4E2A\u4EBA\u77E5\u8BC6\u5E93 (${resolvedId})`;
+    const fsXgkb = new FsXgkb(api, targetFolderName, projectId);
+    const initResult = await fsXgkb.init();
+    if (!initResult.ok) {
+      new import_obsidian2.Notice(`\u274C \u76EE\u5F55\u89E3\u6790\u5931\u8D25: ${initResult.error}`, 8e3);
       return;
     }
-    const folders = foldersResult.value || [];
-    const target = folders.find((f) => f.name === targetFolderName && f.type === 1);
-    if (!target) {
-      const names = folders.map((f) => f.name).join(", ");
-      new import_obsidian2.Notice(`\u274C \u76EE\u5F55 "${targetFolderName}" \u4E0D\u5B58\u5728\u3002\u73B0\u6709: ${names || "(\u7A7A)"}`, 8e3);
-      return;
-    }
-    const filesResult = await api.getChildFiles(target.id);
+    const rootId = initResult.value;
+    const displayPath = normalizeTargetFolderPath(targetFolderName) || "Obsidian";
+    const filesResult = await api.getChildFiles(rootId);
     if (!filesResult.ok) {
       new import_obsidian2.Notice(`\u274C \u76EE\u5F55\u8BBF\u95EE\u5931\u8D25: ${filesResult.error}`, 5e3);
       return;
@@ -677,10 +748,13 @@ var XgkbPluginSettingTab = class extends import_obsidian2.PluginSettingTab {
     const items = filesResult.value || [];
     const mdCount = items.filter((f) => f.type === 2 && f.suffix === "md").length;
     const folderCount = items.filter((f) => f.type === 1).length;
-    new import_obsidian2.Notice(`\u2705 \u8FDE\u63A5\u6210\u529F\uFF01"${targetFolderName}" \u542B ${mdCount} \u4E2A .md \u6587\u4EF6\u3001${folderCount} \u4E2A\u5B50\u6587\u4EF6\u5939`, 5e3);
+    new import_obsidian2.Notice(
+      `\u2705 \u8FDE\u63A5\u6210\u529F\uFF08${spaceLabel}\uFF09\uFF01"${displayPath}" \u542B ${mdCount} \u4E2A .md \u6587\u4EF6\u3001${folderCount} \u4E2A\u5B50\u6587\u4EF6\u5939`,
+      5e3
+    );
   }
   async debugSync() {
-    const { appKey, serverUrl, targetFolderName, syncFolder, syncDirection } = this.plugin.settings;
+    const { appKey, serverUrl, targetFolderName, syncFolder, syncDirection, projectId } = this.plugin.settings;
     if (!appKey) {
       new import_obsidian2.Notice("Enter app key first");
       return;
@@ -691,11 +765,12 @@ var XgkbPluginSettingTab = class extends import_obsidian2.PluginSettingTab {
 `];
     lines.push(`\u540C\u6B65\u65B9\u5411: ${syncDirection}`);
     lines.push(`SyncFolder: "${syncFolder || "(\u6574\u4E2AVault)"}"`);
-    lines.push(`TargetFolder: "${targetFolderName}"
+    lines.push(`TargetFolder: "${targetFolderName}"`);
+    lines.push(`ProjectId: "${(projectId == null ? void 0 : projectId.trim()) || "(\u4E2A\u4EBA\u77E5\u8BC6\u5E93)"}"
 `);
     try {
       const fsLocal = new FsLocal(this.plugin.app, syncFolder);
-      const fsXgkb = new FsXgkb(api, targetFolderName);
+      const fsXgkb = new FsXgkb(api, targetFolderName, projectId);
       const localFiles = fsLocal.listFiles();
       lines.push(`\u672C\u5730 .md \u6587\u4EF6: ${localFiles.length} \u4E2A`);
       for (const f of localFiles.slice(0, 10)) {
@@ -1333,7 +1408,7 @@ var XgkbSyncPlugin = class extends import_obsidian3.Plugin {
       dbOpened = true;
       const api = new XgkbApi(this.settings.serverUrl, this.settings.appKey);
       const fsLocal = new FsLocal(this.app, this.settings.syncFolder);
-      const fsXgkb = new FsXgkb(api, this.settings.targetFolderName);
+      const fsXgkb = new FsXgkb(api, this.settings.targetFolderName, this.settings.projectId);
       const engine = new SyncEngine(fsLocal, fsXgkb, db, this.settings);
       const stats = await engine.runSync(void 0, this.lastSyncTime);
       if (stats.newSince) {

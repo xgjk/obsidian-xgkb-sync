@@ -3,6 +3,7 @@ import type { XgkbPluginSettings } from "./types";
 export const DEFAULT_SETTINGS: XgkbPluginSettings = {
 	appKey: "",
 	serverUrl: "https://sg-al-cwork-web.mediportal.com.cn/open-api/",
+	projectId: "",
 	syncFolder: "",   // 空=同步整个 Vault
 	targetFolderName: "Obsidian",
 	syncDirection: "bidirectional",

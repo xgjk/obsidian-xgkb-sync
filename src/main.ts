@@ -114,7 +114,7 @@ export default class XgkbSyncPlugin extends Plugin {
 
 			const api = new XgkbApi(this.settings.serverUrl, this.settings.appKey);
 			const fsLocal = new FsLocal(this.app, this.settings.syncFolder);
-			const fsXgkb = new FsXgkb(api, this.settings.targetFolderName);
+			const fsXgkb = new FsXgkb(api, this.settings.targetFolderName, this.settings.projectId);
 			const engine = new SyncEngine(fsLocal, fsXgkb, db, this.settings);
 
 			const stats = await engine.runSync(undefined, this.lastSyncTime);

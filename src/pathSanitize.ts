@@ -17,3 +17,18 @@ export function sanitizeRelativePath(relativePath: string): string {
 		.map((seg) => sanitizePathSegment(seg))
 		.join("/");
 }
+
+/** 将云端目标目录配置解析为多级路径片段（支持 `A/B`、`\` 与首尾空白） */
+export function parseTargetFolderSegments(folderPath: string): string[] {
+	return folderPath
+		.replace(/\\/g, "/")
+		.split("/")
+		.map((seg) => seg.trim())
+		.filter(Boolean)
+		.map((seg) => sanitizePathSegment(seg));
+}
+
+/** 规范化后的目标目录字符串（用于 uploadContent 的 folderName 前缀） */
+export function normalizeTargetFolderPath(folderPath: string): string {
+	return parseTargetFolderSegments(folderPath).join("/");
+}
