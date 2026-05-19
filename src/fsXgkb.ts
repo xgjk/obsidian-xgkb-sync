@@ -1,6 +1,6 @@
 import { XgkbApi } from "./xgkbApi";
 import type { FileEntry, Result, XgkbChangeItem, XgkbMetaItem } from "./types";
-import { BATCH_GET_CONTENT_MAX, BATCH_GET_META_MAX, cleanContent } from "./constants";
+import { BATCH_GET_META_MAX, MAX_RETRIES, RETRY_BASE_DELAY_MS, cleanContent } from "./constants";
 import { normalizeTargetFolderPath, parseTargetFolderSegments, sanitizePathSegment } from "./pathSanitize";
 
 /**
@@ -169,45 +169,72 @@ export class FsXgkb {
 		return { ok: true, value: entries };
 	}
 
-	/**
-	 * 读取云端文件内容（使用 getFullFileContent，所写即所读）
-	 */
-	async readFile(fileId: string): Promise<Result<string>> {
-		const result = await this.api.getFullFileContent(fileId);
-		if (!result.ok) return result;
-		// 清理尾部 "Page X of Y" 标记
-		return { ok: true, value: cleanContent(result.value) };
+	private async delay(ms: number): Promise<void> {
+		return new Promise((resolve) => window.setTimeout(resolve, ms));
+	}
+
+	private isRetriableHttp(status: number): boolean {
+		return status === 408 || status === 429 || status >= 500;
+	}
+
+	private async fetchDownloadUrl(downloadUrl: string): Promise<Result<string>> {
+		let lastError = "";
+		for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+			if (attempt > 0) {
+				await this.delay(RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1));
+			}
+			try {
+				const resp = await fetch(downloadUrl);
+				if (!resp.ok) {
+					lastError = `OSS HTTP ${resp.status}: ${resp.statusText}`;
+					if (this.isRetriableHttp(resp.status)) continue;
+					return { ok: false, error: lastError };
+				}
+				const text = await resp.text();
+				return { ok: true, value: text };
+			} catch (e) {
+				lastError = e instanceof Error ? e.message : String(e);
+			}
+		}
+		return { ok: false, error: lastError || "OSS 下载失败" };
 	}
 
 	/**
-	 * 批量预取全文（4.15 `batchGetContent`）。
-	 * 不限个人空间，凭 fileId 与 appKey 权限拉取；建议每批不超过 {@link BATCH_GET_CONTENT_MAX} 个。
-	 * 若某项未命中或非 success，调用方应回退 {@link readFile}。
+	 * 读取云端 .md 原文：优先 getDownloadInfo → OSS 直链；失败则回退 getFullFileContent。
 	 */
-	async readFilesBatch(fileIds: string[]): Promise<Map<string, string>> {
-		const out = new Map<string, string>();
-		const unique = [...new Set(fileIds.filter(Boolean))];
-		for (let i = 0; i < unique.length; i += BATCH_GET_CONTENT_MAX) {
-			const chunk = unique.slice(i, i + BATCH_GET_CONTENT_MAX);
-			const r = await this.api.batchGetContent(chunk.map((fileId) => ({ fileId })));
-			if (!r.ok) {
-				console.warn("[XGKB Sync] batchGetContent 失败，未命中项将回退单文件拉取:", r.error);
+	async readFile(fileId: string): Promise<Result<string>> {
+		let lastError = "";
+
+		for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+			if (attempt > 0) {
+				await this.delay(RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1));
+			}
+			const infoResult = await this.api.getDownloadInfo(fileId, true);
+			if (infoResult.ok && infoResult.value.downloadUrl) {
+				const bodyResult = await this.fetchDownloadUrl(infoResult.value.downloadUrl);
+				if (bodyResult.ok) {
+					return { ok: true, value: bodyResult.value };
+				}
+				lastError = bodyResult.error;
 				continue;
 			}
-			let mergedThisChunk = 0;
-			for (const row of r.value || []) {
-				const id = String(row.fileId);
-				if (row.status === "success" && row.content != null) {
-					out.set(id, cleanContent(row.content));
-					mergedThisChunk++;
-				}
-			}
-			// Obsidian 的 requestUrl 通常不会出现在侧边栏开发者工具 Network 里，用本日志确认请求已发出并已返回
-			console.debug(
-				`[XGKB Sync] batchGetContent 已返回: 本批 ${chunk.length} 个 fileId，接口响应 ${r.value?.length ?? 0} 条，可用正文 ${mergedThisChunk} 条`
-			);
+			lastError = infoResult.ok ? "无 downloadUrl" : infoResult.error;
 		}
-		return out;
+
+		console.warn(
+			`[XGKB Sync] getDownloadInfo 多次失败，回退 getFullFileContent (fileId=${fileId}): ${lastError}`
+		);
+		for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+			if (attempt > 0) {
+				await this.delay(RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1));
+			}
+			const fallback = await this.api.getFullFileContent(fileId);
+			if (fallback.ok) {
+				return { ok: true, value: cleanContent(fallback.value) };
+			}
+			lastError = fallback.error;
+		}
+		return { ok: false, error: lastError || "下载失败" };
 	}
 
 	/**

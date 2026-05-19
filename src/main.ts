@@ -209,6 +209,7 @@ export default class XgkbSyncPlugin extends Plugin {
 
 		if (this.isSyncing) {
 			console.debug("[XGKB Sync] 上次同步仍在进行，跳过本次触发");
+			new Notice("XGKB Sync: 同步进行中，请勿重复点击", 5000);
 			return;
 		}
 		this.isSyncing = true;
@@ -244,7 +245,13 @@ export default class XgkbSyncPlugin extends Plugin {
 			const fsXgkb = new FsXgkb(api, this.settings.targetFolderName, this.settings.projectId);
 			const engine = new SyncEngine(fsLocal, fsXgkb, db, this.settings, scopeKey);
 
-			const stats = await engine.runSync(undefined, since);
+			let lastProgressNotice = 0;
+			const stats = await engine.runSync((msg) => {
+				const now = Date.now();
+				if (msg.startsWith("下载进度") && now - lastProgressNotice < 8000) return;
+				lastProgressNotice = now;
+				new Notice(`XGKB Sync: ${msg}`, 3000);
+			}, since);
 
 			if (stats.newSince) {
 				const rootId = fsXgkb.getRootId();
@@ -273,7 +280,10 @@ export default class XgkbSyncPlugin extends Plugin {
 
 			if (stats.errors.length > 0) {
 				console.error("[XGKB Sync] 同步错误:", stats.errors);
-				new Notice(`XGKB Sync: ${stats.errors.length} 个文件同步失败，请查看控制台`, 8000);
+				new Notice(
+					`XGKB Sync: ${stats.errors.length} 个文件失败（已记录，下次优先重试；水位已推进）`,
+					8000
+				);
 			}
 		} catch (e) {
 			const msg = e instanceof Error ? e.message : String(e);

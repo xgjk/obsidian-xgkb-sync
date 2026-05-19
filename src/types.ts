@@ -131,8 +131,20 @@ export interface SyncStats {
 	skipped: number;
 	failed: number;
 	errors: string[];
-	/** 本轮同步结束后推荐的下次 since 水位（毫秒时间戳），由引擎写入，main 持久化 */
+	/** 本轮结束后写入的 since 水位（毫秒）；有失败时仍会推进，失败项靠 IndexedDB 重试 */
 	newSince?: number;
+	/** 本轮重试的失败记录数 */
+	retriedFailed?: number;
+}
+
+/** getDownloadInfo（4.1）响应 */
+export interface DownloadInfoVO {
+	fileId: string | number;
+	downloadUrl?: string;
+	previewUrl?: string;
+	fileName?: string;
+	suffix?: string;
+	size?: number;
 }
 
 export type ProgressCallback = (msg: string) => void;

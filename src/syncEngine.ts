@@ -8,22 +8,26 @@ import type {
 import { SyncStateDb } from "./syncStateDb";
 import { FsLocal } from "./fsLocal";
 import { FsXgkb } from "./fsXgkb";
-import { DEFAULT_SETTINGS, MTIME_TOLERANCE_MS, CHANGES_SAFETY_WINDOW_MS } from "./constants";
+import {
+	DEFAULT_SETTINGS,
+	DOWNLOAD_CONCURRENCY,
+	MTIME_TOLERANCE_MS,
+	CHANGES_SAFETY_WINDOW_MS,
+} from "./constants";
 import { sanitizePathSegment } from "./pathSanitize";
+
+type RemoteMapBuild = {
+	map: Map<string, FileEntry>;
+	/** 增量：listChanges.serverTime；全量：子树内最大 updateTime */
+	watermarkCandidate: number;
+	scanMode: "incremental" | "full";
+};
 
 /**
  * 同步引擎（Last-Write-Wins）
  *
- * 决策逻辑：
- * - 无 record（首次）：本地有→上传，云端有→下载，都有→对比 mtime
- * - 有 record（增量）：基于 mtime 变化判断方向
- * - 两端都修改了→LWW：较新覆盖较旧
- * - 一端删除了→另一端也删除
- *
- * 云端扫描策略：
- * - 有 since 水位 → 优先走 listChanges + batchGetMeta 增量路径
- *   - 若有未知新文件（fileId 不在本地状态库）→ 自动降级为全量 listDescendantFiles
- * - 无 since（首次）→ 全量 listDescendantFiles
+ * 下载：getDownloadInfo → OSS 直链，并发 {@link DOWNLOAD_CONCURRENCY}，拉完即 writeFile。
+ * 水位：轮次结束后提交；有失败仍推进，失败项记入 IndexedDB（syncStatus=failed）下轮优先重试。
  */
 export class SyncEngine {
 	private db: SyncStateDb;
@@ -33,6 +37,7 @@ export class SyncEngine {
 	private scopeKey: string;
 	private stats: SyncStats;
 	private progress: ProgressCallback = () => {};
+	private successfulRemoteMtimes: number[] = [];
 
 	constructor(
 		fsLocal: FsLocal,
@@ -53,42 +58,39 @@ export class SyncEngine {
 		return { uploaded: 0, downloaded: 0, deleted: 0, skipped: 0, failed: 0, errors: [] };
 	}
 
-	/**
-	 * @param onProgress 进度回调
-	 * @param since      上次同步水位（毫秒时间戳）；首次同步不传
-	 */
 	async runSync(onProgress?: ProgressCallback, since?: number): Promise<SyncStats> {
 		this.stats = this.emptyStats();
+		this.successfulRemoteMtimes = [];
 		this.progress = onProgress || (() => {});
 		const prog = (msg: string) => {
 			console.debug(`[XGKB Sync] ${msg}`);
 			this.progress(msg);
 		};
 
-		// Step 1: 初始化云端
 		prog("连接玄关知识库...");
 		const initResult = await this.fsXgkb.init();
 		if (!initResult.ok) throw new Error(`初始化失败: ${initResult.error}`);
 
-		// Step 2: 扫描本地文件
 		prog("扫描本地文件...");
 		const localFiles = this.fsLocal.listFiles();
 		prog(`本地: ${localFiles.length} 个 .md 文件`);
 
-		// Step 3: 构建云端视图（增量优先，失败降级全量）
-		const { map: remoteMap, newSince } = await this.buildRemoteMap(since, prog);
-		prog(`云端: ${remoteMap.size} 个 .md 文件（水位 ${newSince}）`);
-		this.stats.newSince = newSince;
+		const remoteBuild = await this.buildRemoteMap(since, prog);
+		let remoteMap = remoteBuild.map;
+		prog(`云端: ${remoteMap.size} 个 .md 文件（候选水位 ${remoteBuild.watermarkCandidate}）`);
 
-		// Step 4: 构建本地 Map
+		const retried = await this.injectFailedRetries(remoteMap, prog);
+		this.stats.retriedFailed = retried;
+		if (retried > 0) {
+			prog(`失败重试队列: ${retried} 个文件已并入本轮`);
+		}
+
 		const localMap = new Map<string, FileEntry>();
 		for (const f of localFiles) localMap.set(f.path, f);
 
-		// Step 5: 合并所有路径
 		const allPaths = new Set<string>([...localMap.keys(), ...remoteMap.keys()]);
 		prog(`共 ${allPaths.size} 个路径需要处理`);
 
-		// Step 6a: 逐路径决策
 		const plans: SyncPlan[] = [];
 		let idx = 0;
 		for (const path of allPaths) {
@@ -101,38 +103,114 @@ export class SyncEngine {
 			plans.push({ path, local, remote, record, op });
 		}
 
-		// Step 6b: 批量预取需要下载的文件正文
-		const downloadFileIds: string[] = [];
-		for (const p of plans) {
-			if (p.op === "download-new" || p.op === "download-update") {
-				const id = p.remote?.xgkbFileId;
-				if (id) downloadFileIds.push(id);
-			}
-		}
-		if (downloadFileIds.length > 0) prog(`批量拉取正文 ${downloadFileIds.length} 个文件...`);
-		const contentCache = await this.fsXgkb.readFilesBatch(downloadFileIds);
+		const downloadPlans = plans.filter((p) => p.op === "download-new" || p.op === "download-update");
+		const otherPlans = plans.filter((p) => p.op !== "download-new" && p.op !== "download-update");
 
-		// Step 6c: 按计划执行
 		idx = 0;
-		for (const plan of plans) {
+		for (const plan of otherPlans) {
 			idx++;
-			if (idx % 50 === 0 || idx === plans.length) prog(`处理中 ${idx}/${plans.length}...`);
-			await this.executePlan(plan, contentCache);
+			if (idx % 50 === 0 || idx === otherPlans.length) {
+				prog(`处理中 ${idx}/${otherPlans.length}（上传/跳过/删除）...`);
+			}
+			await this.executePlan(plan);
 		}
 
-		prog(`完成: ↑${this.stats.uploaded} ↓${this.stats.downloaded} ✗${this.stats.deleted} ✗fail:${this.stats.failed} ∅${this.stats.skipped}`);
+		if (downloadPlans.length > 0) {
+			prog(`开始下载 ${downloadPlans.length} 个文件（并发 ${DOWNLOAD_CONCURRENCY}，OSS 直链）...`);
+			let done = 0;
+			await this.runWithConcurrency(downloadPlans, DOWNLOAD_CONCURRENCY, async (plan) => {
+				await this.executePlan(plan);
+				done++;
+				if (done % 5 === 0 || done === downloadPlans.length) {
+					prog(`下载进度 ${done}/${downloadPlans.length}（已完成 ↓${this.stats.downloaded} 失败 ${this.stats.failed}）`);
+				}
+			});
+		}
+
+		this.stats.newSince = this.computeCommittedWatermark(remoteBuild);
+
+		prog(
+			`完成: ↑${this.stats.uploaded} ↓${this.stats.downloaded} ✗${this.stats.deleted} fail:${this.stats.failed} ∅${this.stats.skipped} 水位=${this.stats.newSince ?? "-"}`
+		);
 		return this.stats;
 	}
 
-	// ==================== 云端视图构建 ====================
+	private computeCommittedWatermark(build: RemoteMapBuild): number {
+		const catalogMax = this.maxRemoteMtime(build.map);
+		const successMax =
+			this.successfulRemoteMtimes.length > 0 ? Math.max(...this.successfulRemoteMtimes) : 0;
 
-	/**
-	 * 构建云端文件 Map，优先走增量路径，降级全量。
-	 */
+		if (build.scanMode === "incremental") {
+			return Math.max(build.watermarkCandidate, successMax, catalogMax);
+		}
+		return Math.max(catalogMax, successMax, build.watermarkCandidate);
+	}
+
+	private maxRemoteMtime(map: Map<string, FileEntry>): number {
+		let max = 0;
+		for (const f of map.values()) {
+			if (f.mtime > max) max = f.mtime;
+		}
+		return max;
+	}
+
+	/** 将 IndexedDB 中 failed 记录并入 remoteMap，避免水位推进后漏拉 */
+	private async injectFailedRetries(
+		remoteMap: Map<string, FileEntry>,
+		prog: (msg: string) => void
+	): Promise<number> {
+		const all = await this.db.getAll(this.scopeKey);
+		const failed = all.filter((r) => r.syncStatus === "failed");
+		if (failed.length === 0) return 0;
+
+		const ids = failed.map((r) => r.xgkbFileId).filter(Boolean);
+		const metaMap = await this.fsXgkb.batchGetMetaAll(ids);
+
+		let injected = 0;
+		for (const record of failed) {
+			const meta = metaMap.get(record.xgkbFileId);
+			if (meta?.deleted) {
+				await this.db.delete(this.scopeKey, record.localPath);
+				prog(`云端已删除，清除失败记录: ${record.localPath}`);
+				continue;
+			}
+			if (remoteMap.has(record.localPath)) continue;
+			const mtime = meta?.updateTime ?? record.remoteMtime;
+			remoteMap.set(record.localPath, {
+				path: record.localPath,
+				name: meta?.name || record.localPath.split("/").pop() || record.localPath,
+				mtime,
+				xgkbFileId: record.xgkbFileId,
+				xgkbFolderId:
+					meta?.parentId != null ? String(meta.parentId) : record.xgkbFolderId,
+			});
+			injected++;
+		}
+		if (injected > 0) {
+			prog(`从失败队列恢复 ${injected} 个路径到云端视图`);
+		}
+		return failed.length;
+	}
+
+	private async runWithConcurrency<T>(
+		items: T[],
+		concurrency: number,
+		fn: (item: T) => Promise<void>
+	): Promise<void> {
+		let cursor = 0;
+		const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+			while (cursor < items.length) {
+				const i = cursor++;
+				await fn(items[i]);
+			}
+		});
+		await Promise.all(workers);
+	}
+
 	private async buildRemoteMap(
 		since: number | undefined,
 		prog: (msg: string) => void
-	): Promise<{ map: Map<string, FileEntry>; newSince: number }> {
+	): Promise<RemoteMapBuild> {
 		if (since !== undefined) {
 			const sinceStr = new Date(since).toLocaleString("zh-CN");
 			prog(`增量模式：since=${since} (${sinceStr})`);
@@ -148,14 +226,10 @@ export class SyncEngine {
 		return this.fullRemoteMap();
 	}
 
-	/**
-	 * 尝试增量路径：listChanges + batchGetMeta。
-	 * 遇到未知新文件（无本地记录）返回 null，由调用方降级全量。
-	 */
 	private async tryIncrementalRemoteMap(
 		since: number,
 		prog: (msg: string) => void
-	): Promise<{ map: Map<string, FileEntry>; newSince: number } | null> {
+	): Promise<RemoteMapBuild | null> {
 		const safeSince = since - CHANGES_SAFETY_WINDOW_MS;
 		const changesResult = await this.fsXgkb.listAllChanges(safeSince);
 		if (!changesResult.ok) {
@@ -164,11 +238,10 @@ export class SyncEngine {
 		}
 
 		const { items, serverTime } = changesResult.value;
-		const newSince = serverTime || Date.now();
+		const watermarkCandidate = serverTime || Date.now();
 		prog(`增量变更: ${items.length} 条`);
 
-		// 分类事件，同时保留 item 引用供后续路径重建使用
-		const upsertById = new Map<string, typeof items[0]>();
+		const upsertById = new Map<string, (typeof items)[0]>();
 		const deleteIds = new Set<string>();
 		for (const item of items) {
 			const id = String(item.fileId);
@@ -176,25 +249,21 @@ export class SyncEngine {
 			else upsertById.set(id, item);
 		}
 
-		// 加载全部本地状态，建双向索引
 		const allRecords = await this.db.getAll(this.scopeKey);
 		const fileIdToRecord = new Map<string, SyncStateRecord>();
 		for (const r of allRecords) fileIdToRecord.set(r.xgkbFileId, r);
 
-		// 区分「已知变更（fileId 在状态库）」和「未知新增」
 		const knownUpsertIds: string[] = [];
 		const unknownUpsertIds: string[] = [];
 		for (const id of upsertById.keys()) {
 			if (fileIdToRecord.has(id)) knownUpsertIds.push(id);
 			else unknownUpsertIds.push(id);
 		}
-		prog(`变更分类: upsert已知=${knownUpsertIds.length} upsert新增=${unknownUpsertIds.length} delete=${deleteIds.size}`);
+		prog(
+			`变更分类: upsert已知=${knownUpsertIds.length} upsert新增=${unknownUpsertIds.length} delete=${deleteIds.size}`
+		);
 
-		// 对未知新增文件：用状态库中的 xgkbFolderId 反推目录路径，避免全量降级
-		// 原理：每条 SyncStateRecord 记录了文件的 parentFolderId，
-		//       从 localPath 可推出该 folderId 对应的本地路径前缀
 		const folderIdToPath = new Map<string, string>();
-		// 根目录本身映射为空串
 		const rootId = this.fsXgkb.getRootId();
 		if (rootId) folderIdToPath.set(rootId, "");
 		for (const record of allRecords) {
@@ -203,22 +272,19 @@ export class SyncEngine {
 			folderIdToPath.set(record.xgkbFolderId, folderPath);
 		}
 
-		// 尝试为每个未知新增文件重建路径
-		type ResolvedNew = { id: string; path: string; item: typeof items[0] };
+		type ResolvedNew = { id: string; path: string; item: (typeof items)[0] };
 		const resolvedNewFiles: ResolvedNew[] = [];
-		const unresolvedIds: string[] = []; // 父目录也是全新的，才需要降级
+		const unresolvedIds: string[] = [];
 
 		for (const id of unknownUpsertIds) {
 			const item = upsertById.get(id)!;
 			const parentId = item.parentId != null ? String(item.parentId) : "";
 			const folderPath = folderIdToPath.get(parentId);
 			if (folderPath !== undefined) {
-				// 父目录已知，直接重建路径
 				const safeName = sanitizePathSegment(item.name || id);
 				const filePath = folderPath ? `${folderPath}/${safeName}` : safeName;
 				resolvedNewFiles.push({ id, path: filePath, item });
 			} else {
-				// 父目录也是全新的，无法推断路径
 				unresolvedIds.push(id);
 			}
 		}
@@ -228,10 +294,11 @@ export class SyncEngine {
 			return null;
 		}
 		if (resolvedNewFiles.length > 0) {
-			prog(`路径重建成功 ${resolvedNewFiles.length} 个新文件（无需全量）：${resolvedNewFiles.map((f) => f.path).join(", ")}`);
+			prog(
+				`路径重建成功 ${resolvedNewFiles.length} 个新文件：${resolvedNewFiles.map((f) => f.path).join(", ")}`
+			);
 		}
 
-		// 构建基础 Map：未变更的文件直接复用本地状态里的 remoteMtime
 		const map = new Map<string, FileEntry>();
 		for (const record of allRecords) {
 			const id = record.xgkbFileId;
@@ -245,14 +312,12 @@ export class SyncEngine {
 			});
 		}
 
-		// 用 batchGetMeta 刷新已知变更文件的元数据
 		if (knownUpsertIds.length > 0) {
 			prog(`批量获取 ${knownUpsertIds.length} 个变更文件元数据...`);
 			const metaMap = await this.fsXgkb.batchGetMetaAll(knownUpsertIds);
 			for (const id of knownUpsertIds) {
 				const meta = metaMap.get(id);
 				const record = fileIdToRecord.get(id)!;
-				// meta 缺失或已删除：不加入 Map → decide() 会判定为云端删除
 				if (!meta || meta.deleted) continue;
 				map.set(record.localPath, {
 					path: record.localPath,
@@ -264,7 +329,6 @@ export class SyncEngine {
 			}
 		}
 
-		// 路径重建成功的新文件：直接加入 remoteMap，触发 download-new
 		for (const { id, path, item } of resolvedNewFiles) {
 			map.set(path, {
 				path,
@@ -275,43 +339,61 @@ export class SyncEngine {
 			});
 		}
 
-		return { map, newSince };
+		return { map, watermarkCandidate, scanMode: "incremental" };
 	}
 
-	/** 全量扫描（listDescendantFiles 分页） */
-	private async fullRemoteMap(): Promise<{ map: Map<string, FileEntry>; newSince: number }> {
+	private async fullRemoteMap(): Promise<RemoteMapBuild> {
 		const remoteResult = await this.fsXgkb.listFiles();
 		if (!remoteResult.ok) throw new Error(`扫描云端失败: ${remoteResult.error}`);
 		const map = new Map<string, FileEntry>();
-		for (const f of remoteResult.value) map.set(f.path, f);
-		const newSince = Date.now();
-		console.debug(`[XGKB Sync] 全量扫描完成: ${map.size} 个文件，新水位=${newSince} (${new Date(newSince).toLocaleString("zh-CN")})`);
-		return { map, newSince };
+		let watermarkCandidate = 0;
+		for (const f of remoteResult.value) {
+			map.set(f.path, f);
+			if (f.mtime > watermarkCandidate) watermarkCandidate = f.mtime;
+		}
+		if (watermarkCandidate <= 0) watermarkCandidate = Date.now();
+		console.debug(
+			`[XGKB Sync] 全量扫描完成: ${map.size} 个文件，候选水位=${watermarkCandidate} (${new Date(watermarkCandidate).toLocaleString("zh-CN")})`
+		);
+		return { map, watermarkCandidate, scanMode: "full" };
 	}
 
-	// ==================== 计划执行 ====================
-
-	private async executePlan(plan: SyncPlan, contentCache: Map<string, string>): Promise<void> {
+	private async executePlan(plan: SyncPlan): Promise<void> {
 		const { path, local, remote, record, op } = plan;
 		try {
 			switch (op) {
-				case "upload-new":    await this.doUploadNew(path, local!); break;
-				case "upload-update": await this.doUploadUpdate(path, local!, remote!, record); break;
-				case "download-new":  await this.doDownloadNew(path, remote!, contentCache); break;
-				case "download-update": await this.doDownloadUpdate(path, remote!, record, contentCache); break;
-				case "delete-local":  await this.doDeleteLocal(path, record!); break;
-				case "delete-remote": await this.doDeleteRemote(record!); break;
-				case "skip":          this.stats.skipped++; break;
+				case "upload-new":
+					await this.doUploadNew(path, local!);
+					break;
+				case "upload-update":
+					await this.doUploadUpdate(path, local!, remote!, record);
+					break;
+				case "download-new":
+					await this.doDownload(path, remote!, record);
+					break;
+				case "download-update":
+					await this.doDownload(path, remote!, record);
+					break;
+				case "delete-local":
+					await this.doDeleteLocal(path, record!);
+					break;
+				case "delete-remote":
+					await this.doDeleteRemote(record!);
+					break;
+				case "skip":
+					this.stats.skipped++;
+					break;
 			}
 		} catch (e) {
 			const msg = e instanceof Error ? e.message : String(e);
 			this.stats.failed++;
 			this.stats.errors.push(`${path}: ${msg}`);
 			console.error(`[XGKB Sync] 同步失败 ${path}:`, msg);
+			if ((op === "download-new" || op === "download-update") && remote) {
+				await this.recordDownloadFailure(path, remote, record, msg);
+			}
 		}
 	}
-
-	// ==================== 决策逻辑 ====================
 
 	private decide(
 		path: string,
@@ -321,7 +403,12 @@ export class SyncEngine {
 	): SyncOp {
 		const dir = this.settings.syncDirection;
 
-		// 情况 A：无 record（首次同步该路径）
+		if (record?.syncStatus === "failed") {
+			if (!remote) return "skip";
+			if (dir === "push") return "skip";
+			return "download-update";
+		}
+
 		if (!record) {
 			if (local && !remote) return dir === "pull" ? "skip" : "upload-new";
 			if (!local && remote) return dir === "push" ? "skip" : "download-new";
@@ -333,7 +420,6 @@ export class SyncEngine {
 			return "skip";
 		}
 
-		// 情况 B：有 record（增量同步）
 		if (!local && !remote) return "skip";
 
 		if (!local && remote) {
@@ -349,14 +435,13 @@ export class SyncEngine {
 		}
 
 		if (local && remote) {
-			const localChanged  = local.mtime  > record.localMtime  + MTIME_TOLERANCE_MS;
+			const localChanged = local.mtime > record.localMtime + MTIME_TOLERANCE_MS;
 			const remoteChanged = remote.mtime > record.remoteMtime + MTIME_TOLERANCE_MS;
 
 			if (!localChanged && !remoteChanged) return "skip";
-			if (localChanged  && !remoteChanged) return dir === "pull"  ? "skip" : "upload-update";
-			if (!localChanged && remoteChanged)  return dir === "push"  ? "skip" : "download-update";
+			if (localChanged && !remoteChanged) return dir === "pull" ? "skip" : "upload-update";
+			if (!localChanged && remoteChanged) return dir === "push" ? "skip" : "download-update";
 
-			// 两端都变 → LWW
 			if (dir === "pull") return "download-update";
 			if (dir === "push") return "upload-update";
 			return local.mtime >= remote.mtime ? "upload-update" : "download-update";
@@ -365,9 +450,6 @@ export class SyncEngine {
 		return "skip";
 	}
 
-	// ==================== 操作执行 ====================
-
-	/** 保证 IndexedDB 复合主键 scopeKey + localPath 始终存在 */
 	private buildDbRecord(
 		path: string,
 		partial: Pick<SyncStateRecord, "xgkbFileId" | "xgkbFolderId" | "localMtime" | "remoteMtime"> &
@@ -386,18 +468,38 @@ export class SyncEngine {
 		};
 	}
 
+	private async recordDownloadFailure(
+		path: string,
+		remote: FileEntry,
+		record: SyncStateRecord | undefined,
+		msg: string
+	): Promise<void> {
+		await this.db.put(
+			this.buildDbRecord(path, {
+				xgkbFileId: remote.xgkbFileId!,
+				xgkbFolderId: record?.xgkbFolderId ?? remote.xgkbFolderId ?? "",
+				localMtime: record?.localMtime ?? 0,
+				remoteMtime: remote.mtime,
+				syncStatus: "failed",
+				lastError: msg,
+			})
+		);
+	}
+
 	private async doUploadNew(path: string, local: FileEntry): Promise<void> {
 		const content = await this.fsLocal.readFile(path);
 		const result = await this.fsXgkb.createFile(path, content);
 		if (!result.ok) throw new Error(`上传失败: ${result.error}`);
+		const remoteMtime = Date.now();
 		await this.db.put(
 			this.buildDbRecord(path, {
 				xgkbFileId: result.value.fileId,
 				xgkbFolderId: result.value.folderId,
 				localMtime: local.mtime,
-				remoteMtime: Date.now(),
+				remoteMtime,
 			})
 		);
+		this.successfulRemoteMtimes.push(remoteMtime);
 		this.stats.uploaded++;
 		this.progress(`↑ ${path}`);
 	}
@@ -414,61 +516,40 @@ export class SyncEngine {
 		const fileName = path.split("/").pop() || path;
 		const result = await this.fsXgkb.updateFile(fileId, fileName, content);
 		if (!result.ok) throw new Error(`更新失败: ${result.error}`);
+		const remoteMtime = Date.now();
 		await this.db.put(
 			this.buildDbRecord(path, {
 				xgkbFileId: fileId,
 				xgkbFolderId: record?.xgkbFolderId ?? remote.xgkbFolderId ?? "",
 				localMtime: local.mtime,
-				remoteMtime: Date.now(),
+				remoteMtime,
 			})
 		);
+		this.successfulRemoteMtimes.push(remoteMtime);
 		this.stats.uploaded++;
 		this.progress(`↑ ${path}`);
 	}
 
-	private async doDownloadNew(path: string, remote: FileEntry, contentCache: Map<string, string>): Promise<void> {
-		const fid = remote.xgkbFileId!;
-		const body = contentCache.has(fid)
-			? contentCache.get(fid)!
-			: await this.fsXgkb.readFile(fid).then((r) => {
-				if (!r.ok) throw new Error(`下载失败: ${r.error}`);
-				return r.value;
-			  });
-		const actualMtime = await this.fsLocal.writeFile(path, body);
-		await this.db.put(
-			this.buildDbRecord(path, {
-				xgkbFileId: remote.xgkbFileId!,
-				xgkbFolderId: remote.xgkbFolderId || "",
-				localMtime: actualMtime,
-				remoteMtime: remote.mtime,
-			})
-		);
-		this.stats.downloaded++;
-		this.progress(`↓ ${path}`);
-	}
-
-	private async doDownloadUpdate(
+	private async doDownload(
 		path: string,
 		remote: FileEntry,
-		record: SyncStateRecord | undefined,
-		contentCache: Map<string, string>
+		record: SyncStateRecord | undefined
 	): Promise<void> {
 		const fid = remote.xgkbFileId!;
-		const body = contentCache.has(fid)
-			? contentCache.get(fid)!
-			: await this.fsXgkb.readFile(fid).then((r) => {
-				if (!r.ok) throw new Error(`下载失败: ${r.error}`);
-				return r.value;
-			  });
-		const actualMtime = await this.fsLocal.writeFile(path, body);
+		const bodyResult = await this.fsXgkb.readFile(fid);
+		if (!bodyResult.ok) throw new Error(`下载失败: ${bodyResult.error}`);
+
+		const actualMtime = await this.fsLocal.writeFile(path, bodyResult.value);
 		await this.db.put(
 			this.buildDbRecord(path, {
 				xgkbFileId: fid,
 				xgkbFolderId: record?.xgkbFolderId ?? remote.xgkbFolderId ?? "",
 				localMtime: actualMtime,
 				remoteMtime: remote.mtime,
+				syncStatus: "done",
 			})
 		);
+		this.successfulRemoteMtimes.push(remote.mtime);
 		this.stats.downloaded++;
 		this.progress(`↓ ${path}`);
 	}
@@ -489,7 +570,14 @@ export class SyncEngine {
 	}
 }
 
-type SyncOp = "upload-new" | "upload-update" | "download-new" | "download-update" | "delete-local" | "delete-remote" | "skip";
+type SyncOp =
+	| "upload-new"
+	| "upload-update"
+	| "download-new"
+	| "download-update"
+	| "delete-local"
+	| "delete-remote"
+	| "skip";
 
 type SyncPlan = {
 	path: string;

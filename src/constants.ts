@@ -30,8 +30,11 @@ export const API_PATHS = {
 	batchGetContent: "document-database/ai/batchGetContent",
 } as const;
 
-/** batchGetContent 单次请求最大文件数（与官方文档一致） */
+/** batchGetContent 单次请求最大文件数（与官方文档一致，已弃用为主下载路径） */
 export const BATCH_GET_CONTENT_MAX = 10;
+
+/** OSS 直链下载并发数（getDownloadInfo + fetch） */
+export const DOWNLOAD_CONCURRENCY = 3;
 
 /** batchGetMeta 单次请求最大文件数 */
 export const BATCH_GET_META_MAX = 50;

@@ -6,6 +6,7 @@ import type {
 	Result,
 	FileContentVO,
 	BatchGetContentFileRef,
+	DownloadInfoVO,
 	XgkbListDescendantFilesData,
 	XgkbListChangesData,
 	XgkbMetaItem,
@@ -149,6 +150,17 @@ export class XgkbApi {
 	}
 
 	// ==================== 文件内容 ====================
+
+	/**
+	 * 获取下载凭据（4.1）。forceDownload=true 时返回 OSS downloadUrl，客户端直链拉原文。
+	 * @see https://github.com/xgjk/dev-guide/blob/main/02.%E4%BA%A7%E5%93%81%E4%B8%9A%E5%8A%A1AI%E6%96%87%E6%A1%A3/%E7%9F%A5%E8%AF%86%E5%BA%93/API%E6%8E%A5%E5%8F%A3%E6%98%8E%E7%BB%86_v2/04-UI%E7%BB%88%E7%AB%AF%E9%A2%84%E8%A7%88%E4%B8%8E%E9%98%85%E8%AF%BB.md
+	 */
+	async getDownloadInfo(fileId: string, forceDownload = true): Promise<Result<DownloadInfoVO>> {
+		return this.request<DownloadInfoVO>("GET", API_PATHS.getDownloadInfo, {
+			fileId,
+			forceDownload,
+		});
+	}
 
 	/** 读取文件全文（所写即所读，双写缓存已跑通） */
 	async getFullFileContent(fileId: string): Promise<Result<string>> {

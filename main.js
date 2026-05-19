@@ -70,7 +70,7 @@ var API_PATHS = {
   /** 见《03-AI与纯文本高速通道》4.15，建议单次不超过 10 个文件 */
   batchGetContent: "document-database/ai/batchGetContent"
 };
-var BATCH_GET_CONTENT_MAX = 10;
+var DOWNLOAD_CONCURRENCY = 3;
 var BATCH_GET_META_MAX = 50;
 var CHANGES_SAFETY_WINDOW_MS = 5e3;
 var DB_NAME = "xgkb-sync-state";
@@ -182,6 +182,16 @@ var XgkbApi = class {
     return { ok: true, value: r.value.files || [] };
   }
   // ==================== 文件内容 ====================
+  /**
+   * 获取下载凭据（4.1）。forceDownload=true 时返回 OSS downloadUrl，客户端直链拉原文。
+   * @see https://github.com/xgjk/dev-guide/blob/main/02.%E4%BA%A7%E5%93%81%E4%B8%9A%E5%8A%A1AI%E6%96%87%E6%A1%A3/%E7%9F%A5%E8%AF%86%E5%BA%93/API%E6%8E%A5%E5%8F%A3%E6%98%8E%E7%BB%86_v2/04-UI%E7%BB%88%E7%AB%AF%E9%A2%84%E8%A7%88%E4%B8%8E%E9%98%85%E8%AF%BB.md
+   */
+  async getDownloadInfo(fileId, forceDownload = true) {
+    return this.request("GET", API_PATHS.getDownloadInfo, {
+      fileId,
+      forceDownload
+    });
+  }
   /** 读取文件全文（所写即所读，双写缓存已跑通） */
   async getFullFileContent(fileId) {
     return this.request("GET", API_PATHS.getFullFileContent, { fileId });
@@ -495,44 +505,68 @@ var FsXgkb = class {
     console.debug(`[XGKB Sync] listDescendantFiles \u5B8C\u6210: \u5171 ${entries.length} \u4E2A .md \u6587\u4EF6\uFF0C${page} \u9875`);
     return { ok: true, value: entries };
   }
-  /**
-   * 读取云端文件内容（使用 getFullFileContent，所写即所读）
-   */
-  async readFile(fileId) {
-    const result = await this.api.getFullFileContent(fileId);
-    if (!result.ok)
-      return result;
-    return { ok: true, value: cleanContent(result.value) };
+  async delay(ms) {
+    return new Promise((resolve) => window.setTimeout(resolve, ms));
+  }
+  isRetriableHttp(status) {
+    return status === 408 || status === 429 || status >= 500;
+  }
+  async fetchDownloadUrl(downloadUrl) {
+    let lastError = "";
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      if (attempt > 0) {
+        await this.delay(RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1));
+      }
+      try {
+        const resp = await fetch(downloadUrl);
+        if (!resp.ok) {
+          lastError = `OSS HTTP ${resp.status}: ${resp.statusText}`;
+          if (this.isRetriableHttp(resp.status))
+            continue;
+          return { ok: false, error: lastError };
+        }
+        const text = await resp.text();
+        return { ok: true, value: text };
+      } catch (e) {
+        lastError = e instanceof Error ? e.message : String(e);
+      }
+    }
+    return { ok: false, error: lastError || "OSS \u4E0B\u8F7D\u5931\u8D25" };
   }
   /**
-   * 批量预取全文（4.15 `batchGetContent`）。
-   * 不限个人空间，凭 fileId 与 appKey 权限拉取；建议每批不超过 {@link BATCH_GET_CONTENT_MAX} 个。
-   * 若某项未命中或非 success，调用方应回退 {@link readFile}。
+   * 读取云端 .md 原文：优先 getDownloadInfo → OSS 直链；失败则回退 getFullFileContent。
    */
-  async readFilesBatch(fileIds) {
-    var _a, _b;
-    const out = /* @__PURE__ */ new Map();
-    const unique = [...new Set(fileIds.filter(Boolean))];
-    for (let i = 0; i < unique.length; i += BATCH_GET_CONTENT_MAX) {
-      const chunk = unique.slice(i, i + BATCH_GET_CONTENT_MAX);
-      const r = await this.api.batchGetContent(chunk.map((fileId) => ({ fileId })));
-      if (!r.ok) {
-        console.warn("[XGKB Sync] batchGetContent \u5931\u8D25\uFF0C\u672A\u547D\u4E2D\u9879\u5C06\u56DE\u9000\u5355\u6587\u4EF6\u62C9\u53D6:", r.error);
+  async readFile(fileId) {
+    let lastError = "";
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      if (attempt > 0) {
+        await this.delay(RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1));
+      }
+      const infoResult = await this.api.getDownloadInfo(fileId, true);
+      if (infoResult.ok && infoResult.value.downloadUrl) {
+        const bodyResult = await this.fetchDownloadUrl(infoResult.value.downloadUrl);
+        if (bodyResult.ok) {
+          return { ok: true, value: bodyResult.value };
+        }
+        lastError = bodyResult.error;
         continue;
       }
-      let mergedThisChunk = 0;
-      for (const row of r.value || []) {
-        const id = String(row.fileId);
-        if (row.status === "success" && row.content != null) {
-          out.set(id, cleanContent(row.content));
-          mergedThisChunk++;
-        }
-      }
-      console.debug(
-        `[XGKB Sync] batchGetContent \u5DF2\u8FD4\u56DE: \u672C\u6279 ${chunk.length} \u4E2A fileId\uFF0C\u63A5\u53E3\u54CD\u5E94 ${(_b = (_a = r.value) == null ? void 0 : _a.length) != null ? _b : 0} \u6761\uFF0C\u53EF\u7528\u6B63\u6587 ${mergedThisChunk} \u6761`
-      );
+      lastError = infoResult.ok ? "\u65E0 downloadUrl" : infoResult.error;
     }
-    return out;
+    console.warn(
+      `[XGKB Sync] getDownloadInfo \u591A\u6B21\u5931\u8D25\uFF0C\u56DE\u9000 getFullFileContent (fileId=${fileId}): ${lastError}`
+    );
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      if (attempt > 0) {
+        await this.delay(RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1));
+      }
+      const fallback = await this.api.getFullFileContent(fileId);
+      if (fallback.ok) {
+        return { ok: true, value: cleanContent(fallback.value) };
+      }
+      lastError = fallback.error;
+    }
+    return { ok: false, error: lastError || "\u4E0B\u8F7D\u5931\u8D25" };
   }
   /**
    * 上传新文件（使用 uploadContent）
@@ -855,6 +889,7 @@ var SyncEngine = class {
   constructor(fsLocal, fsXgkb, db, settings, scopeKey) {
     this.progress = () => {
     };
+    this.successfulRemoteMtimes = [];
     this.fsLocal = fsLocal;
     this.fsXgkb = fsXgkb;
     this.db = db;
@@ -865,13 +900,10 @@ var SyncEngine = class {
   emptyStats() {
     return { uploaded: 0, downloaded: 0, deleted: 0, skipped: 0, failed: 0, errors: [] };
   }
-  /**
-   * @param onProgress 进度回调
-   * @param since      上次同步水位（毫秒时间戳）；首次同步不传
-   */
   async runSync(onProgress, since) {
     var _a;
     this.stats = this.emptyStats();
+    this.successfulRemoteMtimes = [];
     this.progress = onProgress || (() => {
     });
     const prog = (msg) => {
@@ -885,9 +917,14 @@ var SyncEngine = class {
     prog("\u626B\u63CF\u672C\u5730\u6587\u4EF6...");
     const localFiles = this.fsLocal.listFiles();
     prog(`\u672C\u5730: ${localFiles.length} \u4E2A .md \u6587\u4EF6`);
-    const { map: remoteMap, newSince } = await this.buildRemoteMap(since, prog);
-    prog(`\u4E91\u7AEF: ${remoteMap.size} \u4E2A .md \u6587\u4EF6\uFF08\u6C34\u4F4D ${newSince}\uFF09`);
-    this.stats.newSince = newSince;
+    const remoteBuild = await this.buildRemoteMap(since, prog);
+    let remoteMap = remoteBuild.map;
+    prog(`\u4E91\u7AEF: ${remoteMap.size} \u4E2A .md \u6587\u4EF6\uFF08\u5019\u9009\u6C34\u4F4D ${remoteBuild.watermarkCandidate}\uFF09`);
+    const retried = await this.injectFailedRetries(remoteMap, prog);
+    this.stats.retriedFailed = retried;
+    if (retried > 0) {
+      prog(`\u5931\u8D25\u91CD\u8BD5\u961F\u5217: ${retried} \u4E2A\u6587\u4EF6\u5DF2\u5E76\u5165\u672C\u8F6E`);
+    }
     const localMap = /* @__PURE__ */ new Map();
     for (const f of localFiles)
       localMap.set(f.path, f);
@@ -905,31 +942,93 @@ var SyncEngine = class {
       const op = this.decide(path, local, remote, record);
       plans.push({ path, local, remote, record, op });
     }
-    const downloadFileIds = [];
-    for (const p of plans) {
-      if (p.op === "download-new" || p.op === "download-update") {
-        const id = (_a = p.remote) == null ? void 0 : _a.xgkbFileId;
-        if (id)
-          downloadFileIds.push(id);
-      }
-    }
-    if (downloadFileIds.length > 0)
-      prog(`\u6279\u91CF\u62C9\u53D6\u6B63\u6587 ${downloadFileIds.length} \u4E2A\u6587\u4EF6...`);
-    const contentCache = await this.fsXgkb.readFilesBatch(downloadFileIds);
+    const downloadPlans = plans.filter((p) => p.op === "download-new" || p.op === "download-update");
+    const otherPlans = plans.filter((p) => p.op !== "download-new" && p.op !== "download-update");
     idx = 0;
-    for (const plan of plans) {
+    for (const plan of otherPlans) {
       idx++;
-      if (idx % 50 === 0 || idx === plans.length)
-        prog(`\u5904\u7406\u4E2D ${idx}/${plans.length}...`);
-      await this.executePlan(plan, contentCache);
+      if (idx % 50 === 0 || idx === otherPlans.length) {
+        prog(`\u5904\u7406\u4E2D ${idx}/${otherPlans.length}\uFF08\u4E0A\u4F20/\u8DF3\u8FC7/\u5220\u9664\uFF09...`);
+      }
+      await this.executePlan(plan);
     }
-    prog(`\u5B8C\u6210: \u2191${this.stats.uploaded} \u2193${this.stats.downloaded} \u2717${this.stats.deleted} \u2717fail:${this.stats.failed} \u2205${this.stats.skipped}`);
+    if (downloadPlans.length > 0) {
+      prog(`\u5F00\u59CB\u4E0B\u8F7D ${downloadPlans.length} \u4E2A\u6587\u4EF6\uFF08\u5E76\u53D1 ${DOWNLOAD_CONCURRENCY}\uFF0COSS \u76F4\u94FE\uFF09...`);
+      let done = 0;
+      await this.runWithConcurrency(downloadPlans, DOWNLOAD_CONCURRENCY, async (plan) => {
+        await this.executePlan(plan);
+        done++;
+        if (done % 5 === 0 || done === downloadPlans.length) {
+          prog(`\u4E0B\u8F7D\u8FDB\u5EA6 ${done}/${downloadPlans.length}\uFF08\u5DF2\u5B8C\u6210 \u2193${this.stats.downloaded} \u5931\u8D25 ${this.stats.failed}\uFF09`);
+        }
+      });
+    }
+    this.stats.newSince = this.computeCommittedWatermark(remoteBuild);
+    prog(
+      `\u5B8C\u6210: \u2191${this.stats.uploaded} \u2193${this.stats.downloaded} \u2717${this.stats.deleted} fail:${this.stats.failed} \u2205${this.stats.skipped} \u6C34\u4F4D=${(_a = this.stats.newSince) != null ? _a : "-"}`
+    );
     return this.stats;
   }
-  // ==================== 云端视图构建 ====================
-  /**
-   * 构建云端文件 Map，优先走增量路径，降级全量。
-   */
+  computeCommittedWatermark(build) {
+    const catalogMax = this.maxRemoteMtime(build.map);
+    const successMax = this.successfulRemoteMtimes.length > 0 ? Math.max(...this.successfulRemoteMtimes) : 0;
+    if (build.scanMode === "incremental") {
+      return Math.max(build.watermarkCandidate, successMax, catalogMax);
+    }
+    return Math.max(catalogMax, successMax, build.watermarkCandidate);
+  }
+  maxRemoteMtime(map) {
+    let max = 0;
+    for (const f of map.values()) {
+      if (f.mtime > max)
+        max = f.mtime;
+    }
+    return max;
+  }
+  /** 将 IndexedDB 中 failed 记录并入 remoteMap，避免水位推进后漏拉 */
+  async injectFailedRetries(remoteMap, prog) {
+    var _a;
+    const all = await this.db.getAll(this.scopeKey);
+    const failed = all.filter((r) => r.syncStatus === "failed");
+    if (failed.length === 0)
+      return 0;
+    const ids = failed.map((r) => r.xgkbFileId).filter(Boolean);
+    const metaMap = await this.fsXgkb.batchGetMetaAll(ids);
+    let injected = 0;
+    for (const record of failed) {
+      const meta = metaMap.get(record.xgkbFileId);
+      if (meta == null ? void 0 : meta.deleted) {
+        await this.db.delete(this.scopeKey, record.localPath);
+        prog(`\u4E91\u7AEF\u5DF2\u5220\u9664\uFF0C\u6E05\u9664\u5931\u8D25\u8BB0\u5F55: ${record.localPath}`);
+        continue;
+      }
+      if (remoteMap.has(record.localPath))
+        continue;
+      const mtime = (_a = meta == null ? void 0 : meta.updateTime) != null ? _a : record.remoteMtime;
+      remoteMap.set(record.localPath, {
+        path: record.localPath,
+        name: (meta == null ? void 0 : meta.name) || record.localPath.split("/").pop() || record.localPath,
+        mtime,
+        xgkbFileId: record.xgkbFileId,
+        xgkbFolderId: (meta == null ? void 0 : meta.parentId) != null ? String(meta.parentId) : record.xgkbFolderId
+      });
+      injected++;
+    }
+    if (injected > 0) {
+      prog(`\u4ECE\u5931\u8D25\u961F\u5217\u6062\u590D ${injected} \u4E2A\u8DEF\u5F84\u5230\u4E91\u7AEF\u89C6\u56FE`);
+    }
+    return failed.length;
+  }
+  async runWithConcurrency(items, concurrency, fn) {
+    let cursor = 0;
+    const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+      while (cursor < items.length) {
+        const i = cursor++;
+        await fn(items[i]);
+      }
+    });
+    await Promise.all(workers);
+  }
   async buildRemoteMap(since, prog) {
     if (since !== void 0) {
       const sinceStr = new Date(since).toLocaleString("zh-CN");
@@ -945,10 +1044,6 @@ var SyncEngine = class {
     }
     return this.fullRemoteMap();
   }
-  /**
-   * 尝试增量路径：listChanges + batchGetMeta。
-   * 遇到未知新文件（无本地记录）返回 null，由调用方降级全量。
-   */
   async tryIncrementalRemoteMap(since, prog) {
     const safeSince = since - CHANGES_SAFETY_WINDOW_MS;
     const changesResult = await this.fsXgkb.listAllChanges(safeSince);
@@ -957,7 +1052,7 @@ var SyncEngine = class {
       return null;
     }
     const { items, serverTime } = changesResult.value;
-    const newSince = serverTime || Date.now();
+    const watermarkCandidate = serverTime || Date.now();
     prog(`\u589E\u91CF\u53D8\u66F4: ${items.length} \u6761`);
     const upsertById = /* @__PURE__ */ new Map();
     const deleteIds = /* @__PURE__ */ new Set();
@@ -980,7 +1075,9 @@ var SyncEngine = class {
       else
         unknownUpsertIds.push(id);
     }
-    prog(`\u53D8\u66F4\u5206\u7C7B: upsert\u5DF2\u77E5=${knownUpsertIds.length} upsert\u65B0\u589E=${unknownUpsertIds.length} delete=${deleteIds.size}`);
+    prog(
+      `\u53D8\u66F4\u5206\u7C7B: upsert\u5DF2\u77E5=${knownUpsertIds.length} upsert\u65B0\u589E=${unknownUpsertIds.length} delete=${deleteIds.size}`
+    );
     const folderIdToPath = /* @__PURE__ */ new Map();
     const rootId = this.fsXgkb.getRootId();
     if (rootId)
@@ -1009,7 +1106,9 @@ var SyncEngine = class {
       return null;
     }
     if (resolvedNewFiles.length > 0) {
-      prog(`\u8DEF\u5F84\u91CD\u5EFA\u6210\u529F ${resolvedNewFiles.length} \u4E2A\u65B0\u6587\u4EF6\uFF08\u65E0\u9700\u5168\u91CF\uFF09\uFF1A${resolvedNewFiles.map((f) => f.path).join(", ")}`);
+      prog(
+        `\u8DEF\u5F84\u91CD\u5EFA\u6210\u529F ${resolvedNewFiles.length} \u4E2A\u65B0\u6587\u4EF6\uFF1A${resolvedNewFiles.map((f) => f.path).join(", ")}`
+      );
     }
     const map = /* @__PURE__ */ new Map();
     for (const record of allRecords) {
@@ -1050,22 +1149,27 @@ var SyncEngine = class {
         xgkbFolderId: item.parentId != null ? String(item.parentId) : ""
       });
     }
-    return { map, newSince };
+    return { map, watermarkCandidate, scanMode: "incremental" };
   }
-  /** 全量扫描（listDescendantFiles 分页） */
   async fullRemoteMap() {
     const remoteResult = await this.fsXgkb.listFiles();
     if (!remoteResult.ok)
       throw new Error(`\u626B\u63CF\u4E91\u7AEF\u5931\u8D25: ${remoteResult.error}`);
     const map = /* @__PURE__ */ new Map();
-    for (const f of remoteResult.value)
+    let watermarkCandidate = 0;
+    for (const f of remoteResult.value) {
       map.set(f.path, f);
-    const newSince = Date.now();
-    console.debug(`[XGKB Sync] \u5168\u91CF\u626B\u63CF\u5B8C\u6210: ${map.size} \u4E2A\u6587\u4EF6\uFF0C\u65B0\u6C34\u4F4D=${newSince} (${new Date(newSince).toLocaleString("zh-CN")})`);
-    return { map, newSince };
+      if (f.mtime > watermarkCandidate)
+        watermarkCandidate = f.mtime;
+    }
+    if (watermarkCandidate <= 0)
+      watermarkCandidate = Date.now();
+    console.debug(
+      `[XGKB Sync] \u5168\u91CF\u626B\u63CF\u5B8C\u6210: ${map.size} \u4E2A\u6587\u4EF6\uFF0C\u5019\u9009\u6C34\u4F4D=${watermarkCandidate} (${new Date(watermarkCandidate).toLocaleString("zh-CN")})`
+    );
+    return { map, watermarkCandidate, scanMode: "full" };
   }
-  // ==================== 计划执行 ====================
-  async executePlan(plan, contentCache) {
+  async executePlan(plan) {
     const { path, local, remote, record, op } = plan;
     try {
       switch (op) {
@@ -1076,10 +1180,10 @@ var SyncEngine = class {
           await this.doUploadUpdate(path, local, remote, record);
           break;
         case "download-new":
-          await this.doDownloadNew(path, remote, contentCache);
+          await this.doDownload(path, remote, record);
           break;
         case "download-update":
-          await this.doDownloadUpdate(path, remote, record, contentCache);
+          await this.doDownload(path, remote, record);
           break;
         case "delete-local":
           await this.doDeleteLocal(path, record);
@@ -1096,11 +1200,20 @@ var SyncEngine = class {
       this.stats.failed++;
       this.stats.errors.push(`${path}: ${msg}`);
       console.error(`[XGKB Sync] \u540C\u6B65\u5931\u8D25 ${path}:`, msg);
+      if ((op === "download-new" || op === "download-update") && remote) {
+        await this.recordDownloadFailure(path, remote, record, msg);
+      }
     }
   }
-  // ==================== 决策逻辑 ====================
   decide(path, local, remote, record) {
     const dir = this.settings.syncDirection;
+    if ((record == null ? void 0 : record.syncStatus) === "failed") {
+      if (!remote)
+        return "skip";
+      if (dir === "push")
+        return "skip";
+      return "download-update";
+    }
     if (!record) {
       if (local && !remote)
         return dir === "pull" ? "skip" : "upload-new";
@@ -1146,8 +1259,6 @@ var SyncEngine = class {
     }
     return "skip";
   }
-  // ==================== 操作执行 ====================
-  /** 保证 IndexedDB 复合主键 scopeKey + localPath 始终存在 */
   buildDbRecord(path, partial) {
     var _a;
     return {
@@ -1162,19 +1273,34 @@ var SyncEngine = class {
       ...partial.lastError !== void 0 ? { lastError: partial.lastError } : {}
     };
   }
+  async recordDownloadFailure(path, remote, record, msg) {
+    var _a, _b, _c;
+    await this.db.put(
+      this.buildDbRecord(path, {
+        xgkbFileId: remote.xgkbFileId,
+        xgkbFolderId: (_b = (_a = record == null ? void 0 : record.xgkbFolderId) != null ? _a : remote.xgkbFolderId) != null ? _b : "",
+        localMtime: (_c = record == null ? void 0 : record.localMtime) != null ? _c : 0,
+        remoteMtime: remote.mtime,
+        syncStatus: "failed",
+        lastError: msg
+      })
+    );
+  }
   async doUploadNew(path, local) {
     const content = await this.fsLocal.readFile(path);
     const result = await this.fsXgkb.createFile(path, content);
     if (!result.ok)
       throw new Error(`\u4E0A\u4F20\u5931\u8D25: ${result.error}`);
+    const remoteMtime = Date.now();
     await this.db.put(
       this.buildDbRecord(path, {
         xgkbFileId: result.value.fileId,
         xgkbFolderId: result.value.folderId,
         localMtime: local.mtime,
-        remoteMtime: Date.now()
+        remoteMtime
       })
     );
+    this.successfulRemoteMtimes.push(remoteMtime);
     this.stats.uploaded++;
     this.progress(`\u2191 ${path}`);
   }
@@ -1188,53 +1314,36 @@ var SyncEngine = class {
     const result = await this.fsXgkb.updateFile(fileId, fileName, content);
     if (!result.ok)
       throw new Error(`\u66F4\u65B0\u5931\u8D25: ${result.error}`);
+    const remoteMtime = Date.now();
     await this.db.put(
       this.buildDbRecord(path, {
         xgkbFileId: fileId,
         xgkbFolderId: (_c = (_b = record == null ? void 0 : record.xgkbFolderId) != null ? _b : remote.xgkbFolderId) != null ? _c : "",
         localMtime: local.mtime,
-        remoteMtime: Date.now()
+        remoteMtime
       })
     );
+    this.successfulRemoteMtimes.push(remoteMtime);
     this.stats.uploaded++;
     this.progress(`\u2191 ${path}`);
   }
-  async doDownloadNew(path, remote, contentCache) {
-    const fid = remote.xgkbFileId;
-    const body = contentCache.has(fid) ? contentCache.get(fid) : await this.fsXgkb.readFile(fid).then((r) => {
-      if (!r.ok)
-        throw new Error(`\u4E0B\u8F7D\u5931\u8D25: ${r.error}`);
-      return r.value;
-    });
-    const actualMtime = await this.fsLocal.writeFile(path, body);
-    await this.db.put(
-      this.buildDbRecord(path, {
-        xgkbFileId: remote.xgkbFileId,
-        xgkbFolderId: remote.xgkbFolderId || "",
-        localMtime: actualMtime,
-        remoteMtime: remote.mtime
-      })
-    );
-    this.stats.downloaded++;
-    this.progress(`\u2193 ${path}`);
-  }
-  async doDownloadUpdate(path, remote, record, contentCache) {
+  async doDownload(path, remote, record) {
     var _a, _b;
     const fid = remote.xgkbFileId;
-    const body = contentCache.has(fid) ? contentCache.get(fid) : await this.fsXgkb.readFile(fid).then((r) => {
-      if (!r.ok)
-        throw new Error(`\u4E0B\u8F7D\u5931\u8D25: ${r.error}`);
-      return r.value;
-    });
-    const actualMtime = await this.fsLocal.writeFile(path, body);
+    const bodyResult = await this.fsXgkb.readFile(fid);
+    if (!bodyResult.ok)
+      throw new Error(`\u4E0B\u8F7D\u5931\u8D25: ${bodyResult.error}`);
+    const actualMtime = await this.fsLocal.writeFile(path, bodyResult.value);
     await this.db.put(
       this.buildDbRecord(path, {
         xgkbFileId: fid,
         xgkbFolderId: (_b = (_a = record == null ? void 0 : record.xgkbFolderId) != null ? _a : remote.xgkbFolderId) != null ? _b : "",
         localMtime: actualMtime,
-        remoteMtime: remote.mtime
+        remoteMtime: remote.mtime,
+        syncStatus: "done"
       })
     );
+    this.successfulRemoteMtimes.push(remote.mtime);
     this.stats.downloaded++;
     this.progress(`\u2193 ${path}`);
   }
@@ -1582,6 +1691,7 @@ var XgkbSyncPlugin = class extends import_obsidian3.Plugin {
     }
     if (this.isSyncing) {
       console.debug("[XGKB Sync] \u4E0A\u6B21\u540C\u6B65\u4ECD\u5728\u8FDB\u884C\uFF0C\u8DF3\u8FC7\u672C\u6B21\u89E6\u53D1");
+      new import_obsidian3.Notice("XGKB Sync: \u540C\u6B65\u8FDB\u884C\u4E2D\uFF0C\u8BF7\u52FF\u91CD\u590D\u70B9\u51FB", 5e3);
       return;
     }
     this.isSyncing = true;
@@ -1610,7 +1720,14 @@ var XgkbSyncPlugin = class extends import_obsidian3.Plugin {
       const fsLocal = new FsLocal(this.app, this.settings.syncFolder);
       const fsXgkb = new FsXgkb(api, this.settings.targetFolderName, this.settings.projectId);
       const engine = new SyncEngine(fsLocal, fsXgkb, db, this.settings, scopeKey);
-      const stats = await engine.runSync(void 0, since);
+      let lastProgressNotice = 0;
+      const stats = await engine.runSync((msg) => {
+        const now = Date.now();
+        if (msg.startsWith("\u4E0B\u8F7D\u8FDB\u5EA6") && now - lastProgressNotice < 8e3)
+          return;
+        lastProgressNotice = now;
+        new import_obsidian3.Notice(`XGKB Sync: ${msg}`, 3e3);
+      }, since);
       if (stats.newSince) {
         const rootId = fsXgkb.getRootId();
         this.syncScopes[scopeKey] = {
@@ -1640,7 +1757,10 @@ var XgkbSyncPlugin = class extends import_obsidian3.Plugin {
       new import_obsidian3.Notice(`XGKB Sync \u5B8C\u6210: ${summary}`, stats.failed > 0 ? 8e3 : 4e3);
       if (stats.errors.length > 0) {
         console.error("[XGKB Sync] \u540C\u6B65\u9519\u8BEF:", stats.errors);
-        new import_obsidian3.Notice(`XGKB Sync: ${stats.errors.length} \u4E2A\u6587\u4EF6\u540C\u6B65\u5931\u8D25\uFF0C\u8BF7\u67E5\u770B\u63A7\u5236\u53F0`, 8e3);
+        new import_obsidian3.Notice(
+          `XGKB Sync: ${stats.errors.length} \u4E2A\u6587\u4EF6\u5931\u8D25\uFF08\u5DF2\u8BB0\u5F55\uFF0C\u4E0B\u6B21\u4F18\u5148\u91CD\u8BD5\uFF1B\u6C34\u4F4D\u5DF2\u63A8\u8FDB\uFF09`,
+          8e3
+        );
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
