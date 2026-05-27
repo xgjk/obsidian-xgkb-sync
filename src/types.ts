@@ -8,6 +8,12 @@ export interface XgkbPluginSettings {
 	syncDirection: "bidirectional" | "push" | "pull";
 	/** 自动同步间隔（分钟），0 = 关闭 */
 	autoSyncInterval: number;
+	/** 使用物理文件上传（resourceId → saveFileByPath/updateFileVersion） */
+	usePhysicalUpload: boolean;
+	/** 物理上传失败时降级 uploadContent */
+	uploadContentFallback: boolean;
+	/** 要同步的文件扩展名（不含点），至少一种 */
+	syncFileExtensions: string[];
 }
 
 /** 同步作用域身份快照（用于展示与持久化） */
@@ -131,10 +137,10 @@ export interface SyncStats {
 	skipped: number;
 	failed: number;
 	errors: string[];
-	/** 本轮结束后写入的 since 水位（毫秒）；有失败时仍会推进，失败项靠 IndexedDB 重试 */
 	newSince?: number;
-	/** 本轮重试的失败记录数 */
 	retriedFailed?: number;
+	renamed?: number;
+	moved?: number;
 }
 
 /** getDownloadInfo（4.1）响应 */
@@ -162,4 +168,81 @@ export interface FileContentVO {
 	content: string | null;
 	status: string;
 	message?: string | null;
+}
+
+export interface SliceCheckResult {
+	sliceId?: number | null;
+	uploadUrl?: string | null;
+	fullPath?: string | null;
+	storageType?: string | null;
+}
+
+export interface UploadFileSliceParams {
+	filePath: string;
+	md5: string;
+	size: number;
+	storageType: string;
+}
+
+export interface SaveResourceParams {
+	name: string;
+	sliceIds: number[];
+	suffix?: string;
+	size?: number;
+}
+
+export interface SaveFileToProjectParams {
+	projectId: string;
+	parentId?: string;
+	path?: string;
+	name: string;
+	fileType: string;
+	suffix?: string;
+	size?: number;
+	resourceId: number;
+	nameConflictStrategy?: number;
+}
+
+export interface UpdateFileVersionParams {
+	id: string;
+	projectId: string;
+	resourceId: number;
+	name?: string;
+	versionRemark?: string;
+	suffix?: string;
+	size?: number;
+}
+
+export interface UpdateFileNameParams {
+	fileId: string;
+	newName: string;
+	projectId?: string;
+	nameConflictStrategy?: 0 | 1;
+}
+
+export interface UpdateFileNameResult {
+	fileId: string;
+	name: string;
+	parentId?: string;
+	updateTime?: number;
+	relativePath?: string;
+}
+
+export interface MoveFileParams {
+	fileId: string;
+	targetParentId: string;
+	projectId?: string;
+	nameConflictStrategy?: 0 | 1 | 2 | 3;
+}
+
+export interface MoveFileResult {
+	fileId: string | number;
+	sourceFileId: string | number;
+	idChanged: boolean;
+	name: string;
+	parentId: string | number;
+	updateTime: number;
+	relativePath?: string;
+	mainSkipped?: boolean;
+	idMappings?: Array<{ sourceFileId: string | number; targetFileId: string | number }>;
 }

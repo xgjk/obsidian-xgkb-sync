@@ -1,7 +1,16 @@
 import { XgkbApi } from "./xgkbApi";
-import type { FileEntry, Result, XgkbChangeItem, XgkbMetaItem } from "./types";
-import { BATCH_GET_META_MAX, MAX_RETRIES, RETRY_BASE_DELAY_MS, cleanContent } from "./constants";
+import { FileUploader } from "./fileUploader";
+import type { FileEntry, Result, XgkbChangeItem, XgkbMetaItem, MoveFileResult } from "./types";
+import {
+	BATCH_GET_META_MAX,
+	DEFAULT_MOVE_NAME_CONFLICT_STRATEGY,
+	DEFAULT_RENAME_NAME_CONFLICT_STRATEGY,
+	MAX_RETRIES,
+	RETRY_BASE_DELAY_MS,
+	cleanContent,
+} from "./constants";
 import { normalizeTargetFolderPath, parseTargetFolderSegments, sanitizePathSegment } from "./pathSanitize";
+import { pathMatchesSyncExtensions, splitFileNameAndSuffix } from "./syncFileTypes";
 
 /**
  * 云端文件系统操作（XGKB API 封装）
@@ -9,15 +18,23 @@ import { normalizeTargetFolderPath, parseTargetFolderSegments, sanitizePathSegme
 export class FsXgkb {
 	private rootId: string | null = null;
 	private projectId: string | null = null;
-	/** 规范化后的目标路径，如 `A/B`（用于 folderName 前缀） */
 	private readonly targetFolderPath: string;
+	private readonly uploader: FileUploader;
+	private readonly syncExtensions: readonly string[];
 
 	constructor(
 		private api: XgkbApi,
 		targetFolderName: string,
-		private configuredProjectId?: string
+		private configuredProjectId?: string,
+		private uploadOpts: { usePhysicalUpload: boolean; uploadContentFallback: boolean } = {
+			usePhysicalUpload: true,
+			uploadContentFallback: true,
+		},
+		syncExtensions: readonly string[] = ["md"]
 	) {
 		this.targetFolderPath = normalizeTargetFolderPath(targetFolderName) || "Obsidian";
+		this.uploader = new FileUploader(api);
+		this.syncExtensions = syncExtensions;
 	}
 
 	getRootId(): string | null {
@@ -126,46 +143,57 @@ export class FsXgkb {
 	}
 
 	/**
-	 * 通过 4.21 扁平列举同步根目录下所有 .md 文件
+	 * 通过 4.21 扁平列举同步根目录下已选类型的文件
 	 */
 	async listFiles(): Promise<Result<FileEntry[]>> {
 		if (!this.rootId) return { ok: false, error: "未初始化" };
 		const entries: FileEntry[] = [];
-		let cursor: string | undefined;
-		let page = 0;
-		do {
-			page++;
-			const r = await this.api.listDescendantFiles({
-				rootFileId: this.rootId,
-				projectId: this.projectId || undefined,
-				suffix: "md",
-				limit: 500,
-				cursor,
-				includePath: true,
-			});
-			if (!r.ok) return { ok: false, error: r.error };
-			const pageItems = r.value.files || [];
-			console.debug(`[XGKB Sync] listDescendantFiles 第${page}页: 返回 ${pageItems.length} 条，nextCursor=${r.value.nextCursor ?? "null"}`);
-			for (const item of pageItems) {
-				const rawPath = item.relativePath || item.name;
-				const safePath = rawPath
-					.split("/")
-					.filter(Boolean)
-					.map((seg) => sanitizePathSegment(seg))
-					.join("/");
-				if (!safePath.endsWith(".md")) continue;
-				entries.push({
-					path: safePath,
-					name: item.name,
-					mtime: item.updateTime || 0,
-					size: item.size,
-					xgkbFileId: String(item.fileId),
-					xgkbFolderId: item.parentId != null ? String(item.parentId) : "",
+		const seen = new Set<string>();
+
+		for (const suffix of this.syncExtensions) {
+			let cursor: string | undefined;
+			let page = 0;
+			do {
+				page++;
+				const r = await this.api.listDescendantFiles({
+					rootFileId: this.rootId,
+					projectId: this.projectId || undefined,
+					suffix,
+					limit: 500,
+					cursor,
+					includePath: true,
 				});
-			}
-			cursor = r.value.nextCursor || undefined;
-		} while (cursor);
-		console.debug(`[XGKB Sync] listDescendantFiles 完成: 共 ${entries.length} 个 .md 文件，${page} 页`);
+				if (!r.ok) return { ok: false, error: r.error };
+				const pageItems = r.value.files || [];
+				console.debug(
+					`[XGKB Sync] listDescendantFiles(.${suffix}) 第${page}页: 返回 ${pageItems.length} 条，nextCursor=${r.value.nextCursor ?? "null"}`
+				);
+				for (const item of pageItems) {
+					const rawPath = item.relativePath || item.name;
+					const safePath = rawPath
+						.split("/")
+						.filter(Boolean)
+						.map((seg) => sanitizePathSegment(seg))
+						.join("/");
+					if (!pathMatchesSyncExtensions(safePath, this.syncExtensions)) continue;
+					if (seen.has(safePath)) continue;
+					seen.add(safePath);
+					entries.push({
+						path: safePath,
+						name: item.name,
+						mtime: item.updateTime || 0,
+						size: item.size,
+						xgkbFileId: String(item.fileId),
+						xgkbFolderId: item.parentId != null ? String(item.parentId) : "",
+					});
+				}
+				cursor = r.value.nextCursor || undefined;
+			} while (cursor);
+		}
+
+		console.debug(
+			`[XGKB Sync] listDescendantFiles 完成: 共 ${entries.length} 个文件（${this.syncExtensions.map((e) => `.${e}`).join(", ")}）`
+		);
 		return { ok: true, value: entries };
 	}
 
@@ -200,7 +228,7 @@ export class FsXgkb {
 	}
 
 	/**
-	 * 读取云端 .md 原文：优先 getDownloadInfo → OSS 直链；失败则回退 getFullFileContent。
+	 * 读取云端文件原文：优先 getDownloadInfo → OSS 直链；失败则回退 getFullFileContent。
 	 */
 	async readFile(fileId: string): Promise<Result<string>> {
 		let lastError = "";
@@ -213,7 +241,7 @@ export class FsXgkb {
 			if (infoResult.ok && infoResult.value.downloadUrl) {
 				const bodyResult = await this.fetchDownloadUrl(infoResult.value.downloadUrl);
 				if (bodyResult.ok) {
-					return { ok: true, value: bodyResult.value };
+					return { ok: true, value: cleanContent(bodyResult.value) };
 				}
 				lastError = bodyResult.error;
 				continue;
@@ -229,40 +257,136 @@ export class FsXgkb {
 				await this.delay(RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1));
 			}
 			const fallback = await this.api.getFullFileContent(fileId);
-			if (fallback.ok) {
+			if (fallback.ok && fallback.value != null) {
 				return { ok: true, value: cleanContent(fallback.value) };
 			}
-			lastError = fallback.error;
+			lastError = fallback.ok ? "getFullFileContent 返回空内容" : fallback.error;
 		}
 		return { ok: false, error: lastError || "下载失败" };
 	}
 
-	/**
-	 * 上传新文件（使用 uploadContent）
-	 * @param relativePath 相对路径（如 "日常学习/笔记.md"）
-	 * @param content Markdown 内容
-	 * @returns fileId 与 folderId（folderId 用于状态库，支撑增量同步路径缓存）
-	 */
 	async createFile(relativePath: string, content: string): Promise<Result<{ fileId: string; folderId: string }>> {
+		const { folderName, fileName } = this.splitRelativePath(relativePath);
+		const { suffix } = splitFileNameAndSuffix(fileName);
+
+		if (this.uploadOpts.usePhysicalUpload && this.projectId) {
+			const physical = await this.uploader.create({
+				content,
+				fileName,
+				fileSuffix: suffix,
+				folderName,
+				projectId: this.projectId,
+			});
+			if (physical.ok) return physical;
+			console.warn("[XGKB Sync] 物理上传新建失败:", physical.error);
+			if (!this.uploadOpts.uploadContentFallback) return physical;
+		}
+
+		return this.createFileViaUploadContent(relativePath, content, folderName, fileName, suffix);
+	}
+
+	async updateFile(fileId: string, fileName: string, content: string): Promise<Result<string>> {
+		const { suffix } = splitFileNameAndSuffix(fileName);
+
+		if (this.uploadOpts.usePhysicalUpload && this.projectId) {
+			const physical = await this.uploader.update({
+				content,
+				fileName,
+				fileSuffix: suffix,
+				updateFileId: fileId,
+				projectId: this.projectId,
+			});
+			if (physical.ok) return physical;
+			console.warn("[XGKB Sync] 物理上传更新失败:", physical.error);
+			if (!this.uploadOpts.uploadContentFallback) return physical;
+		}
+
+		return this.updateFileViaUploadContent(fileId, fileName, content, suffix);
+	}
+
+	/** 同目录内改名（远端） */
+	async renameRemoteFile(fileId: string, newFileName: string): Promise<Result<void>> {
+		if (!this.projectId) return { ok: false, error: "未初始化 projectId" };
+		const r = await this.api.updateFileName({
+			fileId,
+			newName: newFileName,
+			projectId: this.projectId,
+			nameConflictStrategy: DEFAULT_RENAME_NAME_CONFLICT_STRATEGY,
+		});
+		if (!r.ok) return { ok: false, error: r.error };
+		return { ok: true, value: undefined };
+	}
+
+	/** 移动到其他父目录（远端） */
+	async moveRemoteFile(fileId: string, targetParentId: string): Promise<Result<MoveFileResult>> {
+		if (!this.projectId) return { ok: false, error: "未初始化 projectId" };
+		const r = await this.api.moveFile({
+			fileId,
+			targetParentId,
+			projectId: this.projectId,
+			nameConflictStrategy: DEFAULT_MOVE_NAME_CONFLICT_STRATEGY,
+		});
+		if (!r.ok) return { ok: false, error: r.error };
+		if (r.value.mainSkipped) {
+			return { ok: false, error: "移动被跳过（目标目录存在同名文件）" };
+		}
+		return { ok: true, value: r.value };
+	}
+
+	/** 解析 syncFolder 相对路径对应的远端父 folderId；缺失子目录时逐级 createFolder */
+	async resolveFolderIdForRelativePath(relativeFolderPath: string): Promise<Result<string>> {
+		if (!this.projectId || !this.rootId) return { ok: false, error: "未初始化" };
+		const segments = relativeFolderPath ? relativeFolderPath.split("/").filter(Boolean) : [];
+		let currentId = this.rootId;
+		for (let i = 0; i < segments.length; i++) {
+			const seg = segments[i];
+			const childResult = await this.api.getChildFiles(currentId, 1);
+			if (!childResult.ok) return { ok: false, error: childResult.error };
+			const found = (childResult.value || []).find((f) => f.name === seg && f.type === 1);
+			if (!found) {
+				const parentLabel = i === 0 ? "同步根" : segments.slice(0, i).join("/");
+				console.debug(`[XGKB Sync] "${parentLabel}" 下无 "${seg}"，正在创建...`);
+				const createResult = await this.api.createFolder({
+					projectId: this.projectId,
+					parentId: currentId,
+					name: seg,
+				});
+				if (!createResult.ok) {
+					return { ok: false, error: `创建目录 "${seg}" 失败: ${createResult.error}` };
+				}
+				currentId = createResult.value;
+			} else {
+				currentId = found.id;
+			}
+		}
+		return { ok: true, value: currentId };
+	}
+
+	private splitRelativePath(relativePath: string): { folderName: string; fileName: string } {
 		const lastSlash = relativePath.lastIndexOf("/");
 		const folderPath = lastSlash > 0 ? relativePath.substring(0, lastSlash) : "";
 		const fileName = lastSlash > 0 ? relativePath.substring(lastSlash + 1) : relativePath;
-
 		const folderName = folderPath
 			? `${this.targetFolderPath}/${folderPath}`
 			: this.targetFolderPath;
+		return { folderName, fileName };
+	}
 
+	private async createFileViaUploadContent(
+		relativePath: string,
+		content: string,
+		folderName: string,
+		fileName: string,
+		fileSuffix: string
+	): Promise<Result<{ fileId: string; folderId: string }>> {
 		const result = await this.api.uploadContent({
 			content,
 			fileName,
-			fileSuffix: "md",
+			fileSuffix,
 			folderName,
 			projectId: this.projectId || undefined,
 		});
-
 		if (!result.ok) return { ok: false, error: `上传失败: ${result.error}` };
-
-		// 新建模式返回 UploadContentResult，含 fileId 与 folderId
 		const data = result.value as { fileId: string | number; folderId?: string | number };
 		return {
 			ok: true,
@@ -273,20 +397,20 @@ export class FsXgkb {
 		};
 	}
 
-	/**
-	 * 更新已有文件（使用 uploadContent + updateFileId）
-	 */
-	async updateFile(fileId: string, fileName: string, content: string): Promise<Result<string>> {
+	private async updateFileViaUploadContent(
+		fileId: string,
+		fileName: string,
+		content: string,
+		fileSuffix: string
+	): Promise<Result<string>> {
 		const result = await this.api.uploadContent({
 			content,
 			fileName,
-			fileSuffix: "md",
+			fileSuffix,
 			updateFileId: fileId,
 			versionRemark: "XGKB Sync plugin update",
 		});
-
 		if (!result.ok) return { ok: false, error: `更新失败: ${result.error}` };
-
 		const data = result.value as { fileId: string };
 		return { ok: true, value: data.fileId };
 	}

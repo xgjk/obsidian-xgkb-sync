@@ -37,7 +37,8 @@ __export(main_exports, {
   default: () => XgkbSyncPlugin
 });
 module.exports = __toCommonJS(main_exports);
-var import_obsidian3 = require("obsidian");
+var import_obsidian4 = require("obsidian");
+var Obsidian2 = __toESM(require("obsidian"));
 
 // src/constants.ts
 var DEFAULT_SETTINGS = {
@@ -48,8 +49,10 @@ var DEFAULT_SETTINGS = {
   // 空=同步整个 Vault
   targetFolderName: "Obsidian",
   syncDirection: "bidirectional",
-  autoSyncInterval: 0
-  // 默认关闭
+  autoSyncInterval: 0,
+  usePhysicalUpload: true,
+  uploadContentFallback: true,
+  syncFileExtensions: ["md"]
 };
 var API_PATHS = {
   getChildFiles: "document-database/file/getChildFiles",
@@ -61,6 +64,13 @@ var API_PATHS = {
   getFileContent: "document-database/file/getFileContent",
   getFullFileContent: "document-database/file/getFullFileContent",
   uploadContent: "document-database/file/uploadContent",
+  updateFileName: "document-database/file/updateFileName",
+  moveFile: "document-database/file/moveFile",
+  getSliceIdByMd5V2: "document-database/file/getSliceIdByMd5V2",
+  uploadFileSliceV2: "document-database/file/uploadFileSliceV2",
+  saveResource: "document-database/file/saveResource",
+  saveFileByPath: "document-database/file/saveFileByPath",
+  updateFileVersion: "document-database/file/updateFileVersion",
   searchFile: "document-database/file/searchFile",
   getLevel1Folders: "document-database/file/getLevel1Folders",
   deleteFile: "document-database/file/deleteFile",
@@ -71,6 +81,14 @@ var API_PATHS = {
   batchGetContent: "document-database/ai/batchGetContent"
 };
 var DOWNLOAD_CONCURRENCY = 3;
+var UPLOAD_CONCURRENCY = 2;
+var EXECUTE_BATCH_PAUSE_MS = 200;
+var UPLOAD_CHUNK_SIZE = 5 * 1024 * 1024;
+var VERSION_REMARK = "XGKB Sync plugin update";
+var DEFAULT_RENAME_NAME_CONFLICT_STRATEGY = 1;
+var DEFAULT_MOVE_NAME_CONFLICT_STRATEGY = 0;
+var DIR_RENAME_COVERAGE_RATIO = 0.8;
+var DIR_RENAME_MIN_FILES = 2;
 var BATCH_GET_META_MAX = 50;
 var CHANGES_SAFETY_WINDOW_MS = 5e3;
 var DB_NAME = "xgkb-sync-state";
@@ -80,11 +98,14 @@ var MAX_RETRIES = 3;
 var RETRY_BASE_DELAY_MS = 1e3;
 var MTIME_TOLERANCE_MS = 1e3;
 function cleanContent(raw) {
+  if (raw == null)
+    return "";
   return raw.replace(/\n*Page \d+ of \d+\s*$/, "").trimEnd() + "\n";
 }
+var XGKB_NODE_FOLDER = 1;
 
 // src/settings.ts
-var import_obsidian2 = require("obsidian");
+var import_obsidian3 = require("obsidian");
 
 // src/xgkbApi.ts
 var import_obsidian = require("obsidian");
@@ -227,6 +248,46 @@ var XgkbApi = class {
       return r;
     return { ok: true, value: true };
   }
+  // ==================== 分片上传 ====================
+  async getSliceIdByMd5V2(md5, size, suffix) {
+    const params = { md5, size };
+    if (suffix)
+      params.suffix = suffix;
+    return this.request("GET", API_PATHS.getSliceIdByMd5V2, params);
+  }
+  async uploadFileSliceV2(params) {
+    return this.request("POST", API_PATHS.uploadFileSliceV2, { ...params });
+  }
+  async saveResource(params) {
+    return this.request("POST", API_PATHS.saveResource, { ...params });
+  }
+  // ==================== 物理文件入库 ====================
+  async saveFileByPath(params) {
+    return this.request("POST", API_PATHS.saveFileByPath, { ...params });
+  }
+  async updateFileVersion(params) {
+    return this.request("POST", API_PATHS.updateFileVersion, { ...params });
+  }
+  async updateFileName(params) {
+    return this.request("POST", API_PATHS.updateFileName, {
+      fileId: params.fileId,
+      newName: params.newName,
+      ...params.projectId !== void 0 && { projectId: params.projectId },
+      ...params.nameConflictStrategy !== void 0 && {
+        nameConflictStrategy: params.nameConflictStrategy
+      }
+    });
+  }
+  async moveFile(params) {
+    return this.request("POST", API_PATHS.moveFile, {
+      fileId: params.fileId,
+      targetParentId: params.targetParentId,
+      ...params.projectId !== void 0 && { projectId: params.projectId },
+      ...params.nameConflictStrategy !== void 0 && {
+        nameConflictStrategy: params.nameConflictStrategy
+      }
+    });
+  }
   /** 显式创建空目录（4.24） */
   async createFolder(params) {
     const r = await this.request("POST", API_PATHS.createFolder, params);
@@ -242,6 +303,7 @@ var XgkbApi = class {
 
 // src/fsLocal.ts
 var Obsidian = __toESM(require("obsidian"));
+var import_obsidian2 = require("obsidian");
 
 // src/pathSanitize.ts
 var ILLEGAL_IN_SEGMENT = /[*"<>:|?\\]/g;
@@ -260,30 +322,84 @@ function normalizeTargetFolderPath(folderPath) {
   return parseTargetFolderSegments(folderPath).join("/");
 }
 
+// src/syncFileTypes.ts
+var AVAILABLE_SYNC_EXTENSIONS = ["md", "json", "html"];
+function normalizeSyncExtensions(input) {
+  const raw = Array.isArray(input) ? input : ["md"];
+  const selected = /* @__PURE__ */ new Set();
+  for (const item of raw) {
+    const ext = String(item).trim().toLowerCase().replace(/^\./, "");
+    if (AVAILABLE_SYNC_EXTENSIONS.includes(ext)) {
+      selected.add(ext);
+    }
+  }
+  if (selected.size === 0)
+    return ["md"];
+  return AVAILABLE_SYNC_EXTENSIONS.filter((ext) => selected.has(ext));
+}
+function extensionOfPath(relativePath) {
+  const slash = relativePath.lastIndexOf("/");
+  const name = slash >= 0 ? relativePath.slice(slash + 1) : relativePath;
+  const dot = name.lastIndexOf(".");
+  if (dot <= 0 || dot === name.length - 1)
+    return "";
+  return name.slice(dot + 1).toLowerCase();
+}
+function pathMatchesSyncExtensions(relativePath, allowed) {
+  const ext = extensionOfPath(relativePath);
+  return ext !== "" && allowed.includes(ext);
+}
+function formatSyncExtensionsLabel(allowed) {
+  return allowed.map((ext) => `.${ext}`).join(", ");
+}
+function splitFileNameAndSuffix(fileNameWithExt) {
+  const dot = fileNameWithExt.lastIndexOf(".");
+  if (dot <= 0 || dot === fileNameWithExt.length - 1) {
+    return { fileName: fileNameWithExt, suffix: "md" };
+  }
+  return {
+    fileName: fileNameWithExt.slice(0, dot),
+    suffix: fileNameWithExt.slice(dot + 1).toLowerCase()
+  };
+}
+
 // src/fsLocal.ts
+function isDotHiddenRelativePath(relativePath) {
+  const slash = relativePath.lastIndexOf("/");
+  const base = slash >= 0 ? relativePath.slice(slash + 1) : relativePath;
+  return base.startsWith(".");
+}
 var FsLocal = class {
-  constructor(app, syncFolder) {
+  constructor(app, syncFolder, syncExtensions = ["md"]) {
     this.app = app;
+    /** 同一目录并发 createFolder 时串行，避免 Obsidian 报 Folder already exists */
+    this.folderEnsureLocks = /* @__PURE__ */ new Map();
     this.basePath = syncFolder ? this.normalize(syncFolder) : app.vault.getRoot().path;
+    this.syncExtensions = syncExtensions;
   }
   normalize(p) {
-    return p.replace(/\\/g, "/").replace(/\/+/g, "/");
+    return (0, import_obsidian2.normalizePath)(p.replace(/\\/g, "/").replace(/\/+/g, "/"));
   }
-  /** 列出 syncFolder 下所有 .md 文件（递归） */
-  listFiles() {
+  /** 列出 syncFolder 下所有已选类型的文件（递归，含 adapter 上的隐藏点文件） */
+  async listFiles() {
     const folder = this.app.vault.getAbstractFileByPath(this.basePath);
-    if (!folder || !(folder instanceof Obsidian.TFolder))
-      return [];
     const entries = [];
-    this.collectMd(folder, entries, "");
+    const seen = /* @__PURE__ */ new Set();
+    if (folder && folder instanceof Obsidian.TFolder) {
+      this.collectFromVaultTree(folder, entries, "", seen);
+    }
+    await this.collectDotFilesFromAdapter("", entries, seen);
     return entries;
   }
-  collectMd(folder, entries, prefix) {
+  collectFromVaultTree(folder, entries, prefix, seen) {
     for (const child of folder.children) {
       if (child instanceof Obsidian.TFile) {
-        if (child.extension === "md" && !child.name.includes("_conflict_")) {
+        if (this.syncExtensions.includes(child.extension) && !child.name.includes("_conflict_")) {
           const seg = sanitizePathSegment(child.name);
           const relativePath = prefix ? `${prefix}/${seg}` : seg;
+          if (seen.has(relativePath))
+            continue;
+          seen.add(relativePath);
           entries.push({
             path: relativePath,
             name: child.name,
@@ -296,57 +412,182 @@ var FsLocal = class {
         const subPrefix = prefix ? `${prefix}/${seg}` : seg;
         if (child.name.startsWith("."))
           continue;
-        this.collectMd(child, entries, subPrefix);
+        this.collectFromVaultTree(child, entries, subPrefix, seen);
       }
     }
+  }
+  /** 补充 Vault 树里没有、但磁盘上存在的 `.xxx` 文件（adapter 写入的 orphan） */
+  async collectDotFilesFromAdapter(relativeDir, entries, seen) {
+    const fullDir = relativeDir ? `${this.basePath}/${relativeDir}` : this.basePath;
+    const normalizedDir = (0, import_obsidian2.normalizePath)(fullDir);
+    let listed;
+    try {
+      listed = await this.app.vault.adapter.list(normalizedDir);
+    } catch (e) {
+      return;
+    }
+    for (const name of listed.folders) {
+      if (name.startsWith("."))
+        continue;
+      const rel = relativeDir ? `${relativeDir}/${name}` : name;
+      await this.collectDotFilesFromAdapter(rel, entries, seen);
+    }
+    for (const name of listed.files) {
+      if (!name.startsWith("."))
+        continue;
+      const rel = relativeDir ? `${relativeDir}/${name}` : name;
+      const full = (0, import_obsidian2.normalizePath)(`${normalizedDir}/${name}`);
+      let stat;
+      try {
+        stat = await this.app.vault.adapter.stat(full);
+      } catch (e) {
+        continue;
+      }
+      if (!stat || stat.type !== "file")
+        continue;
+      if (name.includes("_conflict_"))
+        continue;
+      const ext = extensionOfPath(name);
+      if (!ext || !this.syncExtensions.includes(ext))
+        continue;
+      const safeRel = sanitizeRelativePath(rel);
+      if (seen.has(safeRel))
+        continue;
+      seen.add(safeRel);
+      entries.push({
+        path: safeRel,
+        name,
+        mtime: stat.mtime,
+        size: stat.size
+      });
+    }
+  }
+  /** 将 Vault 绝对路径转为 syncFolder 相对路径；不在同步根下返回 null */
+  toSyncRelativePath(vaultPath) {
+    const normalized = this.normalize(vaultPath);
+    const root = this.app.vault.getRoot().path;
+    const base = this.basePath === root ? "" : this.basePath;
+    let relative;
+    if (base) {
+      if (normalized === base)
+        relative = "";
+      else if (!normalized.startsWith(`${base}/`))
+        relative = null;
+      else
+        relative = normalized.slice(base.length + 1);
+    } else {
+      relative = normalized;
+    }
+    return relative == null ? null : sanitizeRelativePath(relative);
+  }
+  /** 同 Vault 内重命名/移动文件，返回新路径 mtime */
+  async renameFile(oldRelativePath, newRelativePath) {
+    const oldFull = this.resolve(oldRelativePath);
+    const newFull = this.resolve(newRelativePath);
+    await this.ensureFolder(newFull);
+    const file = this.app.vault.getAbstractFileByPath(oldFull);
+    if (!(file instanceof Obsidian.TFile)) {
+      throw new Error(`\u6587\u4EF6\u4E0D\u5B58\u5728: ${oldFull}`);
+    }
+    await this.app.fileManager.renameFile(file, newFull);
+    const renamed = this.app.vault.getAbstractFileByPath(newFull);
+    if (!(renamed instanceof Obsidian.TFile)) {
+      throw new Error(`\u91CD\u547D\u540D\u540E\u65E0\u6CD5\u8BFB\u53D6: ${newFull}`);
+    }
+    return renamed.stat.mtime;
+  }
+  /** 同 Vault 内重命名/移动文件夹（整棵子树） */
+  async renameFolder(oldRelativePath, newRelativePath) {
+    const oldFull = this.resolve(oldRelativePath);
+    const newFull = this.resolve(newRelativePath);
+    await this.ensureFolder(newFull);
+    const folder = this.app.vault.getAbstractFileByPath(oldFull);
+    if (!(folder instanceof Obsidian.TFolder)) {
+      throw new Error(`\u76EE\u5F55\u4E0D\u5B58\u5728: ${oldFull}`);
+    }
+    await this.app.fileManager.renameFile(folder, newFull);
   }
   /** 读取文件内容 */
   async readFile(relativePath) {
     const fullPath = this.resolve(relativePath);
-    const file = this.app.vault.getAbstractFileByPath(fullPath);
-    if (!file || !(file instanceof Obsidian.TFile)) {
-      throw new Error(`\u6587\u4EF6\u4E0D\u5B58\u5728: ${fullPath}`);
+    if (isDotHiddenRelativePath(relativePath)) {
+      if (!await this.app.vault.adapter.exists(fullPath)) {
+        throw new Error(`\u6587\u4EF6\u4E0D\u5B58\u5728: ${fullPath}`);
+      }
+      return this.app.vault.adapter.read(fullPath);
     }
-    return this.app.vault.read(file);
+    const file = this.app.vault.getAbstractFileByPath(fullPath);
+    if (file instanceof Obsidian.TFile) {
+      return this.app.vault.read(file);
+    }
+    if (await this.app.vault.adapter.exists(fullPath)) {
+      return this.app.vault.adapter.read(fullPath);
+    }
+    throw new Error(`\u6587\u4EF6\u4E0D\u5B58\u5728: ${fullPath}`);
   }
   /** 写入文件（自动创建目录） */
   async writeFile(relativePath, content) {
     const fullPath = this.resolve(relativePath);
     await this.ensureFolder(fullPath);
-    const existing = this.app.vault.getAbstractFileByPath(fullPath);
-    if (existing instanceof Obsidian.TFile) {
-      await this.app.vault.modify(existing, content);
-    } else {
-      await this.app.vault.create(fullPath, content);
+    const adapter = this.app.vault.adapter;
+    if (isDotHiddenRelativePath(relativePath)) {
+      await adapter.write(fullPath, content);
+      return this.mtimeFromPathAsync(fullPath);
     }
-    const file = this.app.vault.getAbstractFileByPath(fullPath);
-    if (!(file instanceof Obsidian.TFile)) {
-      throw new Error(`\u5199\u5165\u540E\u65E0\u6CD5\u8BFB\u53D6\u6587\u4EF6\u72B6\u6001: ${fullPath}`);
+    const indexed = this.app.vault.getAbstractFileByPath(fullPath);
+    if (indexed instanceof Obsidian.TFile) {
+      await this.app.vault.modify(indexed, content);
+      return indexed.stat.mtime;
     }
-    return file.stat.mtime;
+    if (await adapter.exists(fullPath)) {
+      await adapter.write(fullPath, content);
+      return this.mtimeFromPathAsync(fullPath);
+    }
+    const created = await this.app.vault.create(fullPath, content);
+    if (created instanceof Obsidian.TFile) {
+      return created.stat.mtime;
+    }
+    await adapter.write(fullPath, content);
+    return this.mtimeFromPathAsync(fullPath);
   }
-  /** 删除文件（走 Vault 回收站） */
+  /** 删除文件（走 Vault 回收站；隐藏点文件走 adapter.remove） */
   async trashFile(relativePath) {
     const fullPath = this.resolve(relativePath);
+    if (isDotHiddenRelativePath(relativePath)) {
+      if (await this.app.vault.adapter.exists(fullPath)) {
+        await this.app.vault.adapter.remove(fullPath);
+      }
+      return;
+    }
     const file = this.app.vault.getAbstractFileByPath(fullPath);
     if (file instanceof Obsidian.TFile) {
       await this.app.fileManager.trashFile(file);
+      return;
+    }
+    if (await this.app.vault.adapter.exists(fullPath)) {
+      await this.app.vault.adapter.remove(fullPath);
     }
   }
   /** 获取文件的 mtime */
-  getMtime(relativePath) {
-    const fullPath = this.resolve(relativePath);
-    const file = this.app.vault.getAbstractFileByPath(fullPath);
-    if (file instanceof Obsidian.TFile)
-      return file.stat.mtime;
-    return null;
+  async getMtime(relativePath) {
+    const mtime = await this.mtimeFromPathAsync(this.resolve(relativePath));
+    return mtime > 0 ? mtime : null;
+  }
+  async mtimeFromPathAsync(fullPath) {
+    var _a;
+    const normalized = (0, import_obsidian2.normalizePath)(fullPath);
+    const indexed = this.app.vault.getAbstractFileByPath(normalized);
+    if (indexed instanceof Obsidian.TFile) {
+      return indexed.stat.mtime;
+    }
+    const stat = await this.app.vault.adapter.stat(normalized);
+    return (_a = stat == null ? void 0 : stat.mtime) != null ? _a : 0;
   }
   resolve(relativePath) {
-    const safe = sanitizeRelativePath(this.normalize(relativePath));
+    const safe = sanitizeRelativePath(relativePath.replace(/\\/g, "/").replace(/\/+/g, "/"));
     const root = this.app.vault.getRoot().path;
-    if (this.basePath === root)
-      return safe;
-    return `${this.basePath}/${safe}`;
+    const full = this.basePath === root ? safe : `${this.basePath}/${safe}`;
+    return (0, import_obsidian2.normalizePath)(full);
   }
   async ensureFolder(fullPath) {
     const parts = fullPath.split("/");
@@ -356,22 +597,317 @@ var FsLocal = class {
     let current = "";
     for (const part of folderParts) {
       current = current ? `${current}/${part}` : part;
-      const normalized = this.normalize(current);
-      if (!this.app.vault.getAbstractFileByPath(normalized)) {
-        await this.app.vault.createFolder(normalized);
-      }
+      await this.ensureFolderSegment((0, import_obsidian2.normalizePath)(current));
     }
+  }
+  folderIndexed(normalized) {
+    const node = this.app.vault.getAbstractFileByPath(normalized);
+    return node instanceof Obsidian.TFolder;
+  }
+  async ensureFolderSegment(normalized) {
+    if (this.folderIndexed(normalized))
+      return;
+    let lock = this.folderEnsureLocks.get(normalized);
+    if (!lock) {
+      lock = this.createFolderSegment(normalized);
+      this.folderEnsureLocks.set(normalized, lock);
+      lock.finally(() => {
+        if (this.folderEnsureLocks.get(normalized) === lock) {
+          this.folderEnsureLocks.delete(normalized);
+        }
+      });
+    }
+    await lock;
+  }
+  async createFolderSegment(normalized) {
+    if (this.folderIndexed(normalized))
+      return;
+    try {
+      await this.app.vault.createFolder(normalized);
+    } catch (e) {
+      if (!this.isFolderAlreadyExistsError(e))
+        throw e;
+      if (this.folderIndexed(normalized))
+        return;
+      if (await this.app.vault.adapter.exists(normalized))
+        return;
+      throw e;
+    }
+  }
+  isFolderAlreadyExistsError(e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return /folder already exists/i.test(msg);
   }
 };
 
+// src/md5.ts
+function md5Hex(data) {
+  const words = bytesToWords(data);
+  const nBits = data.length * 8;
+  return hexMd5(words, nBits);
+}
+function bytesToWords(bytes) {
+  const words = [];
+  for (let i = 0; i < bytes.length; i++) {
+    words[i >>> 2] |= bytes[i] << i % 4 * 8;
+  }
+  return words;
+}
+function hexMd5(x, len) {
+  x[len >> 5] |= 128 << len % 32;
+  x[(len + 64 >>> 9 << 4) + 14] = len;
+  let a = 1732584193;
+  let b = -271733879;
+  let c = -1732584194;
+  let d = 271733878;
+  for (let i = 0; i < x.length; i += 16) {
+    const oldA = a;
+    const oldB = b;
+    const oldC = c;
+    const oldD = d;
+    a = ff(a, b, c, d, x[i + 0], 7, -680876936);
+    d = ff(d, a, b, c, x[i + 1], 12, -389564586);
+    c = ff(c, d, a, b, x[i + 2], 17, 606105819);
+    b = ff(b, c, d, a, x[i + 3], 22, -1044525330);
+    a = ff(a, b, c, d, x[i + 4], 7, -176418897);
+    d = ff(d, a, b, c, x[i + 5], 12, 1200080426);
+    c = ff(c, d, a, b, x[i + 6], 17, -1473231341);
+    b = ff(b, c, d, a, x[i + 7], 22, -45705983);
+    a = ff(a, b, c, d, x[i + 8], 7, 1770035416);
+    d = ff(d, a, b, c, x[i + 9], 12, -1958414417);
+    c = ff(c, d, a, b, x[i + 10], 17, -42063);
+    b = ff(b, c, d, a, x[i + 11], 22, -1990404162);
+    a = ff(a, b, c, d, x[i + 12], 7, 1804603682);
+    d = ff(d, a, b, c, x[i + 13], 12, -40341101);
+    c = ff(c, d, a, b, x[i + 14], 17, -1502002290);
+    b = ff(b, c, d, a, x[i + 15], 22, 1236535329);
+    a = gg(a, b, c, d, x[i + 1], 5, -165796510);
+    d = gg(d, a, b, c, x[i + 6], 9, -1069501632);
+    c = gg(c, d, a, b, x[i + 11], 14, 643717713);
+    b = gg(b, c, d, a, x[i + 0], 20, -373897302);
+    a = gg(a, b, c, d, x[i + 5], 5, -701558691);
+    d = gg(d, a, b, c, x[i + 10], 9, 38016083);
+    c = gg(c, d, a, b, x[i + 15], 14, -660478335);
+    b = gg(b, c, d, a, x[i + 4], 20, -405537848);
+    a = gg(a, b, c, d, x[i + 9], 5, 568446438);
+    d = gg(d, a, b, c, x[i + 14], 9, -1019803690);
+    c = gg(c, d, a, b, x[i + 3], 14, -187363961);
+    b = gg(b, c, d, a, x[i + 8], 20, 1163531501);
+    a = gg(a, b, c, d, x[i + 13], 5, -1444681467);
+    d = gg(d, a, b, c, x[i + 2], 9, -51403784);
+    c = gg(c, d, a, b, x[i + 7], 14, 1735328473);
+    b = gg(b, c, d, a, x[i + 12], 20, -1926607734);
+    a = hh(a, b, c, d, x[i + 5], 4, -378558);
+    d = hh(d, a, b, c, x[i + 8], 11, -2022574463);
+    c = hh(c, d, a, b, x[i + 11], 16, 1839030562);
+    b = hh(b, c, d, a, x[i + 14], 23, -35309556);
+    a = hh(a, b, c, d, x[i + 1], 4, -1530992060);
+    d = hh(d, a, b, c, x[i + 4], 11, 1272893353);
+    c = hh(c, d, a, b, x[i + 7], 16, -155497632);
+    b = hh(b, c, d, a, x[i + 10], 23, -1094730640);
+    a = hh(a, b, c, d, x[i + 13], 4, 681279174);
+    d = hh(d, a, b, c, x[i + 0], 11, -358537222);
+    c = hh(c, d, a, b, x[i + 3], 16, -722521979);
+    b = hh(b, c, d, a, x[i + 6], 23, 76029189);
+    a = hh(a, b, c, d, x[i + 9], 4, -640364487);
+    d = hh(d, a, b, c, x[i + 12], 11, -421815835);
+    c = hh(c, d, a, b, x[i + 15], 16, 530742520);
+    b = hh(b, c, d, a, x[i + 2], 23, -995338651);
+    a = ii(a, b, c, d, x[i + 0], 6, -198630844);
+    d = ii(d, a, b, c, x[i + 7], 10, 1126891415);
+    c = ii(c, d, a, b, x[i + 14], 15, -1416354905);
+    b = ii(b, c, d, a, x[i + 5], 21, -57434055);
+    a = ii(a, b, c, d, x[i + 12], 6, 1700485571);
+    d = ii(d, a, b, c, x[i + 3], 10, -1894986606);
+    c = ii(c, d, a, b, x[i + 10], 15, -1051523);
+    b = ii(b, c, d, a, x[i + 1], 21, -2054922799);
+    a = ii(a, b, c, d, x[i + 8], 6, 1873313359);
+    d = ii(d, a, b, c, x[i + 15], 10, -30611744);
+    c = ii(c, d, a, b, x[i + 6], 15, -1560198380);
+    b = ii(b, c, d, a, x[i + 13], 21, 1309151649);
+    a = ii(a, b, c, d, x[i + 4], 6, -145523070);
+    d = ii(d, a, b, c, x[i + 11], 10, -1120210379);
+    c = ii(c, d, a, b, x[i + 2], 15, 718787259);
+    b = ii(b, c, d, a, x[i + 9], 21, -343485551);
+    a = add(a, oldA);
+    b = add(b, oldB);
+    c = add(c, oldC);
+    d = add(d, oldD);
+  }
+  return [a, b, c, d].map(wordToHex).join("");
+}
+function cmn(q, a, b, x, s, t) {
+  return add(rol(add(add(a, q), add(x, t)), s), b);
+}
+function ff(a, b, c, d, x, s, t) {
+  return cmn(b & c | ~b & d, a, b, x, s, t);
+}
+function gg(a, b, c, d, x, s, t) {
+  return cmn(b & d | c & ~d, a, b, x, s, t);
+}
+function hh(a, b, c, d, x, s, t) {
+  return cmn(b ^ c ^ d, a, b, x, s, t);
+}
+function ii(a, b, c, d, x, s, t) {
+  return cmn(c ^ (b | ~d), a, b, x, s, t);
+}
+function add(x, y) {
+  return x + y | 0;
+}
+function rol(n, c) {
+  return n << c | n >>> 32 - c;
+}
+function wordToHex(n) {
+  let s = "";
+  for (let j = 0; j < 4; j++) {
+    s += (n >> j * 8 & 255).toString(16).padStart(2, "0");
+  }
+  return s;
+}
+
+// src/fileUploader.ts
+var FileUploader = class {
+  constructor(api) {
+    this.api = api;
+  }
+  async create(params) {
+    const bytes = new TextEncoder().encode(params.content);
+    const suffix = params.fileSuffix || extractSuffix(params.fileName) || "md";
+    const resourceResult = await this.uploadToResource(bytes, params.fileName, suffix);
+    if (!resourceResult.ok)
+      return resourceResult;
+    const saveResult = await this.api.saveFileByPath({
+      projectId: params.projectId,
+      path: params.folderName || void 0,
+      name: params.fileName,
+      fileType: "file",
+      suffix,
+      size: bytes.length,
+      resourceId: resourceResult.value,
+      nameConflictStrategy: 1
+    });
+    if (!saveResult.ok)
+      return { ok: false, error: `saveFileByPath \u5931\u8D25: ${saveResult.error}` };
+    const fileId = String(saveResult.value);
+    const metaResult = await this.api.batchGetMeta([fileId], params.projectId);
+    let folderId = "";
+    if (metaResult.ok && metaResult.value.length > 0) {
+      const parent = metaResult.value[0].parentId;
+      folderId = parent != null ? String(parent) : "";
+    }
+    return { ok: true, value: { fileId, folderId } };
+  }
+  async update(params) {
+    const bytes = new TextEncoder().encode(params.content);
+    const suffix = params.fileSuffix || extractSuffix(params.fileName) || "md";
+    const resourceResult = await this.uploadToResource(bytes, params.fileName, suffix);
+    if (!resourceResult.ok)
+      return resourceResult;
+    const versionResult = await this.api.updateFileVersion({
+      id: params.updateFileId,
+      projectId: params.projectId,
+      resourceId: resourceResult.value,
+      name: params.fileName,
+      suffix,
+      size: bytes.length,
+      versionRemark: VERSION_REMARK
+    });
+    if (!versionResult.ok) {
+      return { ok: false, error: `updateFileVersion \u5931\u8D25: ${versionResult.error}` };
+    }
+    return { ok: true, value: String(versionResult.value) };
+  }
+  async uploadToResource(bytes, fileName, suffix) {
+    const sliceIds = [];
+    const totalSize = bytes.length;
+    const chunkCount = Math.max(1, Math.ceil(totalSize / UPLOAD_CHUNK_SIZE));
+    for (let i = 0; i < chunkCount; i++) {
+      const start = i * UPLOAD_CHUNK_SIZE;
+      const end = Math.min(start + UPLOAD_CHUNK_SIZE, totalSize);
+      const chunk = bytes.subarray(start, end);
+      const chunkMd5 = md5Hex(chunk);
+      const chunkSize = chunk.length;
+      const checkResult = await this.api.getSliceIdByMd5V2(chunkMd5, chunkSize, suffix);
+      if (!checkResult.ok) {
+        return {
+          ok: false,
+          error: `getSliceIdByMd5V2 \u5931\u8D25 (${i + 1}/${chunkCount}): ${checkResult.error}`
+        };
+      }
+      const sliceData = checkResult.value;
+      if (sliceData.sliceId) {
+        sliceIds.push(sliceData.sliceId);
+        continue;
+      }
+      if (!sliceData.uploadUrl) {
+        return {
+          ok: false,
+          error: `\u5206\u7247 ${i + 1}/${chunkCount} \u65E0 uploadUrl \u4E14\u65E0 sliceId`
+        };
+      }
+      const putResult = await this.putToMinIO(sliceData.uploadUrl, chunk);
+      if (!putResult.ok) {
+        return { ok: false, error: `MinIO PUT \u5931\u8D25 (${i + 1}/${chunkCount}): ${putResult.error}` };
+      }
+      const registerResult = await this.api.uploadFileSliceV2({
+        filePath: sliceData.fullPath,
+        md5: chunkMd5,
+        size: chunkSize,
+        storageType: sliceData.storageType || "MINIO"
+      });
+      if (!registerResult.ok) {
+        return {
+          ok: false,
+          error: `uploadFileSliceV2 \u5931\u8D25 (${i + 1}/${chunkCount}): ${registerResult.error}`
+        };
+      }
+      sliceIds.push(registerResult.value);
+    }
+    const mergeResult = await this.api.saveResource({
+      name: fileName,
+      sliceIds,
+      suffix,
+      size: totalSize
+    });
+    if (!mergeResult.ok) {
+      return { ok: false, error: `saveResource \u5931\u8D25: ${mergeResult.error}` };
+    }
+    return { ok: true, value: mergeResult.value };
+  }
+  async putToMinIO(url, data) {
+    try {
+      const resp = await fetch(url, { method: "PUT", body: data });
+      if (!resp.ok) {
+        const text = await resp.text().catch(() => "");
+        return { ok: false, error: `HTTP ${resp.status}: ${text.slice(0, 200)}` };
+      }
+      return { ok: true, value: void 0 };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  }
+};
+function extractSuffix(fileName) {
+  const dot = fileName.lastIndexOf(".");
+  if (dot <= 0 || dot === fileName.length - 1)
+    return void 0;
+  return fileName.slice(dot + 1).toLowerCase();
+}
+
 // src/fsXgkb.ts
 var FsXgkb = class {
-  constructor(api, targetFolderName, configuredProjectId) {
+  constructor(api, targetFolderName, configuredProjectId, uploadOpts = {
+    usePhysicalUpload: true,
+    uploadContentFallback: true
+  }, syncExtensions = ["md"]) {
     this.api = api;
     this.configuredProjectId = configuredProjectId;
+    this.uploadOpts = uploadOpts;
     this.rootId = null;
     this.projectId = null;
     this.targetFolderPath = normalizeTargetFolderPath(targetFolderName) || "Obsidian";
+    this.uploader = new FileUploader(api);
+    this.syncExtensions = syncExtensions;
   }
   getRootId() {
     return this.rootId;
@@ -463,46 +999,56 @@ var FsXgkb = class {
     return { ok: true, value: currentId };
   }
   /**
-   * 通过 4.21 扁平列举同步根目录下所有 .md 文件
+   * 通过 4.21 扁平列举同步根目录下已选类型的文件
    */
   async listFiles() {
     var _a;
     if (!this.rootId)
       return { ok: false, error: "\u672A\u521D\u59CB\u5316" };
     const entries = [];
-    let cursor;
-    let page = 0;
-    do {
-      page++;
-      const r = await this.api.listDescendantFiles({
-        rootFileId: this.rootId,
-        projectId: this.projectId || void 0,
-        suffix: "md",
-        limit: 500,
-        cursor,
-        includePath: true
-      });
-      if (!r.ok)
-        return { ok: false, error: r.error };
-      const pageItems = r.value.files || [];
-      console.debug(`[XGKB Sync] listDescendantFiles \u7B2C${page}\u9875: \u8FD4\u56DE ${pageItems.length} \u6761\uFF0CnextCursor=${(_a = r.value.nextCursor) != null ? _a : "null"}`);
-      for (const item of pageItems) {
-        const rawPath = item.relativePath || item.name;
-        const safePath = rawPath.split("/").filter(Boolean).map((seg) => sanitizePathSegment(seg)).join("/");
-        if (!safePath.endsWith(".md"))
-          continue;
-        entries.push({
-          path: safePath,
-          name: item.name,
-          mtime: item.updateTime || 0,
-          size: item.size,
-          xgkbFileId: String(item.fileId),
-          xgkbFolderId: item.parentId != null ? String(item.parentId) : ""
+    const seen = /* @__PURE__ */ new Set();
+    for (const suffix of this.syncExtensions) {
+      let cursor;
+      let page = 0;
+      do {
+        page++;
+        const r = await this.api.listDescendantFiles({
+          rootFileId: this.rootId,
+          projectId: this.projectId || void 0,
+          suffix,
+          limit: 500,
+          cursor,
+          includePath: true
         });
-      }
-      cursor = r.value.nextCursor || void 0;
-    } while (cursor);
-    console.debug(`[XGKB Sync] listDescendantFiles \u5B8C\u6210: \u5171 ${entries.length} \u4E2A .md \u6587\u4EF6\uFF0C${page} \u9875`);
+        if (!r.ok)
+          return { ok: false, error: r.error };
+        const pageItems = r.value.files || [];
+        console.debug(
+          `[XGKB Sync] listDescendantFiles(.${suffix}) \u7B2C${page}\u9875: \u8FD4\u56DE ${pageItems.length} \u6761\uFF0CnextCursor=${(_a = r.value.nextCursor) != null ? _a : "null"}`
+        );
+        for (const item of pageItems) {
+          const rawPath = item.relativePath || item.name;
+          const safePath = rawPath.split("/").filter(Boolean).map((seg) => sanitizePathSegment(seg)).join("/");
+          if (!pathMatchesSyncExtensions(safePath, this.syncExtensions))
+            continue;
+          if (seen.has(safePath))
+            continue;
+          seen.add(safePath);
+          entries.push({
+            path: safePath,
+            name: item.name,
+            mtime: item.updateTime || 0,
+            size: item.size,
+            xgkbFileId: String(item.fileId),
+            xgkbFolderId: item.parentId != null ? String(item.parentId) : ""
+          });
+        }
+        cursor = r.value.nextCursor || void 0;
+      } while (cursor);
+    }
+    console.debug(
+      `[XGKB Sync] listDescendantFiles \u5B8C\u6210: \u5171 ${entries.length} \u4E2A\u6587\u4EF6\uFF08${this.syncExtensions.map((e) => `.${e}`).join(", ")}\uFF09`
+    );
     return { ok: true, value: entries };
   }
   async delay(ms) {
@@ -534,7 +1080,7 @@ var FsXgkb = class {
     return { ok: false, error: lastError || "OSS \u4E0B\u8F7D\u5931\u8D25" };
   }
   /**
-   * 读取云端 .md 原文：优先 getDownloadInfo → OSS 直链；失败则回退 getFullFileContent。
+   * 读取云端文件原文：优先 getDownloadInfo → OSS 直链；失败则回退 getFullFileContent。
    */
   async readFile(fileId) {
     let lastError = "";
@@ -546,7 +1092,7 @@ var FsXgkb = class {
       if (infoResult.ok && infoResult.value.downloadUrl) {
         const bodyResult = await this.fetchDownloadUrl(infoResult.value.downloadUrl);
         if (bodyResult.ok) {
-          return { ok: true, value: bodyResult.value };
+          return { ok: true, value: cleanContent(bodyResult.value) };
         }
         lastError = bodyResult.error;
         continue;
@@ -561,28 +1107,123 @@ var FsXgkb = class {
         await this.delay(RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1));
       }
       const fallback = await this.api.getFullFileContent(fileId);
-      if (fallback.ok) {
+      if (fallback.ok && fallback.value != null) {
         return { ok: true, value: cleanContent(fallback.value) };
       }
-      lastError = fallback.error;
+      lastError = fallback.ok ? "getFullFileContent \u8FD4\u56DE\u7A7A\u5185\u5BB9" : fallback.error;
     }
     return { ok: false, error: lastError || "\u4E0B\u8F7D\u5931\u8D25" };
   }
-  /**
-   * 上传新文件（使用 uploadContent）
-   * @param relativePath 相对路径（如 "日常学习/笔记.md"）
-   * @param content Markdown 内容
-   * @returns fileId 与 folderId（folderId 用于状态库，支撑增量同步路径缓存）
-   */
   async createFile(relativePath, content) {
+    const { folderName, fileName } = this.splitRelativePath(relativePath);
+    const { suffix } = splitFileNameAndSuffix(fileName);
+    if (this.uploadOpts.usePhysicalUpload && this.projectId) {
+      const physical = await this.uploader.create({
+        content,
+        fileName,
+        fileSuffix: suffix,
+        folderName,
+        projectId: this.projectId
+      });
+      if (physical.ok)
+        return physical;
+      console.warn("[XGKB Sync] \u7269\u7406\u4E0A\u4F20\u65B0\u5EFA\u5931\u8D25:", physical.error);
+      if (!this.uploadOpts.uploadContentFallback)
+        return physical;
+    }
+    return this.createFileViaUploadContent(relativePath, content, folderName, fileName, suffix);
+  }
+  async updateFile(fileId, fileName, content) {
+    const { suffix } = splitFileNameAndSuffix(fileName);
+    if (this.uploadOpts.usePhysicalUpload && this.projectId) {
+      const physical = await this.uploader.update({
+        content,
+        fileName,
+        fileSuffix: suffix,
+        updateFileId: fileId,
+        projectId: this.projectId
+      });
+      if (physical.ok)
+        return physical;
+      console.warn("[XGKB Sync] \u7269\u7406\u4E0A\u4F20\u66F4\u65B0\u5931\u8D25:", physical.error);
+      if (!this.uploadOpts.uploadContentFallback)
+        return physical;
+    }
+    return this.updateFileViaUploadContent(fileId, fileName, content, suffix);
+  }
+  /** 同目录内改名（远端） */
+  async renameRemoteFile(fileId, newFileName) {
+    if (!this.projectId)
+      return { ok: false, error: "\u672A\u521D\u59CB\u5316 projectId" };
+    const r = await this.api.updateFileName({
+      fileId,
+      newName: newFileName,
+      projectId: this.projectId,
+      nameConflictStrategy: DEFAULT_RENAME_NAME_CONFLICT_STRATEGY
+    });
+    if (!r.ok)
+      return { ok: false, error: r.error };
+    return { ok: true, value: void 0 };
+  }
+  /** 移动到其他父目录（远端） */
+  async moveRemoteFile(fileId, targetParentId) {
+    if (!this.projectId)
+      return { ok: false, error: "\u672A\u521D\u59CB\u5316 projectId" };
+    const r = await this.api.moveFile({
+      fileId,
+      targetParentId,
+      projectId: this.projectId,
+      nameConflictStrategy: DEFAULT_MOVE_NAME_CONFLICT_STRATEGY
+    });
+    if (!r.ok)
+      return { ok: false, error: r.error };
+    if (r.value.mainSkipped) {
+      return { ok: false, error: "\u79FB\u52A8\u88AB\u8DF3\u8FC7\uFF08\u76EE\u6807\u76EE\u5F55\u5B58\u5728\u540C\u540D\u6587\u4EF6\uFF09" };
+    }
+    return { ok: true, value: r.value };
+  }
+  /** 解析 syncFolder 相对路径对应的远端父 folderId；缺失子目录时逐级 createFolder */
+  async resolveFolderIdForRelativePath(relativeFolderPath) {
+    if (!this.projectId || !this.rootId)
+      return { ok: false, error: "\u672A\u521D\u59CB\u5316" };
+    const segments = relativeFolderPath ? relativeFolderPath.split("/").filter(Boolean) : [];
+    let currentId = this.rootId;
+    for (let i = 0; i < segments.length; i++) {
+      const seg = segments[i];
+      const childResult = await this.api.getChildFiles(currentId, 1);
+      if (!childResult.ok)
+        return { ok: false, error: childResult.error };
+      const found = (childResult.value || []).find((f) => f.name === seg && f.type === 1);
+      if (!found) {
+        const parentLabel = i === 0 ? "\u540C\u6B65\u6839" : segments.slice(0, i).join("/");
+        console.debug(`[XGKB Sync] "${parentLabel}" \u4E0B\u65E0 "${seg}"\uFF0C\u6B63\u5728\u521B\u5EFA...`);
+        const createResult = await this.api.createFolder({
+          projectId: this.projectId,
+          parentId: currentId,
+          name: seg
+        });
+        if (!createResult.ok) {
+          return { ok: false, error: `\u521B\u5EFA\u76EE\u5F55 "${seg}" \u5931\u8D25: ${createResult.error}` };
+        }
+        currentId = createResult.value;
+      } else {
+        currentId = found.id;
+      }
+    }
+    return { ok: true, value: currentId };
+  }
+  splitRelativePath(relativePath) {
     const lastSlash = relativePath.lastIndexOf("/");
     const folderPath = lastSlash > 0 ? relativePath.substring(0, lastSlash) : "";
     const fileName = lastSlash > 0 ? relativePath.substring(lastSlash + 1) : relativePath;
     const folderName = folderPath ? `${this.targetFolderPath}/${folderPath}` : this.targetFolderPath;
+    return { folderName, fileName };
+  }
+  async createFileViaUploadContent(relativePath, content, folderName, fileName, fileSuffix) {
     const result = await this.api.uploadContent({
       content,
       fileName,
-      fileSuffix: "md",
+      fileSuffix,
       folderName,
       projectId: this.projectId || void 0
     });
@@ -597,14 +1238,11 @@ var FsXgkb = class {
       }
     };
   }
-  /**
-   * 更新已有文件（使用 uploadContent + updateFileId）
-   */
-  async updateFile(fileId, fileName, content) {
+  async updateFileViaUploadContent(fileId, fileName, content, fileSuffix) {
     const result = await this.api.uploadContent({
       content,
       fileName,
-      fileSuffix: "md",
+      fileSuffix,
       updateFileId: fileId,
       versionRemark: "XGKB Sync plugin update"
     });
@@ -686,55 +1324,82 @@ var FsXgkb = class {
 };
 
 // src/settings.ts
-var XgkbPluginSettingTab = class extends import_obsidian2.PluginSettingTab {
+var XgkbPluginSettingTab = class extends import_obsidian3.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;
   }
   display() {
+    if (this.scopeIdentityTimer !== void 0) {
+      window.clearTimeout(this.scopeIdentityTimer);
+      this.scopeIdentityTimer = void 0;
+    }
     const { containerEl } = this;
     containerEl.empty();
-    new import_obsidian2.Setting(containerEl).setName("App key").setDesc("\u7384\u5173\u77E5\u8BC6\u5E93 API \u5BC6\u94A5").addText(
-      (text) => text.setPlaceholder("Enter app key").setValue(this.plugin.settings.appKey).onChange(async (value) => {
+    new import_obsidian3.Setting(containerEl).setName("App key").setDesc("\u7384\u5173\u77E5\u8BC6\u5E93 API \u5BC6\u94A5").addText((text) => {
+      text.setPlaceholder("Enter app key").setValue(this.plugin.settings.appKey);
+      this.bindScopeIdentityText(text, (value) => {
         this.plugin.settings.appKey = value;
-        await this.plugin.onScopeIdentityChanged();
-      })
-    );
-    new import_obsidian2.Setting(containerEl).setName("Server URL").setDesc("\u7384\u5173\u77E5\u8BC6\u5E93 API \u5730\u5740").addText(
-      (text) => text.setPlaceholder(DEFAULT_SETTINGS.serverUrl).setValue(this.plugin.settings.serverUrl).onChange(async (value) => {
+      });
+    });
+    new import_obsidian3.Setting(containerEl).setName("Server URL").setDesc("\u7384\u5173\u77E5\u8BC6\u5E93 API \u5730\u5740").addText((text) => {
+      text.setPlaceholder(DEFAULT_SETTINGS.serverUrl).setValue(this.plugin.settings.serverUrl);
+      this.bindScopeIdentityText(text, (value) => {
         this.plugin.settings.serverUrl = value || DEFAULT_SETTINGS.serverUrl;
-        await this.plugin.onScopeIdentityChanged();
-      })
-    );
-    new import_obsidian2.Setting(containerEl).setName("Project ID").setDesc("\u76EE\u6807\u77E5\u8BC6\u5E93\u7A7A\u95F4 ID\uFF1B\u7559\u7A7A\u5219\u540C\u6B65\u5230\u4E2A\u4EBA\u77E5\u8BC6\u5E93\u3002\u5207\u6362\u7A7A\u95F4\u5C06\u81EA\u52A8\u4F7F\u7528\u72EC\u7ACB\u6C34\u4F4D\u3002").addText(
-      (text) => {
-        var _a;
-        return text.setPlaceholder("\u7559\u7A7A = \u4E2A\u4EBA\u77E5\u8BC6\u5E93").setValue((_a = this.plugin.settings.projectId) != null ? _a : "").onChange(async (value) => {
-          this.plugin.settings.projectId = value.trim();
-          await this.plugin.onScopeIdentityChanged();
-        });
-      }
-    );
-    new import_obsidian2.Setting(containerEl).setName("Sync folder").setDesc("Obsidian \u4E2D\u7528\u4E8E\u540C\u6B65\u7684\u6587\u4EF6\u5939\u8DEF\u5F84\uFF08\u7A7A = \u540C\u6B65\u6574\u4E2A vault\uFF09").addText(
-      (text) => text.setPlaceholder("Example: notes").setValue(this.plugin.settings.syncFolder).onChange(async (value) => {
+      });
+    });
+    new import_obsidian3.Setting(containerEl).setName("Project ID").setDesc("\u76EE\u6807\u77E5\u8BC6\u5E93\u7A7A\u95F4 ID\uFF1B\u7559\u7A7A\u5219\u540C\u6B65\u5230\u4E2A\u4EBA\u77E5\u8BC6\u5E93\u3002\u5207\u6362\u7A7A\u95F4\u5C06\u81EA\u52A8\u4F7F\u7528\u72EC\u7ACB\u6C34\u4F4D\u3002").addText((text) => {
+      var _a;
+      text.setPlaceholder("\u7559\u7A7A = \u4E2A\u4EBA\u77E5\u8BC6\u5E93").setValue((_a = this.plugin.settings.projectId) != null ? _a : "");
+      this.bindScopeIdentityText(text, (value) => {
+        this.plugin.settings.projectId = value.trim();
+      });
+    });
+    new import_obsidian3.Setting(containerEl).setName("Sync folder").setDesc("Obsidian \u4E2D\u7528\u4E8E\u540C\u6B65\u7684\u6587\u4EF6\u5939\u8DEF\u5F84\uFF08\u7A7A = \u540C\u6B65\u6574\u4E2A vault\uFF09").addText((text) => {
+      text.setPlaceholder("Example: notes").setValue(this.plugin.settings.syncFolder);
+      this.bindScopeIdentityText(text, (value) => {
         this.plugin.settings.syncFolder = value;
-        await this.plugin.onScopeIdentityChanged();
-      })
-    );
-    new import_obsidian2.Setting(containerEl).setName("Cloud target folder").setDesc("\u77E5\u8BC6\u5E93\u4E2D\u7684\u540C\u6B65\u6839\u76EE\u5F55\uFF1B\u652F\u6301\u591A\u7EA7\u8DEF\u5F84\uFF0C\u5982 Obsidian \u6216 A/B\uFF08\u4E0D\u5B58\u5728\u65F6\u81EA\u52A8\u521B\u5EFA\uFF09").addText(
-      (text) => text.setPlaceholder("Obsidian \u6216 A/B").setValue(this.plugin.settings.targetFolderName).onChange(async (value) => {
+      });
+    });
+    new import_obsidian3.Setting(containerEl).setName("Cloud target folder").setDesc("\u77E5\u8BC6\u5E93\u4E2D\u7684\u540C\u6B65\u6839\u76EE\u5F55\uFF1B\u652F\u6301\u591A\u7EA7\u8DEF\u5F84\uFF0C\u5982 Obsidian \u6216 A/B\uFF08\u4E0D\u5B58\u5728\u65F6\u81EA\u52A8\u521B\u5EFA\uFF09").addText((text) => {
+      text.setPlaceholder("Obsidian \u6216 A/B").setValue(this.plugin.settings.targetFolderName);
+      this.bindScopeIdentityText(text, (value) => {
         const normalized = normalizeTargetFolderPath(value);
         this.plugin.settings.targetFolderName = normalized || "Obsidian";
-        await this.plugin.onScopeIdentityChanged();
-      })
-    );
-    new import_obsidian2.Setting(containerEl).setName("Sync direction").setDesc("\u53CC\u5411\u540C\u6B65 / \u4EC5\u63A8\u9001 / \u4EC5\u62C9\u53D6").addDropdown(
+      });
+    });
+    const fileTypesWrap = containerEl.createDiv({ cls: "xgkb-sync-file-types" });
+    new import_obsidian3.Setting(fileTypesWrap).setName("Sync file types").setDesc("\u9009\u62E9\u8981\u540C\u6B65\u7684\u6587\u4EF6\u7C7B\u578B\uFF08\u81F3\u5C11\u4FDD\u7559\u4E00\u79CD\uFF09");
+    for (const ext of AVAILABLE_SYNC_EXTENSIONS) {
+      const desc = ext === "md" ? "Markdown \u7B14\u8BB0" : ext === "json" ? "JSON \u914D\u7F6E/\u6570\u636E" : "HTML \u9875\u9762";
+      new import_obsidian3.Setting(fileTypesWrap).setName(`.${ext}`).setDesc(desc).addToggle((toggle) => {
+        const current = normalizeSyncExtensions(this.plugin.settings.syncFileExtensions);
+        toggle.setValue(current.includes(ext));
+        toggle.onChange(async (enabled) => {
+          let next = [...normalizeSyncExtensions(this.plugin.settings.syncFileExtensions)];
+          if (enabled) {
+            if (!next.includes(ext))
+              next.push(ext);
+          } else {
+            next = next.filter((item) => item !== ext);
+            if (next.length === 0) {
+              new import_obsidian3.Notice("\u81F3\u5C11\u4FDD\u7559\u4E00\u79CD\u6587\u4EF6\u7C7B\u578B", 3e3);
+              toggle.setValue(true);
+              return;
+            }
+          }
+          this.plugin.settings.syncFileExtensions = normalizeSyncExtensions(next);
+          await this.plugin.saveSettings();
+        });
+      });
+    }
+    new import_obsidian3.Setting(containerEl).setName("Sync direction").setDesc("\u53CC\u5411\u540C\u6B65 / \u4EC5\u63A8\u9001 / \u4EC5\u62C9\u53D6").addDropdown(
       (dropdown) => dropdown.addOption("bidirectional", "Bidirectional").addOption("push", "Push only").addOption("pull", "Pull only").setValue(this.plugin.settings.syncDirection).onChange(async (value) => {
         this.plugin.settings.syncDirection = value;
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian2.Setting(containerEl).setName("Automatic sync interval").setDesc("\u5B9A\u671F\u81EA\u52A8\u6267\u884C\u540C\u6B65\uFF0C\u5173\u95ED\u5219\u4EC5\u624B\u52A8\u89E6\u53D1").addDropdown(
+    new import_obsidian3.Setting(containerEl).setName("Automatic sync interval").setDesc("\u5B9A\u671F\u81EA\u52A8\u6267\u884C\u540C\u6B65\uFF0C\u5173\u95ED\u5219\u4EC5\u624B\u52A8\u89E6\u53D1").addDropdown(
       (dropdown) => dropdown.addOption("0", "Off (manual sync)").addOption("5", "Every 5 minutes").addOption("10", "Every 10 minutes").addOption("30", "Every 30 minutes").addOption("60", "Every hour").addOption("120", "Every 2 hours").setValue(String(this.plugin.settings.autoSyncInterval)).onChange(async (value) => {
         this.plugin.settings.autoSyncInterval = Number(value);
         await this.plugin.saveSettings();
@@ -759,49 +1424,77 @@ var XgkbPluginSettingTab = class extends import_obsidian2.PluginSettingTab {
       void this.plugin.resetAllSyncScopes();
     });
   }
+  /** 文本类设置：防抖后再切换作用域并提示（失焦时立即提交） */
+  bindScopeIdentityText(text, apply) {
+    const commitScope = () => {
+      if (this.scopeIdentityTimer !== void 0) {
+        window.clearTimeout(this.scopeIdentityTimer);
+        this.scopeIdentityTimer = void 0;
+      }
+      void this.plugin.onScopeIdentityChanged();
+    };
+    text.onChange((value) => {
+      apply(value);
+      if (this.scopeIdentityTimer !== void 0) {
+        window.clearTimeout(this.scopeIdentityTimer);
+      }
+      this.scopeIdentityTimer = window.setTimeout(commitScope, 600);
+    });
+    text.inputEl.addEventListener("blur", commitScope);
+  }
   async testConnection() {
     const { appKey, serverUrl, targetFolderName, projectId } = this.plugin.settings;
     if (!appKey) {
-      new import_obsidian2.Notice("Enter app key first");
+      new import_obsidian3.Notice("Enter app key first");
       return;
     }
-    new import_obsidian2.Notice("\u6D4B\u8BD5\u8FDE\u63A5\u4E2D...");
+    new import_obsidian3.Notice("\u6D4B\u8BD5\u8FDE\u63A5\u4E2D...");
     const api = new XgkbApi(serverUrl, appKey);
     const projectIdResult = await api.resolveProjectId(projectId);
     if (!projectIdResult.ok) {
-      new import_obsidian2.Notice(`\u274C \u8FDE\u63A5\u5931\u8D25: ${projectIdResult.error}`, 5e3);
+      new import_obsidian3.Notice(`\u274C \u8FDE\u63A5\u5931\u8D25: ${projectIdResult.error}`, 5e3);
       return;
     }
     const resolvedId = projectIdResult.value;
     const spaceLabel = (projectId == null ? void 0 : projectId.trim()) ? `\u7A7A\u95F4 ${resolvedId}` : `\u4E2A\u4EBA\u77E5\u8BC6\u5E93 (${resolvedId})`;
-    const fsXgkb = new FsXgkb(api, targetFolderName, projectId);
+    const fsXgkb = new FsXgkb(
+      api,
+      targetFolderName,
+      projectId,
+      void 0,
+      normalizeSyncExtensions(this.plugin.settings.syncFileExtensions)
+    );
     const initResult = await fsXgkb.init();
     if (!initResult.ok) {
-      new import_obsidian2.Notice(`\u274C \u76EE\u5F55\u89E3\u6790\u5931\u8D25: ${initResult.error}`, 8e3);
+      new import_obsidian3.Notice(`\u274C \u76EE\u5F55\u89E3\u6790\u5931\u8D25: ${initResult.error}`, 8e3);
       return;
     }
     const rootId = initResult.value;
     const displayPath = normalizeTargetFolderPath(targetFolderName) || "Obsidian";
     const filesResult = await api.getChildFiles(rootId);
     if (!filesResult.ok) {
-      new import_obsidian2.Notice(`\u274C \u76EE\u5F55\u8BBF\u95EE\u5931\u8D25: ${filesResult.error}`, 5e3);
+      new import_obsidian3.Notice(`\u274C \u76EE\u5F55\u8BBF\u95EE\u5931\u8D25: ${filesResult.error}`, 5e3);
       return;
     }
     const items = filesResult.value || [];
-    const mdCount = items.filter((f) => f.type === 2 && f.suffix === "md").length;
+    const syncExtensions = normalizeSyncExtensions(this.plugin.settings.syncFileExtensions);
+    const syncCount = items.filter(
+      (f) => f.type === 2 && f.suffix && syncExtensions.includes(f.suffix.toLowerCase())
+    ).length;
     const folderCount = items.filter((f) => f.type === 1).length;
-    new import_obsidian2.Notice(
-      `\u2705 \u8FDE\u63A5\u6210\u529F\uFF08${spaceLabel}\uFF09\uFF01"${displayPath}" \u542B ${mdCount} \u4E2A .md \u6587\u4EF6\u3001${folderCount} \u4E2A\u5B50\u6587\u4EF6\u5939`,
+    const typesLabel = formatSyncExtensionsLabel(syncExtensions);
+    new import_obsidian3.Notice(
+      `\u2705 \u8FDE\u63A5\u6210\u529F\uFF08${spaceLabel}\uFF09\uFF01"${displayPath}" \u542B ${syncCount} \u4E2A ${typesLabel} \u6587\u4EF6\u3001${folderCount} \u4E2A\u5B50\u6587\u4EF6\u5939`,
       5e3
     );
   }
   async debugSync() {
     const { appKey, serverUrl, targetFolderName, syncFolder, syncDirection, projectId } = this.plugin.settings;
     if (!appKey) {
-      new import_obsidian2.Notice("Enter app key first");
+      new import_obsidian3.Notice("Enter app key first");
       return;
     }
-    new import_obsidian2.Notice("\u8BCA\u65AD\u4E2D...");
+    new import_obsidian3.Notice("\u8BCA\u65AD\u4E2D...");
     const api = new XgkbApi(serverUrl, appKey);
     const lines = [`=== XGKB Sync \u8BCA\u65AD ===
 `];
@@ -814,10 +1507,12 @@ var XgkbPluginSettingTab = class extends import_obsidian2.PluginSettingTab {
     }
     lines.push("");
     try {
-      const fsLocal = new FsLocal(this.plugin.app, syncFolder);
-      const fsXgkb = new FsXgkb(api, targetFolderName, projectId);
-      const localFiles = fsLocal.listFiles();
-      lines.push(`\u672C\u5730 .md \u6587\u4EF6: ${localFiles.length} \u4E2A`);
+      const syncExtensions = normalizeSyncExtensions(this.plugin.settings.syncFileExtensions);
+      const typesLabel = formatSyncExtensionsLabel(syncExtensions);
+      const fsLocal = new FsLocal(this.plugin.app, syncFolder, syncExtensions);
+      const fsXgkb = new FsXgkb(api, targetFolderName, projectId, void 0, syncExtensions);
+      const localFiles = await fsLocal.listFiles();
+      lines.push(`\u672C\u5730 ${typesLabel} \u6587\u4EF6: ${localFiles.length} \u4E2A`);
       for (const f of localFiles.slice(0, 10)) {
         lines.push(`  \u{1F4C4} ${f.path}  (${new Date(f.mtime).toLocaleString()})`);
       }
@@ -835,7 +1530,7 @@ var XgkbPluginSettingTab = class extends import_obsidian2.PluginSettingTab {
         } else {
           const remoteFiles = remoteResult.value;
           lines.push(`
-\u4E91\u7AEF .md \u6587\u4EF6: ${remoteFiles.length} \u4E2A`);
+\u4E91\u7AEF ${typesLabel} \u6587\u4EF6: ${remoteFiles.length} \u4E2A`);
           for (const f of remoteFiles.slice(0, 10)) {
             lines.push(`  \u2601\uFE0F ${f.path}  (${new Date(f.mtime).toLocaleString()})`);
           }
@@ -880,9 +1575,106 @@ var XgkbPluginSettingTab = class extends import_obsidian2.PluginSettingTab {
       await this.plugin.app.vault.create(logPath, fullText);
     } catch (e) {
     }
-    new import_obsidian2.Notice("\u8BCA\u65AD\u5B8C\u6210\uFF0C\u8BE6\u60C5\u89C1\u63A7\u5236\u53F0\u548C .xgkb-sync-debug.log", 5e3);
+    new import_obsidian3.Notice("\u8BCA\u65AD\u5B8C\u6210\uFF0C\u8BE6\u60C5\u89C1\u63A7\u5236\u53F0\u548C .xgkb-sync-debug.log", 5e3);
   }
 };
+
+// src/syncDiagnostics.ts
+function syncDiag(msg, data) {
+  if (data !== void 0) {
+    console.debug(`[XGKB Sync][diag] ${msg}`, data);
+  } else {
+    console.debug(`[XGKB Sync][diag] ${msg}`);
+  }
+}
+function syncDiagListChangesItems(items) {
+  syncDiag(`listChanges \u539F\u59CB\u6761\u76EE (${items.length} \u6761)`);
+  for (const item of items) {
+    syncDiag("listChanges item", {
+      fileId: String(item.fileId),
+      event: item.event,
+      type: item.type,
+      name: item.name,
+      parentId: item.parentId != null ? String(item.parentId) : null,
+      updateTime: item.updateTime
+    });
+  }
+}
+function syncDiagKnownUpsert(fileId, record, item, meta, folderIdToPath) {
+  var _a, _b, _c;
+  const itemParent = item.parentId != null ? String(item.parentId) : null;
+  const metaParent = (meta == null ? void 0 : meta.parentId) != null ? String(meta.parentId) : null;
+  const oldParentId = record.xgkbFolderId;
+  const oldName = (_a = record.localPath.split("/").pop()) != null ? _a : "";
+  const itemName = (_b = item.name) != null ? _b : null;
+  const metaName = (_c = meta == null ? void 0 : meta.name) != null ? _c : null;
+  const newParentForOpenclaw = metaParent != null ? metaParent : "";
+  const newNameForOpenclaw = metaName != null ? metaName : "";
+  const openclawWouldDetect = Boolean(newParentForOpenclaw && oldParentId) && (newParentForOpenclaw !== oldParentId || newNameForOpenclaw !== oldName);
+  const openclawFolderPath = newParentForOpenclaw ? folderIdToPath.get(newParentForOpenclaw) : void 0;
+  syncDiag("knownUpsert \u6570\u636E\u6E90\u5BF9\u6BD4\uFF08openclaw \u68C0\u6D4B\u6761\u4EF6\u89C1 openclaw-xgkb-sync syncEngine.ts:876-903\uFF09", {
+    fileId,
+    recordLocalPath: record.localPath,
+    recordXgkbFolderId: oldParentId,
+    recordRemoteMtime: record.remoteMtime,
+    listChanges: {
+      parentId: itemParent,
+      name: itemName,
+      type: item.type,
+      updateTime: item.updateTime
+    },
+    batchGetMeta: meta ? {
+      parentId: metaParent,
+      name: metaName,
+      updateTime: meta.updateTime,
+      deleted: meta.deleted
+    } : null,
+    parentIdItemVsMeta: itemParent === metaParent ? "same" : "DIFF",
+    parentIdItemVsRecord: itemParent === oldParentId ? "same" : "DIFF",
+    parentIdMetaVsRecord: metaParent === oldParentId ? "same" : "DIFF",
+    nameMetaVsRecord: metaName === oldName ? "same" : "DIFF",
+    openclawWouldDetectMoveOrRename: openclawWouldDetect,
+    openclawNewParentFolderPath: openclawFolderPath != null ? openclawFolderPath : null,
+    openclawNewParentInFolderMap: openclawFolderPath !== void 0
+  });
+}
+function syncDiagPathResolve(fileId, recordPath, remotePath, opts) {
+  var _a;
+  syncDiag("knownUpsert \u8DEF\u5F84\u91CD\u5EFA\u7ED3\u679C", {
+    fileId,
+    recordPath,
+    remotePath,
+    pathsEqual: recordPath === remotePath,
+    parentIdUsed: opts.parentIdUsed || null,
+    fileNameUsed: opts.fileNameUsed,
+    folderPathFromMap: (_a = opts.folderPathFromMap) != null ? _a : null,
+    usedFallback: opts.usedFallback
+  });
+}
+function syncDiagFolderMapSnapshot(label, folderIdToPath, folderIds) {
+  var _a;
+  const snapshot = {};
+  for (const id of folderIds) {
+    const sid = String(id);
+    if (!sid)
+      continue;
+    snapshot[sid] = (_a = folderIdToPath.get(sid)) != null ? _a : null;
+  }
+  syncDiag(label, snapshot);
+}
+function syncDiagHydrate(phase, data) {
+  syncDiag(`hydrate ${phase}`, data);
+}
+function syncDiagFolderUpsertApply(results) {
+  syncDiag(`folderUpsert \u5E94\u7528\u7ED3\u679C (${results.length} \u6761)`, {
+    items: results,
+    applied: results.filter((r) => r.status === "applied").length,
+    skipped: results.filter((r) => r.status === "skipped_parent_unknown").length
+  });
+}
+function syncDiagReconcile(kind, fileId, detail) {
+  syncDiag(`reconcile ${kind}`, { fileId, ...detail });
+}
 
 // src/syncEngine.ts
 var SyncEngine = class {
@@ -890,6 +1682,8 @@ var SyncEngine = class {
     this.progress = () => {
     };
     this.successfulRemoteMtimes = [];
+    /** 上传/rename-remote 完成后批量刷新远端 mtime（fileId → localPath） */
+    this.mtimeRefreshQueue = /* @__PURE__ */ new Map();
     this.fsLocal = fsLocal;
     this.fsXgkb = fsXgkb;
     this.db = db;
@@ -897,13 +1691,26 @@ var SyncEngine = class {
     this.scopeKey = scopeKey;
     this.stats = this.emptyStats();
   }
+  get syncExtensions() {
+    return normalizeSyncExtensions(this.settings.syncFileExtensions);
+  }
   emptyStats() {
-    return { uploaded: 0, downloaded: 0, deleted: 0, skipped: 0, failed: 0, errors: [] };
+    return {
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      skipped: 0,
+      failed: 0,
+      errors: [],
+      renamed: 0,
+      moved: 0
+    };
   }
   async runSync(onProgress, since) {
-    var _a;
+    var _a, _b, _c;
     this.stats = this.emptyStats();
     this.successfulRemoteMtimes = [];
+    this.mtimeRefreshQueue.clear();
     this.progress = onProgress || (() => {
     });
     const prog = (msg) => {
@@ -915,11 +1722,11 @@ var SyncEngine = class {
     if (!initResult.ok)
       throw new Error(`\u521D\u59CB\u5316\u5931\u8D25: ${initResult.error}`);
     prog("\u626B\u63CF\u672C\u5730\u6587\u4EF6...");
-    const localFiles = this.fsLocal.listFiles();
-    prog(`\u672C\u5730: ${localFiles.length} \u4E2A .md \u6587\u4EF6`);
+    const localFiles = await this.fsLocal.listFiles();
+    prog(`\u672C\u5730: ${localFiles.length} \u4E2A\u6587\u4EF6\uFF08${formatSyncExtensionsLabel(normalizeSyncExtensions(this.settings.syncFileExtensions))}\uFF09`);
     const remoteBuild = await this.buildRemoteMap(since, prog);
     let remoteMap = remoteBuild.map;
-    prog(`\u4E91\u7AEF: ${remoteMap.size} \u4E2A .md \u6587\u4EF6\uFF08\u5019\u9009\u6C34\u4F4D ${remoteBuild.watermarkCandidate}\uFF09`);
+    prog(`\u4E91\u7AEF: ${remoteMap.size} \u4E2A\u6587\u4EF6\uFF08${formatSyncExtensionsLabel(normalizeSyncExtensions(this.settings.syncFileExtensions))}\uFF0C\u5019\u9009\u6C34\u4F4D ${remoteBuild.watermarkCandidate}\uFF09`);
     const retried = await this.injectFailedRetries(remoteMap, prog);
     this.stats.retriedFailed = retried;
     if (retried > 0) {
@@ -928,44 +1735,95 @@ var SyncEngine = class {
     const localMap = /* @__PURE__ */ new Map();
     for (const f of localFiles)
       localMap.set(f.path, f);
-    const allPaths = /* @__PURE__ */ new Set([...localMap.keys(), ...remoteMap.keys()]);
-    prog(`\u5171 ${allPaths.size} \u4E2A\u8DEF\u5F84\u9700\u8981\u5904\u7406`);
-    const plans = [];
+    const allRecords = await this.db.getAll(this.scopeKey);
+    const recordMap = /* @__PURE__ */ new Map();
+    for (const r of allRecords)
+      recordMap.set(r.localPath, r);
+    const consumedPaths = /* @__PURE__ */ new Set();
+    const rawReconcilePlans = this.buildPathReconcilePlans(
+      localMap,
+      remoteMap,
+      recordMap,
+      prog,
+      consumedPaths
+    );
+    const reconcilePlans = await this.collapseDirectoryReconcilePlans(
+      rawReconcilePlans,
+      allRecords,
+      prog
+    );
+    for (const plan of reconcilePlans) {
+      if (!plan.isDirectory)
+        continue;
+      for (const p of (_a = plan.consumedPaths) != null ? _a : [])
+        consumedPaths.add(p);
+    }
+    const allPaths = /* @__PURE__ */ new Set([
+      ...localMap.keys(),
+      ...remoteMap.keys(),
+      ...recordMap.keys()
+    ]);
+    prog(`\u5171 ${allPaths.size} \u4E2A\u8DEF\u5F84\u9700\u8981\u5904\u7406\uFF08\u542B rename ${reconcilePlans.length}\uFF09`);
+    const plans = [...reconcilePlans];
     let idx = 0;
+    const pathCount = allPaths.size;
     for (const path of allPaths) {
+      if (consumedPaths.has(path))
+        continue;
       idx++;
-      if (idx % 50 === 0 || idx === allPaths.size)
-        prog(`\u51B3\u7B56\u4E2D ${idx}/${allPaths.size}...`);
+      if (idx % 50 === 0 || idx === pathCount)
+        prog(`\u51B3\u7B56\u4E2D ${idx}/${pathCount}...`);
       const local = localMap.get(path);
       const remote = remoteMap.get(path);
-      const record = await this.db.get(this.scopeKey, path);
+      const record = recordMap.get(path);
       const op = this.decide(path, local, remote, record);
       plans.push({ path, local, remote, record, op });
     }
+    const renameLocalPlans = plans.filter((p) => p.op === "rename-local");
+    const renameRemotePlans = plans.filter((p) => p.op === "rename-remote");
+    const deletePlans = plans.filter((p) => p.op === "delete-local" || p.op === "delete-remote");
     const downloadPlans = plans.filter((p) => p.op === "download-new" || p.op === "download-update");
-    const otherPlans = plans.filter((p) => p.op !== "download-new" && p.op !== "download-update");
-    idx = 0;
-    for (const plan of otherPlans) {
-      idx++;
-      if (idx % 50 === 0 || idx === otherPlans.length) {
-        prog(`\u5904\u7406\u4E2D ${idx}/${otherPlans.length}\uFF08\u4E0A\u4F20/\u8DF3\u8FC7/\u5220\u9664\uFF09...`);
-      }
+    const uploadPlans = plans.filter((p) => p.op === "upload-new" || p.op === "upload-update");
+    const skipCount = plans.filter((p) => p.op === "skip").length;
+    this.stats.skipped += skipCount;
+    for (const plan of renameLocalPlans) {
+      await this.executePlan(plan);
+    }
+    for (const plan of deletePlans) {
       await this.executePlan(plan);
     }
     if (downloadPlans.length > 0) {
-      prog(`\u5F00\u59CB\u4E0B\u8F7D ${downloadPlans.length} \u4E2A\u6587\u4EF6\uFF08\u5E76\u53D1 ${DOWNLOAD_CONCURRENCY}\uFF0COSS \u76F4\u94FE\uFF09...`);
+      prog(`\u5F00\u59CB\u4E0B\u8F7D ${downloadPlans.length} \u4E2A\u6587\u4EF6\uFF08\u5E76\u53D1 ${DOWNLOAD_CONCURRENCY}\uFF09...`);
       let done = 0;
       await this.runWithConcurrency(downloadPlans, DOWNLOAD_CONCURRENCY, async (plan) => {
         await this.executePlan(plan);
         done++;
         if (done % 5 === 0 || done === downloadPlans.length) {
-          prog(`\u4E0B\u8F7D\u8FDB\u5EA6 ${done}/${downloadPlans.length}\uFF08\u5DF2\u5B8C\u6210 \u2193${this.stats.downloaded} \u5931\u8D25 ${this.stats.failed}\uFF09`);
+          prog(`\u4E0B\u8F7D\u8FDB\u5EA6 ${done}/${downloadPlans.length}\uFF08\u2193${this.stats.downloaded} \u5931\u8D25 ${this.stats.failed}\uFF09`);
         }
       });
     }
+    for (const plan of renameRemotePlans) {
+      await this.executePlan(plan);
+    }
+    if (uploadPlans.length > 0) {
+      prog(`\u5F00\u59CB\u4E0A\u4F20 ${uploadPlans.length} \u4E2A\u6587\u4EF6\uFF08\u5E76\u53D1 ${UPLOAD_CONCURRENCY}\uFF09...`);
+      let done = 0;
+      await this.runWithConcurrency(uploadPlans, UPLOAD_CONCURRENCY, async (plan) => {
+        await this.executePlan(plan);
+        done++;
+        if (done % 3 === 0 || done === uploadPlans.length) {
+          prog(`\u4E0A\u4F20\u8FDB\u5EA6 ${done}/${uploadPlans.length}\uFF08\u2191${this.stats.uploaded} \u5931\u8D25 ${this.stats.failed}\uFF09`);
+        }
+        if (done % UPLOAD_CONCURRENCY === 0) {
+          await this.delay(EXECUTE_BATCH_PAUSE_MS);
+        }
+      });
+    }
+    await this.flushMtimeRefreshQueue();
     this.stats.newSince = this.computeCommittedWatermark(remoteBuild);
     prog(
-      `\u5B8C\u6210: \u2191${this.stats.uploaded} \u2193${this.stats.downloaded} \u2717${this.stats.deleted} fail:${this.stats.failed} \u2205${this.stats.skipped} \u6C34\u4F4D=${(_a = this.stats.newSince) != null ? _a : "-"}`
+      `\u5B8C\u6210: \u2191${this.stats.uploaded} \u2193${this.stats.downloaded} \u21BB${(_b = this.stats.renamed) != null ? _b : 0} \u2717${this.stats.deleted} fail:${this.stats.failed} \u2205${this.stats.skipped} \u6C34\u4F4D=${(_c = this.stats.newSince) != null ? _c : "-"}`
     );
     return this.stats;
   }
@@ -994,6 +1852,13 @@ var SyncEngine = class {
       return 0;
     const ids = failed.map((r) => r.xgkbFileId).filter(Boolean);
     const metaMap = await this.fsXgkb.batchGetMetaAll(ids);
+    const folderIdToPath = this.buildFolderIdToPathFromRecords(all);
+    const parentIds = [];
+    for (const meta of metaMap.values()) {
+      if (meta.parentId != null)
+        parentIds.push(String(meta.parentId));
+    }
+    await this.hydrateFolderIdToPath(folderIdToPath, parentIds, prog);
     let injected = 0;
     for (const record of failed) {
       const meta = metaMap.get(record.xgkbFileId);
@@ -1002,12 +1867,15 @@ var SyncEngine = class {
         prog(`\u4E91\u7AEF\u5DF2\u5220\u9664\uFF0C\u6E05\u9664\u5931\u8D25\u8BB0\u5F55: ${record.localPath}`);
         continue;
       }
-      if (remoteMap.has(record.localPath))
+      const remotePath = meta ? this.remotePathFromMeta(meta, folderIdToPath, record.localPath) : record.localPath;
+      if (!pathMatchesSyncExtensions(remotePath, this.syncExtensions))
+        continue;
+      if (remoteMap.has(remotePath))
         continue;
       const mtime = (_a = meta == null ? void 0 : meta.updateTime) != null ? _a : record.remoteMtime;
-      remoteMap.set(record.localPath, {
-        path: record.localPath,
-        name: (meta == null ? void 0 : meta.name) || record.localPath.split("/").pop() || record.localPath,
+      remoteMap.set(remotePath, {
+        path: remotePath,
+        name: (meta == null ? void 0 : meta.name) || remotePath.split("/").pop() || remotePath,
         mtime,
         xgkbFileId: record.xgkbFileId,
         xgkbFolderId: (meta == null ? void 0 : meta.parentId) != null ? String(meta.parentId) : record.xgkbFolderId
@@ -1017,7 +1885,203 @@ var SyncEngine = class {
     if (injected > 0) {
       prog(`\u4ECE\u5931\u8D25\u961F\u5217\u6062\u590D ${injected} \u4E2A\u8DEF\u5F84\u5230\u4E91\u7AEF\u89C6\u56FE`);
     }
-    return failed.length;
+    return injected;
+  }
+  async delay(ms) {
+    return new Promise((resolve) => window.setTimeout(resolve, ms));
+  }
+  /** 同 fileId 路径不一致 → rename 计划（零额外 KB list 调用） */
+  buildPathReconcilePlans(localMap, remoteMap, recordMap, prog, consumed) {
+    const plans = [];
+    const dir = this.settings.syncDirection;
+    const fileIdToRemote = /* @__PURE__ */ new Map();
+    for (const remote of remoteMap.values()) {
+      if (remote.xgkbFileId)
+        fileIdToRemote.set(remote.xgkbFileId, remote);
+    }
+    for (const record of recordMap.values()) {
+      const remote = fileIdToRemote.get(record.xgkbFileId);
+      if (!remote) {
+        syncDiagReconcile("skip", record.xgkbFileId, {
+          reason: "remoteMap \u4E2D\u65E0\u6B64 fileId",
+          recordPath: record.localPath,
+          syncStatus: record.syncStatus
+        });
+        continue;
+      }
+      if (remote.path === record.localPath)
+        continue;
+      const localAtRecord = localMap.get(record.localPath);
+      const localAtRemote = localMap.get(remote.path);
+      syncDiagReconcile("match", record.xgkbFileId, {
+        recordPath: record.localPath,
+        remotePath: remote.path,
+        localAtRecord: Boolean(localAtRecord),
+        localAtRemote: Boolean(localAtRemote)
+      });
+      if (localAtRemote && !localAtRecord && remote.path !== record.localPath) {
+        let op2;
+        if (dir === "pull") {
+          op2 = "rename-local";
+        } else if (dir === "push") {
+          op2 = "rename-remote";
+        } else {
+          op2 = localAtRemote.mtime >= remote.mtime ? "rename-remote" : "rename-local";
+        }
+        if (op2 === "rename-local") {
+          plans.push({
+            path: record.localPath,
+            targetPath: remote.path,
+            local: localAtRemote,
+            remote,
+            record,
+            op: "rename-local"
+          });
+        } else {
+          plans.push({
+            path: remote.path,
+            remoteOldPath: record.localPath,
+            local: localAtRemote,
+            remote,
+            record,
+            op: "rename-remote"
+          });
+        }
+        consumed.add(record.localPath);
+        consumed.add(remote.path);
+        continue;
+      }
+      if (!localAtRecord || localAtRemote) {
+        syncDiagReconcile("skip", record.xgkbFileId, {
+          reason: !localAtRecord ? "\u672C\u5730\u65E0 record.localPath \u6587\u4EF6" : "remote.path \u5DF2\u88AB\u5176\u4ED6\u672C\u5730\u6587\u4EF6\u5360\u7528",
+          recordPath: record.localPath,
+          remotePath: remote.path,
+          localAtRecord: Boolean(localAtRecord),
+          localAtRemote: Boolean(localAtRemote)
+        });
+        continue;
+      }
+      let op = null;
+      if (dir === "pull") {
+        op = "rename-local";
+      } else if (dir === "push") {
+        op = "rename-remote";
+      } else {
+        op = localAtRecord.mtime >= remote.mtime ? "rename-remote" : "rename-local";
+      }
+      if (op === "rename-local") {
+        syncDiagReconcile("plan", record.xgkbFileId, {
+          op: "rename-local",
+          from: record.localPath,
+          to: remote.path
+        });
+        plans.push({
+          path: record.localPath,
+          targetPath: remote.path,
+          local: localAtRecord,
+          remote,
+          record,
+          op: "rename-local"
+        });
+      } else {
+        plans.push({
+          path: record.localPath,
+          remoteOldPath: remote.path,
+          local: localAtRecord,
+          remote,
+          record,
+          op: "rename-remote"
+        });
+      }
+      consumed.add(record.localPath);
+      consumed.add(remote.path);
+    }
+    if (plans.length > 0) {
+      prog(`fileId \u8DEF\u5F84\u5BF9\u8D26: ${plans.length} \u4E2A rename/move`);
+    } else {
+      syncDiag("reconcile \u672A\u751F\u6210\u8BA1\u5212\uFF08\u6240\u6709 fileId \u7684 remote.path === record.localPath \u6216\u5DF2 skip\uFF09");
+    }
+    return plans;
+  }
+  /** 将同前缀变更的多文件 rename 聚合为目录级计划（1 次 folder API） */
+  async collapseDirectoryReconcilePlans(plans, allRecords, prog) {
+    var _a, _b, _c, _d, _e;
+    const renamePlans = plans.filter((p) => p.op === "rename-local" || p.op === "rename-remote");
+    const others = plans.filter((p) => p.op !== "rename-local" && p.op !== "rename-remote");
+    if (renamePlans.length === 0)
+      return plans;
+    const groups = /* @__PURE__ */ new Map();
+    for (const plan of renamePlans) {
+      const op = plan.op;
+      const oldPath = op === "rename-local" ? plan.path : plan.remoteOldPath || ((_a = plan.remote) == null ? void 0 : _a.path);
+      const newPath = op === "rename-local" ? plan.targetPath : plan.path;
+      if (!oldPath || !newPath)
+        continue;
+      const prefix = deriveDirPrefixChange(oldPath, newPath);
+      if (!prefix)
+        continue;
+      const key = `${op}\0${prefix.oldPrefix}\0${prefix.newPrefix}`;
+      if (!groups.has(key)) {
+        groups.set(key, { op, ...prefix, items: [] });
+      }
+      groups.get(key).items.push(plan);
+    }
+    const collapsed = [...others];
+    const consumed = /* @__PURE__ */ new Set();
+    for (const group of groups.values()) {
+      const countPrefix = group.op === "rename-local" ? group.oldPrefix : group.newPrefix;
+      const totalUnderPrefix = allRecords.filter(
+        (r) => r.syncStatus !== "failed" && (r.localPath === countPrefix || r.localPath.startsWith(`${countPrefix}/`))
+      ).length;
+      const meetsThreshold = group.items.length >= DIR_RENAME_MIN_FILES && totalUnderPrefix > 0 && group.items.length >= totalUnderPrefix * DIR_RENAME_COVERAGE_RATIO;
+      if (!meetsThreshold) {
+        for (const item of group.items)
+          collapsed.push(item);
+        continue;
+      }
+      for (const item of group.items)
+        consumed.add(item);
+      const affectedRecords = group.items.map((p) => p.record).filter((r) => r != null);
+      const consumedPaths = /* @__PURE__ */ new Set();
+      for (const item of group.items) {
+        consumedPaths.add(item.path);
+        if (item.targetPath)
+          consumedPaths.add(item.targetPath);
+        if (item.remoteOldPath)
+          consumedPaths.add(item.remoteOldPath);
+        if ((_b = item.remote) == null ? void 0 : _b.path)
+          consumedPaths.add(item.remote.path);
+      }
+      let remoteFolderFileId = pickDirectChildFolderId(affectedRecords, group.oldPrefix);
+      if (!remoteFolderFileId) {
+        const resolved = await this.fsXgkb.resolveFolderIdForRelativePath(group.oldPrefix);
+        if (resolved.ok)
+          remoteFolderFileId = resolved.value;
+      }
+      const newFolderName = group.newPrefix.split("/").pop() || group.newPrefix;
+      collapsed.push({
+        op: group.op,
+        isDirectory: true,
+        path: group.oldPrefix,
+        directoryOldPath: group.oldPrefix,
+        directoryNewPath: group.newPrefix,
+        newFolderName,
+        remoteFolderFileId,
+        affectedRecords,
+        consumedPaths: [...consumedPaths],
+        local: (_c = group.items[0]) == null ? void 0 : _c.local,
+        remote: (_d = group.items[0]) == null ? void 0 : _d.remote,
+        record: (_e = group.items[0]) == null ? void 0 : _e.record
+      });
+    }
+    for (const plan of renamePlans) {
+      if (!consumed.has(plan))
+        collapsed.push(plan);
+    }
+    const dirCount = collapsed.filter((p) => p.isDirectory).length;
+    if (dirCount > 0)
+      prog(`\u76EE\u5F55\u7EA7 rename/move: ${dirCount} \u7EC4\uFF08\u7531 ${renamePlans.length} \u4E2A\u6587\u4EF6\u8BA1\u5212\u805A\u5408\uFF09`);
+    return collapsed;
   }
   async runWithConcurrency(items, concurrency, fn) {
     let cursor = 0;
@@ -1045,6 +2109,7 @@ var SyncEngine = class {
     return this.fullRemoteMap();
   }
   async tryIncrementalRemoteMap(since, prog) {
+    var _a;
     const safeSince = since - CHANGES_SAFETY_WINDOW_MS;
     const changesResult = await this.fsXgkb.listAllChanges(safeSince);
     if (!changesResult.ok) {
@@ -1069,33 +2134,116 @@ var SyncEngine = class {
       fileIdToRecord.set(r.xgkbFileId, r);
     const knownUpsertIds = [];
     const unknownUpsertIds = [];
-    for (const id of upsertById.keys()) {
+    const folderUpsertIds = [];
+    for (const [id, item] of upsertById) {
+      if (item.type === XGKB_NODE_FOLDER) {
+        folderUpsertIds.push(id);
+        continue;
+      }
       if (fileIdToRecord.has(id))
         knownUpsertIds.push(id);
       else
         unknownUpsertIds.push(id);
     }
     prog(
-      `\u53D8\u66F4\u5206\u7C7B: upsert\u5DF2\u77E5=${knownUpsertIds.length} upsert\u65B0\u589E=${unknownUpsertIds.length} delete=${deleteIds.size}`
+      `\u53D8\u66F4\u5206\u7C7B: upsert\u5DF2\u77E5=${knownUpsertIds.length} upsert\u65B0\u589E=${unknownUpsertIds.length} delete=${deleteIds.size} \u76EE\u5F55=${folderUpsertIds.length}`
     );
-    const folderIdToPath = /* @__PURE__ */ new Map();
-    const rootId = this.fsXgkb.getRootId();
-    if (rootId)
-      folderIdToPath.set(rootId, "");
-    for (const record of allRecords) {
-      const parts = record.localPath.split("/");
-      const folderPath = parts.length > 1 ? parts.slice(0, -1).join("/") : "";
-      folderIdToPath.set(record.xgkbFolderId, folderPath);
+    if (items.length > 0 && items.length <= 30) {
+      syncDiagListChangesItems(items);
+    }
+    const folderIdToPath = this.buildFolderIdToPathFromRecords(allRecords);
+    const folderUpsertParentIds = [];
+    for (const id of folderUpsertIds) {
+      const item = upsertById.get(id);
+      if (item.parentId != null)
+        folderUpsertParentIds.push(String(item.parentId));
+    }
+    if (folderUpsertParentIds.length > 0) {
+      syncDiagHydrate("\u76EE\u5F55 upsert \u524D\u5148\u8865\u9F50\u7236\u76EE\u5F55", {
+        folderUpsertIds,
+        parentIds: [...new Set(folderUpsertParentIds)]
+      });
+      if (!await this.hydrateFolderIdToPath(folderIdToPath, folderUpsertParentIds, prog)) {
+        return null;
+      }
+    }
+    const folderUpsertResults = this.applyFolderUpsertsToPathMap(upsertById, folderIdToPath);
+    if (folderUpsertResults.length > 0) {
+      syncDiagFolderUpsertApply(folderUpsertResults);
+      const skipped = folderUpsertResults.filter((r) => r.status === "skipped_parent_unknown");
+      if (skipped.length > 0) {
+        prog(`\u76EE\u5F55 upsert \u65E0\u6CD5\u89E3\u6790\u7236\u8DEF\u5F84 (${skipped.length} \u6761)\uFF0C\u964D\u7EA7\u5168\u91CF\u5BF9\u8D26...`);
+        return null;
+      }
+    }
+    if (knownUpsertIds.length > 0 || folderUpsertIds.length > 0) {
+      const seedIds = /* @__PURE__ */ new Set([...folderUpsertIds, ...folderUpsertParentIds]);
+      for (const id of knownUpsertIds) {
+        const r = fileIdToRecord.get(id);
+        seedIds.add(r.xgkbFolderId);
+        const item = upsertById.get(id);
+        if (item.parentId != null)
+          seedIds.add(String(item.parentId));
+      }
+      syncDiagFolderMapSnapshot("applyFolderUpserts \u540E folderIdToPath\uFF08\u76F8\u5173 id\uFF09", folderIdToPath, seedIds);
+    }
+    let knownMetaMap = /* @__PURE__ */ new Map();
+    if (knownUpsertIds.length > 0) {
+      prog(`\u6279\u91CF\u83B7\u53D6 ${knownUpsertIds.length} \u4E2A\u53D8\u66F4\u6587\u4EF6\u5143\u6570\u636E...`);
+      knownMetaMap = await this.fsXgkb.batchGetMetaAll(knownUpsertIds);
+    }
+    const folderIdsToHydrate = [];
+    for (const id of knownUpsertIds) {
+      const item = upsertById.get(id);
+      const meta = knownMetaMap.get(id);
+      const record = fileIdToRecord.get(id);
+      const parentId = this.effectiveParentId(item, meta);
+      if (!parentId)
+        continue;
+      if (parentId !== record.xgkbFolderId || !folderIdToPath.has(parentId)) {
+        folderIdsToHydrate.push(parentId);
+      }
+    }
+    for (const id of unknownUpsertIds) {
+      const item = upsertById.get(id);
+      if (item.parentId != null)
+        folderIdsToHydrate.push(String(item.parentId));
+    }
+    if (folderIdsToHydrate.length > 0) {
+      syncDiagHydrate("\u5F85\u8865\u9F50\u76EE\u5F55\u94FE", {
+        seedFolderIds: [...new Set(folderIdsToHydrate.map(String))]
+      });
+    }
+    if (!await this.hydrateFolderIdToPath(folderIdToPath, folderIdsToHydrate, prog)) {
+      return null;
+    }
+    if (knownUpsertIds.length > 0) {
+      const afterHydrate = /* @__PURE__ */ new Set();
+      for (const id of knownUpsertIds) {
+        const r = fileIdToRecord.get(id);
+        const item = upsertById.get(id);
+        const meta = knownMetaMap.get(id);
+        afterHydrate.add(r.xgkbFolderId);
+        if (item.parentId != null)
+          afterHydrate.add(String(item.parentId));
+        if ((meta == null ? void 0 : meta.parentId) != null)
+          afterHydrate.add(String(meta.parentId));
+      }
+      syncDiagFolderMapSnapshot("hydrate \u540E folderIdToPath\uFF08\u76F8\u5173 id\uFF09", folderIdToPath, afterHydrate);
     }
     const resolvedNewFiles = [];
     const unresolvedIds = [];
     for (const id of unknownUpsertIds) {
       const item = upsertById.get(id);
+      if (item.type === XGKB_NODE_FOLDER)
+        continue;
       const parentId = item.parentId != null ? String(item.parentId) : "";
       const folderPath = folderIdToPath.get(parentId);
       if (folderPath !== void 0) {
         const safeName = sanitizePathSegment(item.name || id);
         const filePath = folderPath ? `${folderPath}/${safeName}` : safeName;
+        if (!pathMatchesSyncExtensions(filePath, this.syncExtensions))
+          continue;
         resolvedNewFiles.push({ id, path: filePath, item });
       } else {
         unresolvedIds.push(id);
@@ -1115,32 +2263,69 @@ var SyncEngine = class {
       const id = record.xgkbFileId;
       if (deleteIds.has(id) || upsertById.has(id))
         continue;
-      map.set(record.localPath, {
-        path: record.localPath,
-        name: record.localPath.split("/").pop() || record.localPath,
+      const remotePath = this.remotePathForRecord(record, folderIdToPath);
+      map.set(remotePath, {
+        path: remotePath,
+        name: remotePath.split("/").pop() || remotePath,
         mtime: record.remoteMtime,
         xgkbFileId: id,
         xgkbFolderId: record.xgkbFolderId
       });
     }
     if (knownUpsertIds.length > 0) {
-      prog(`\u6279\u91CF\u83B7\u53D6 ${knownUpsertIds.length} \u4E2A\u53D8\u66F4\u6587\u4EF6\u5143\u6570\u636E...`);
-      const metaMap = await this.fsXgkb.batchGetMetaAll(knownUpsertIds);
       for (const id of knownUpsertIds) {
-        const meta = metaMap.get(id);
+        const item = upsertById.get(id);
+        const meta = knownMetaMap.get(id);
         const record = fileIdToRecord.get(id);
-        if (!meta || meta.deleted)
+        if (!meta) {
+          prog(`\u53D8\u66F4\u6587\u4EF6 meta \u7F3A\u5931 fileId=${id}\uFF0C\u964D\u7EA7\u5168\u91CF\u5BF9\u8D26...`);
+          return null;
+        }
+        if (meta.deleted) {
+          syncDiag("knownUpsert \u8DF3\u8FC7: meta.deleted", { fileId: id });
           continue;
-        map.set(record.localPath, {
-          path: record.localPath,
-          name: meta.name || record.localPath.split("/").pop() || record.localPath,
-          mtime: meta.updateTime || record.remoteMtime,
+        }
+        syncDiagKnownUpsert(id, record, item, meta, folderIdToPath);
+        const newParentId = this.effectiveParentId(item, meta);
+        const fileNameUsed = (_a = item.name) != null ? _a : meta.name;
+        const folderPathFromMap = newParentId ? folderIdToPath.get(newParentId) : void 0;
+        const remotePath = this.remotePathFromParent(
+          newParentId,
+          fileNameUsed,
+          folderIdToPath,
+          record.localPath
+        );
+        const usedFallback = remotePath === record.localPath && (!newParentId || folderPathFromMap === void 0);
+        syncDiagPathResolve(id, record.localPath, remotePath, {
+          parentIdUsed: newParentId,
+          fileNameUsed: fileNameUsed || record.localPath.split("/").pop() || "",
+          folderPathFromMap,
+          usedFallback
+        });
+        if (newParentId && newParentId !== record.xgkbFolderId && remotePath === record.localPath) {
+          syncDiag("parentId \u5DF2\u53D8\u4F46\u8DEF\u5F84\u672A\u53D8 \u2192 \u964D\u7EA7\u5168\u91CF", {
+            fileId: id,
+            oldParentId: record.xgkbFolderId,
+            newParentId,
+            folderPathFromMap: folderPathFromMap != null ? folderPathFromMap : null
+          });
+          prog(`\u79FB\u52A8\u540E\u8DEF\u5F84\u65E0\u6CD5\u4ECE\u589E\u91CF\u91CD\u5EFA\uFF0C\u964D\u7EA7\u5168\u91CF\u5BF9\u8D26...`);
+          return null;
+        }
+        if (!pathMatchesSyncExtensions(remotePath, this.syncExtensions))
+          continue;
+        map.set(remotePath, {
+          path: remotePath,
+          name: item.name || meta.name || remotePath.split("/").pop() || remotePath,
+          mtime: item.updateTime || meta.updateTime || record.remoteMtime,
           xgkbFileId: id,
-          xgkbFolderId: meta.parentId != null ? String(meta.parentId) : record.xgkbFolderId
+          xgkbFolderId: newParentId || record.xgkbFolderId
         });
       }
     }
     for (const { id, path, item } of resolvedNewFiles) {
+      if (!pathMatchesSyncExtensions(path, this.syncExtensions))
+        continue;
       map.set(path, {
         path,
         name: item.name || path.split("/").pop() || path,
@@ -1150,6 +2335,191 @@ var SyncEngine = class {
       });
     }
     return { map, watermarkCandidate, scanMode: "incremental" };
+  }
+  buildFolderIdToPathFromRecords(records) {
+    const folderIdToPath = /* @__PURE__ */ new Map();
+    const rootId = this.fsXgkb.getRootId();
+    if (rootId)
+      folderIdToPath.set(rootId, "");
+    for (const record of records) {
+      const parts = record.localPath.split("/");
+      const folderPath = parts.length > 1 ? parts.slice(0, -1).join("/") : "";
+      folderIdToPath.set(record.xgkbFolderId, folderPath);
+    }
+    return folderIdToPath;
+  }
+  /** listChanges 中的目录 upsert → 更新 folderId 对应路径（远端目录改名/新建） */
+  applyFolderUpsertsToPathMap(upsertById, folderIdToPath) {
+    var _a;
+    const results = [];
+    let changed = true;
+    let pass = 0;
+    const maxPasses = upsertById.size + 1;
+    while (changed && pass < maxPasses) {
+      pass++;
+      changed = false;
+      for (const item of upsertById.values()) {
+        if (item.type !== XGKB_NODE_FOLDER)
+          continue;
+        const folderId = String(item.fileId);
+        const parentId = item.parentId != null ? String(item.parentId) : "";
+        const oldPath = (_a = folderIdToPath.get(folderId)) != null ? _a : null;
+        const parentPath = folderIdToPath.get(parentId);
+        if (parentPath === void 0) {
+          if (pass === 1) {
+            results.push({
+              folderId,
+              name: item.name || folderId,
+              parentId,
+              oldPath,
+              newPath: null,
+              status: "skipped_parent_unknown"
+            });
+          }
+          continue;
+        }
+        const seg = sanitizePathSegment(item.name || folderId);
+        const nextPath = parentPath ? `${parentPath}/${seg}` : seg;
+        if (folderIdToPath.get(folderId) !== nextPath) {
+          folderIdToPath.set(folderId, nextPath);
+          changed = true;
+          const existing = results.find((r) => r.folderId === folderId);
+          if (existing) {
+            existing.newPath = nextPath;
+            existing.status = "applied";
+          } else {
+            results.push({
+              folderId,
+              name: item.name || folderId,
+              parentId,
+              oldPath,
+              newPath: nextPath,
+              status: "applied"
+            });
+          }
+        } else if (pass === 1 && !results.some((r) => r.folderId === folderId)) {
+          results.push({
+            folderId,
+            name: item.name || folderId,
+            parentId,
+            oldPath,
+            newPath: nextPath,
+            status: "unchanged"
+          });
+        }
+      }
+    }
+    return results;
+  }
+  /**
+   * 通过 batchGetMeta 向上补齐缺失的 folderId→路径（跨目录 move 时中间目录可能不在本地 IDB 中）。
+   */
+  async hydrateFolderIdToPath(folderIdToPath, seedFolderIds, prog) {
+    const rootId = this.fsXgkb.getRootId();
+    if (rootId)
+      folderIdToPath.set(rootId, "");
+    const pending = /* @__PURE__ */ new Set();
+    for (const id of seedFolderIds) {
+      const sid = String(id);
+      if (sid && sid !== rootId && !folderIdToPath.has(sid))
+        pending.add(sid);
+    }
+    if (pending.size === 0) {
+      syncDiagHydrate("\u65E0\u9700\u8BF7\u6C42\uFF08seed \u5747\u5DF2\u5728 folderIdToPath \u4E2D\uFF09", {
+        seedCount: [...seedFolderIds].length
+      });
+      return true;
+    }
+    syncDiagHydrate("\u5F00\u59CB\u8BF7\u6C42\u76EE\u5F55 meta", { pendingIds: [...pending] });
+    const metaById = /* @__PURE__ */ new Map();
+    const maxFetchRounds = 32;
+    let fetchRound = 0;
+    while (pending.size > 0 && fetchRound < maxFetchRounds) {
+      fetchRound++;
+      const batch = [...pending];
+      pending.clear();
+      const fetched = await this.fsXgkb.batchGetMetaAll(batch);
+      for (const id of batch) {
+        const meta = fetched.get(id);
+        if (!meta || meta.deleted) {
+          prog(`\u76EE\u5F55\u5143\u6570\u636E\u7F3A\u5931 fileId=${id}\uFF0C\u964D\u7EA7\u5168\u91CF\u5BF9\u8D26...`);
+          return false;
+        }
+        metaById.set(id, meta);
+        syncDiagHydrate("\u76EE\u5F55 meta", {
+          folderId: id,
+          name: meta.name,
+          parentId: meta.parentId != null ? String(meta.parentId) : null
+        });
+        const parentId = meta.parentId != null ? String(meta.parentId) : "";
+        if (parentId && parentId !== id && parentId !== rootId && !folderIdToPath.has(parentId)) {
+          pending.add(parentId);
+        }
+      }
+    }
+    if (pending.size > 0) {
+      prog("\u76EE\u5F55\u94FE\u8DEF\u8FC7\u6DF1\u6216\u672A\u89E3\u6790\uFF0C\u964D\u7EA7\u5168\u91CF\u5BF9\u8D26...");
+      return false;
+    }
+    let changed = true;
+    let assignPass = 0;
+    while (changed && assignPass < metaById.size + 1) {
+      assignPass++;
+      changed = false;
+      for (const [folderId, meta] of metaById) {
+        const parentId = meta.parentId != null ? String(meta.parentId) : "";
+        const parentPath = parentId === rootId || parentId === "" || parentId === "0" ? folderIdToPath.has(rootId || "") || parentId === rootId ? "" : void 0 : folderIdToPath.get(parentId);
+        if (parentPath === void 0)
+          continue;
+        const seg = sanitizePathSegment(meta.name || folderId);
+        const nextPath = parentPath ? `${parentPath}/${seg}` : seg;
+        if (folderIdToPath.get(folderId) !== nextPath) {
+          folderIdToPath.set(folderId, nextPath);
+          changed = true;
+        }
+      }
+    }
+    for (const folderId of metaById.keys()) {
+      if (!folderIdToPath.has(folderId)) {
+        prog(`\u65E0\u6CD5\u89E3\u6790\u76EE\u5F55\u8DEF\u5F84 folderId=${folderId}\uFF0C\u964D\u7EA7\u5168\u91CF\u5BF9\u8D26...`);
+        return false;
+      }
+    }
+    if (metaById.size > 0) {
+      prog(`\u8865\u5145\u89E3\u6790 ${metaById.size} \u4E2A\u76EE\u5F55\u8DEF\u5F84`);
+    }
+    return true;
+  }
+  remotePathForRecord(record, folderIdToPath) {
+    const fileName = record.localPath.split("/").pop() || record.localPath;
+    const folderPath = folderIdToPath.get(record.xgkbFolderId);
+    if (folderPath === void 0)
+      return record.localPath;
+    return folderPath ? `${folderPath}/${fileName}` : fileName;
+  }
+  effectiveParentId(item, meta) {
+    if ((item == null ? void 0 : item.parentId) != null)
+      return String(item.parentId);
+    if ((meta == null ? void 0 : meta.parentId) != null)
+      return String(meta.parentId);
+    return "";
+  }
+  remotePathFromParent(parentId, fileName, folderIdToPath, fallback) {
+    if (!parentId)
+      return fallback;
+    const folderPath = folderIdToPath.get(parentId);
+    if (folderPath === void 0)
+      return fallback;
+    const name = sanitizePathSegment(fileName || fallback.split("/").pop() || fallback);
+    return folderPath ? `${folderPath}/${name}` : name;
+  }
+  remotePathFromMeta(meta, folderIdToPath, fallback) {
+    return this.remotePathFromParent(
+      meta.parentId != null ? String(meta.parentId) : "",
+      meta.name,
+      folderIdToPath,
+      fallback
+    );
   }
   async fullRemoteMap() {
     const remoteResult = await this.fsXgkb.listFiles();
@@ -1170,6 +2540,7 @@ var SyncEngine = class {
     return { map, watermarkCandidate, scanMode: "full" };
   }
   async executePlan(plan) {
+    var _a, _b, _c;
     const { path, local, remote, record, op } = plan;
     try {
       switch (op) {
@@ -1180,10 +2551,26 @@ var SyncEngine = class {
           await this.doUploadUpdate(path, local, remote, record);
           break;
         case "download-new":
-          await this.doDownload(path, remote, record);
-          break;
         case "download-update":
           await this.doDownload(path, remote, record);
+          break;
+        case "rename-local":
+          if (plan.isDirectory)
+            await this.doRenameLocalDirectory(plan);
+          else
+            await this.doRenameLocal(plan);
+          break;
+        case "rename-remote":
+          if (plan.isDirectory) {
+            const oldParent = parentPathOf((_a = plan.directoryOldPath) != null ? _a : "");
+            const newParent = parentPathOf((_b = plan.directoryNewPath) != null ? _b : "");
+            if (oldParent === newParent)
+              await this.doRenameRemoteDirectory(plan);
+            else
+              await this.doMoveRemoteDirectory(plan);
+          } else {
+            await this.doRenameRemote(plan);
+          }
           break;
         case "delete-local":
           await this.doDeleteLocal(path, record);
@@ -1192,7 +2579,6 @@ var SyncEngine = class {
           await this.doDeleteRemote(record);
           break;
         case "skip":
-          this.stats.skipped++;
           break;
       }
     } catch (e) {
@@ -1200,19 +2586,30 @@ var SyncEngine = class {
       this.stats.failed++;
       this.stats.errors.push(`${path}: ${msg}`);
       console.error(`[XGKB Sync] \u540C\u6B65\u5931\u8D25 ${path}:`, msg);
-      if ((op === "download-new" || op === "download-update") && remote) {
-        await this.recordDownloadFailure(path, remote, record, msg);
+      if (op !== "skip" && op !== "delete-local" && op !== "delete-remote") {
+        const failRecords = plan.isDirectory && ((_c = plan.affectedRecords) == null ? void 0 : _c.length) ? plan.affectedRecords : record ? [record] : [];
+        for (const r of failRecords) {
+          await this.recordFailure(r.localPath, remote, r, msg);
+        }
+        if (failRecords.length === 0) {
+          await this.recordFailure(path, remote, record, msg);
+        }
       }
     }
   }
   decide(path, local, remote, record) {
     const dir = this.settings.syncDirection;
     if ((record == null ? void 0 : record.syncStatus) === "failed") {
-      if (!remote)
-        return "skip";
+      if (!remote) {
+        return local && dir !== "pull" ? "upload-new" : "skip";
+      }
+      if (dir === "pull")
+        return "download-update";
       if (dir === "push")
-        return "skip";
-      return "download-update";
+        return local ? "upload-update" : "skip";
+      if (!local)
+        return "download-update";
+      return local.mtime >= remote.mtime ? "upload-update" : "download-update";
     }
     if (!record) {
       if (local && !remote)
@@ -1240,7 +2637,11 @@ var SyncEngine = class {
       if (dir === "pull")
         return "skip";
       const localChanged = local.mtime > record.localMtime + MTIME_TOLERANCE_MS;
-      return localChanged ? "upload-new" : "delete-local";
+      if (localChanged)
+        return "upload-new";
+      if (record.xgkbFileId)
+        return "skip";
+      return "delete-local";
     }
     if (local && remote) {
       const localChanged = local.mtime > record.localMtime + MTIME_TOLERANCE_MS;
@@ -1273,40 +2674,65 @@ var SyncEngine = class {
       ...partial.lastError !== void 0 ? { lastError: partial.lastError } : {}
     };
   }
-  async recordDownloadFailure(path, remote, record, msg) {
-    var _a, _b, _c;
+  async recordFailure(path, remote, record, msg) {
+    var _a, _b, _c, _d, _e, _f;
+    const fileId = (_a = remote == null ? void 0 : remote.xgkbFileId) != null ? _a : record == null ? void 0 : record.xgkbFileId;
+    if (!fileId)
+      return;
     await this.db.put(
       this.buildDbRecord(path, {
-        xgkbFileId: remote.xgkbFileId,
-        xgkbFolderId: (_b = (_a = record == null ? void 0 : record.xgkbFolderId) != null ? _a : remote.xgkbFolderId) != null ? _b : "",
-        localMtime: (_c = record == null ? void 0 : record.localMtime) != null ? _c : 0,
-        remoteMtime: remote.mtime,
+        xgkbFileId: fileId,
+        xgkbFolderId: (_c = (_b = record == null ? void 0 : record.xgkbFolderId) != null ? _b : remote == null ? void 0 : remote.xgkbFolderId) != null ? _c : "",
+        localMtime: (_d = record == null ? void 0 : record.localMtime) != null ? _d : 0,
+        remoteMtime: (_f = (_e = remote == null ? void 0 : remote.mtime) != null ? _e : record == null ? void 0 : record.remoteMtime) != null ? _f : 0,
         syncStatus: "failed",
         lastError: msg
       })
     );
+  }
+  queueMtimeRefresh(fileId, localPath) {
+    this.mtimeRefreshQueue.set(fileId, localPath);
+  }
+  /** 批次结束后一次 batchGetMeta，避免上传/rename 逐文件查 meta */
+  async flushMtimeRefreshQueue() {
+    if (this.mtimeRefreshQueue.size === 0)
+      return;
+    const pending = [...this.mtimeRefreshQueue.entries()];
+    this.mtimeRefreshQueue.clear();
+    const metaMap = await this.fsXgkb.batchGetMetaAll(pending.map(([id]) => id));
+    for (const [fileId, localPath] of pending) {
+      const meta = metaMap.get(fileId);
+      if ((meta == null ? void 0 : meta.updateTime) == null)
+        continue;
+      const record = await this.db.get(this.scopeKey, localPath);
+      if (!record)
+        continue;
+      await this.db.put({ ...record, remoteMtime: meta.updateTime, lastSyncAt: Date.now() });
+      this.successfulRemoteMtimes.push(meta.updateTime);
+    }
   }
   async doUploadNew(path, local) {
     const content = await this.fsLocal.readFile(path);
     const result = await this.fsXgkb.createFile(path, content);
     if (!result.ok)
       throw new Error(`\u4E0A\u4F20\u5931\u8D25: ${result.error}`);
-    const remoteMtime = Date.now();
+    const fileId = result.value.fileId;
     await this.db.put(
       this.buildDbRecord(path, {
-        xgkbFileId: result.value.fileId,
+        xgkbFileId: fileId,
         xgkbFolderId: result.value.folderId,
         localMtime: local.mtime,
-        remoteMtime
+        remoteMtime: Date.now(),
+        syncStatus: "done"
       })
     );
-    this.successfulRemoteMtimes.push(remoteMtime);
+    this.queueMtimeRefresh(fileId, path);
     this.stats.uploaded++;
     this.progress(`\u2191 ${path}`);
   }
   async doUploadUpdate(path, local, remote, record) {
-    var _a, _b, _c;
-    const fileId = (_a = record == null ? void 0 : record.xgkbFileId) != null ? _a : remote.xgkbFileId;
+    var _a, _b, _c, _d, _e;
+    const fileId = (_a = remote == null ? void 0 : remote.xgkbFileId) != null ? _a : record == null ? void 0 : record.xgkbFileId;
     if (!fileId)
       throw new Error("\u7F3A\u5C11\u4E91\u7AEF\u6587\u4EF6 ID\uFF0C\u65E0\u6CD5\u66F4\u65B0");
     const content = await this.fsLocal.readFile(path);
@@ -1314,18 +2740,180 @@ var SyncEngine = class {
     const result = await this.fsXgkb.updateFile(fileId, fileName, content);
     if (!result.ok)
       throw new Error(`\u66F4\u65B0\u5931\u8D25: ${result.error}`);
-    const remoteMtime = Date.now();
+    const interimMtime = (_c = (_b = remote == null ? void 0 : remote.mtime) != null ? _b : record == null ? void 0 : record.remoteMtime) != null ? _c : Date.now();
     await this.db.put(
       this.buildDbRecord(path, {
         xgkbFileId: fileId,
-        xgkbFolderId: (_c = (_b = record == null ? void 0 : record.xgkbFolderId) != null ? _b : remote.xgkbFolderId) != null ? _c : "",
+        xgkbFolderId: (_e = (_d = record == null ? void 0 : record.xgkbFolderId) != null ? _d : remote == null ? void 0 : remote.xgkbFolderId) != null ? _e : "",
         localMtime: local.mtime,
-        remoteMtime
+        remoteMtime: interimMtime,
+        syncStatus: "done"
       })
     );
-    this.successfulRemoteMtimes.push(remoteMtime);
+    this.queueMtimeRefresh(fileId, path);
     this.stats.uploaded++;
     this.progress(`\u2191 ${path}`);
+  }
+  async doRenameLocal(plan) {
+    var _a, _b, _c, _d, _e;
+    const { record, local, targetPath } = plan;
+    if (!record || !local || !targetPath)
+      throw new Error("rename-local \u53C2\u6570\u4E0D\u5B8C\u6574");
+    let actualMtime = local.mtime;
+    if (record.localPath !== targetPath) {
+      try {
+        actualMtime = await this.fsLocal.renameFile(record.localPath, targetPath);
+      } catch (e) {
+        const atTarget = await this.fsLocal.getMtime(targetPath);
+        if (atTarget == null)
+          throw e;
+        actualMtime = atTarget;
+      }
+    }
+    await this.db.delete(this.scopeKey, record.localPath);
+    await this.db.put(
+      this.buildDbRecord(targetPath, {
+        xgkbFileId: record.xgkbFileId,
+        xgkbFolderId: (_b = (_a = plan.remote) == null ? void 0 : _a.xgkbFolderId) != null ? _b : record.xgkbFolderId,
+        localMtime: actualMtime,
+        remoteMtime: (_d = (_c = plan.remote) == null ? void 0 : _c.mtime) != null ? _d : record.remoteMtime,
+        syncStatus: "done"
+      })
+    );
+    this.stats.renamed = ((_e = this.stats.renamed) != null ? _e : 0) + 1;
+    this.progress(`\u21BB \u672C\u5730 ${record.localPath} \u2192 ${targetPath}`);
+  }
+  async doRenameRemote(plan) {
+    var _a, _b, _c, _d;
+    const { local, path, remote, remoteOldPath } = plan;
+    let { record } = plan;
+    if (!record || !local || !remote)
+      throw new Error("rename-remote \u53C2\u6570\u4E0D\u5B8C\u6574");
+    const fileId = record.xgkbFileId;
+    const oldRemotePath = remoteOldPath || remote.path;
+    const newFileName = path.split("/").pop() || path;
+    const oldParent = parentPathOf(oldRemotePath);
+    const newParent = parentPathOf(path);
+    if (oldParent === newParent) {
+      const r = await this.fsXgkb.renameRemoteFile(fileId, newFileName);
+      if (!r.ok)
+        throw new Error(r.error);
+      this.stats.renamed = ((_a = this.stats.renamed) != null ? _a : 0) + 1;
+    } else {
+      const folderResult = await this.fsXgkb.resolveFolderIdForRelativePath(newParent);
+      if (!folderResult.ok)
+        throw new Error(folderResult.error);
+      const targetFolderId = folderResult.value;
+      const moveResult = await this.fsXgkb.moveRemoteFile(fileId, targetFolderId);
+      if (!moveResult.ok)
+        throw new Error(moveResult.error);
+      const oldName = oldRemotePath.split("/").pop() || "";
+      if (oldName !== newFileName) {
+        const renameResult = await this.fsXgkb.renameRemoteFile(fileId, newFileName);
+        if (!renameResult.ok)
+          throw new Error(renameResult.error);
+      }
+      this.stats.moved = ((_b = this.stats.moved) != null ? _b : 0) + 1;
+      record = { ...record, xgkbFolderId: targetFolderId };
+    }
+    const interimMtime = (_d = (_c = plan.remote) == null ? void 0 : _c.mtime) != null ? _d : record.remoteMtime;
+    await this.db.put(
+      this.buildDbRecord(path, {
+        xgkbFileId: fileId,
+        xgkbFolderId: record.xgkbFolderId,
+        localMtime: local.mtime,
+        remoteMtime: interimMtime,
+        syncStatus: "done"
+      })
+    );
+    this.queueMtimeRefresh(fileId, path);
+    this.progress(`\u21BB \u8FDC\u7AEF \u2192 ${path}`);
+  }
+  async doRenameLocalDirectory(plan) {
+    var _a;
+    const oldPrefix = plan.directoryOldPath;
+    const newPrefix = plan.directoryNewPath;
+    if (!oldPrefix || !newPrefix)
+      throw new Error("rename-local(\u76EE\u5F55) \u53C2\u6570\u4E0D\u5B8C\u6574");
+    await this.fsLocal.renameFolder(oldPrefix, newPrefix);
+    const moved = await this.db.relocateRecordsByPrefix(this.scopeKey, oldPrefix, newPrefix);
+    this.stats.renamed = ((_a = this.stats.renamed) != null ? _a : 0) + 1;
+    this.progress(`\u21BB \u672C\u5730\u76EE\u5F55 ${oldPrefix} \u2192 ${newPrefix}\uFF08${moved} \u4E2A\u6587\u4EF6\uFF09`);
+  }
+  async doRenameRemoteDirectory(plan) {
+    var _a;
+    const {
+      directoryOldPath: oldPrefix,
+      directoryNewPath: newPrefix,
+      remoteFolderFileId,
+      newFolderName,
+      affectedRecords = []
+    } = plan;
+    if (!oldPrefix || !newPrefix || !remoteFolderFileId || !newFolderName) {
+      throw new Error("rename-remote(\u76EE\u5F55) \u7F3A\u5C11 remoteFolderFileId \u6216\u76EE\u5F55\u8DEF\u5F84");
+    }
+    const r = await this.fsXgkb.renameRemoteFile(remoteFolderFileId, newFolderName);
+    if (!r.ok)
+      throw new Error(r.error);
+    await this.db.relocateRecordsByPrefix(this.scopeKey, oldPrefix, newPrefix);
+    for (const rec of affectedRecords) {
+      const suffix = rec.localPath.slice(oldPrefix.length);
+      const newPath = `${newPrefix}${suffix}`;
+      if (rec.xgkbFileId)
+        this.queueMtimeRefresh(rec.xgkbFileId, newPath);
+    }
+    this.stats.renamed = ((_a = this.stats.renamed) != null ? _a : 0) + 1;
+    this.progress(
+      `\u21BB \u8FDC\u7AEF\u76EE\u5F55 ${oldPrefix} \u2192 ${newPrefix}\uFF08${affectedRecords.length} \u4E2A\u6587\u4EF6\uFF0C1 \u6B21 updateFileName\uFF09`
+    );
+  }
+  async doMoveRemoteDirectory(plan) {
+    var _a;
+    const {
+      directoryOldPath: oldPrefix,
+      directoryNewPath: newPrefix,
+      remoteFolderFileId,
+      newFolderName,
+      affectedRecords = []
+    } = plan;
+    if (!oldPrefix || !newPrefix || !remoteFolderFileId) {
+      throw new Error("move-remote(\u76EE\u5F55) \u7F3A\u5C11 remoteFolderFileId \u6216\u76EE\u5F55\u8DEF\u5F84");
+    }
+    const newParent = parentPathOf(newPrefix);
+    const folderResult = await this.fsXgkb.resolveFolderIdForRelativePath(newParent);
+    if (!folderResult.ok)
+      throw new Error(folderResult.error);
+    const moveResult = await this.fsXgkb.moveRemoteFile(remoteFolderFileId, folderResult.value);
+    if (!moveResult.ok)
+      throw new Error(moveResult.error);
+    let folderFileId = String(moveResult.value.fileId);
+    const oldFolderName = oldPrefix.split("/").pop() || oldPrefix;
+    if (newFolderName && newFolderName !== oldFolderName) {
+      const renameResult = await this.fsXgkb.renameRemoteFile(folderFileId, newFolderName);
+      if (!renameResult.ok)
+        throw new Error(renameResult.error);
+    }
+    const idMappings = collectMoveIdMappings(moveResult.value);
+    if (idMappings.length > 0) {
+      await this.db.applyFileIdMappings(this.scopeKey, idMappings);
+    }
+    await this.db.relocateRecordsByPrefix(this.scopeKey, oldPrefix, newPrefix);
+    const all = await this.db.getAll(this.scopeKey);
+    for (const rec of all) {
+      if (!rec.localPath.startsWith(`${newPrefix}/`) && rec.localPath !== newPrefix)
+        continue;
+      const rest = rec.localPath.slice(newPrefix.length + 1);
+      if (rest.includes("/"))
+        continue;
+      if (rec.xgkbFolderId === remoteFolderFileId) {
+        await this.db.put({ ...rec, xgkbFolderId: folderFileId, lastSyncAt: Date.now() });
+      }
+      this.queueMtimeRefresh(rec.xgkbFileId, rec.localPath);
+    }
+    this.stats.moved = ((_a = this.stats.moved) != null ? _a : 0) + 1;
+    this.progress(
+      `\u2192 \u8FDC\u7AEF\u76EE\u5F55 ${oldPrefix} \u2192 ${newPrefix}\uFF08${affectedRecords.length} \u4E2A\u6587\u4EF6\uFF0C1 \u6B21 moveFile\uFF09`
+    );
   }
   async doDownload(path, remote, record) {
     var _a, _b;
@@ -1362,6 +2950,60 @@ var SyncEngine = class {
     this.progress(`\u2717 \u4E91\u7AEF\u5220\u9664 ${record.localPath}`);
   }
 };
+function parentPathOf(relativePath) {
+  const i = relativePath.lastIndexOf("/");
+  return i > 0 ? relativePath.substring(0, i) : "";
+}
+function deriveDirPrefixChange(oldPath, newPath) {
+  const oldSlash = oldPath.lastIndexOf("/");
+  const newSlash = newPath.lastIndexOf("/");
+  if (oldSlash !== newSlash)
+    return null;
+  const fileName = oldSlash >= 0 ? oldPath.slice(oldSlash + 1) : oldPath;
+  if ((newSlash >= 0 ? newPath.slice(newSlash + 1) : newPath) !== fileName)
+    return null;
+  const oldDir = oldSlash >= 0 ? oldPath.slice(0, oldSlash) : "";
+  const newDir = newSlash >= 0 ? newPath.slice(0, newSlash) : "";
+  if (oldDir === newDir)
+    return null;
+  const oldParts = oldDir ? oldDir.split("/") : [];
+  const newParts = newDir ? newDir.split("/") : [];
+  if (oldParts.length !== newParts.length)
+    return null;
+  let diffIdx = -1;
+  for (let i = 0; i < oldParts.length; i++) {
+    if (oldParts[i] !== newParts[i]) {
+      if (diffIdx >= 0)
+        return null;
+      diffIdx = i;
+    }
+  }
+  if (diffIdx < 0)
+    return null;
+  return {
+    oldPrefix: oldParts.slice(0, diffIdx + 1).join("/"),
+    newPrefix: newParts.slice(0, diffIdx + 1).join("/")
+  };
+}
+function pickDirectChildFolderId(records, oldPrefix) {
+  for (const rec of records) {
+    if (!rec.localPath.startsWith(`${oldPrefix}/`))
+      continue;
+    const rest = rec.localPath.slice(oldPrefix.length + 1);
+    if (!rest.includes("/") && rec.xgkbFolderId)
+      return rec.xgkbFolderId;
+  }
+  return void 0;
+}
+function collectMoveIdMappings(result) {
+  var _a;
+  if (!result.idChanged || !((_a = result.idMappings) == null ? void 0 : _a.length))
+    return [];
+  return result.idMappings.map((m) => ({
+    sourceFileId: String(m.sourceFileId),
+    targetFileId: String(m.targetFileId)
+  }));
+}
 
 // src/syncStateDb.ts
 function requestError(request) {
@@ -1450,6 +3092,85 @@ var SyncStateDb = class {
       request.onerror = () => resolve([]);
     });
   }
+  async getByFileId(scopeKey, xgkbFileId) {
+    if (!this.db)
+      return void 0;
+    return new Promise((resolve) => {
+      const tx = this.db.transaction(DB_STORE_NAME, "readonly");
+      const store = tx.objectStore(DB_STORE_NAME);
+      const index = store.index("xgkbFileId");
+      const request = index.getAll(xgkbFileId);
+      request.onsuccess = () => {
+        const rows = request.result || [];
+        resolve(rows.find((r) => r.scopeKey === scopeKey));
+      };
+      request.onerror = () => resolve(void 0);
+    });
+  }
+  /** Vault rename：迁键 localPath，保留 xgkbFileId 等字段 */
+  async relocateRecord(scopeKey, oldPath, newPath) {
+    const record = await this.get(scopeKey, oldPath);
+    if (!record)
+      return false;
+    await this.delete(scopeKey, oldPath);
+    await this.put({ ...record, localPath: newPath, lastSyncAt: Date.now() });
+    return true;
+  }
+  /** 文件夹 rename/move：批量更新 oldPrefix 下所有 record 的路径前缀 */
+  async relocateRecordsByPrefix(scopeKey, oldPrefix, newPrefix) {
+    if (!oldPrefix || oldPrefix === newPrefix)
+      return 0;
+    const all = await this.getAll(scopeKey);
+    let moved = 0;
+    for (const record of all) {
+      if (!pathUnderPrefix(record.localPath, oldPrefix))
+        continue;
+      const suffix = record.localPath.slice(oldPrefix.length);
+      const newPath = `${newPrefix}${suffix}`;
+      if (newPath === record.localPath)
+        continue;
+      await this.delete(scopeKey, record.localPath);
+      await this.put({ ...record, localPath: newPath, lastSyncAt: Date.now() });
+      moved++;
+    }
+    return moved;
+  }
+  /** moveFile 返回的 fileId 映射（目录 move 后子文件 id 可能变化） */
+  async applyFileIdMappings(scopeKey, mappings) {
+    if (mappings.length === 0)
+      return 0;
+    const lookup = new Map(mappings.map((m) => [m.sourceFileId, m.targetFileId]));
+    const all = await this.getAll(scopeKey);
+    let updated = 0;
+    for (const record of all) {
+      const nextFileId = lookup.get(record.xgkbFileId);
+      const nextFolderId = lookup.get(record.xgkbFolderId);
+      if (!nextFileId && !nextFolderId)
+        continue;
+      await this.put({
+        ...record,
+        ...nextFileId ? { xgkbFileId: nextFileId } : {},
+        ...nextFolderId ? { xgkbFolderId: nextFolderId } : {},
+        lastSyncAt: Date.now()
+      });
+      updated++;
+    }
+    return updated;
+  }
+  /** 移出 syncFolder 或删除时清理该前缀下所有 record */
+  async deleteRecordsByPrefix(scopeKey, prefix) {
+    if (!this.db || !prefix)
+      return 0;
+    const all = await this.getAll(scopeKey);
+    let deleted = 0;
+    for (const record of all) {
+      if (!pathUnderPrefix(record.localPath, prefix))
+        continue;
+      await this.delete(scopeKey, record.localPath);
+      deleted++;
+    }
+    return deleted;
+  }
   async deleteAllForScope(scopeKey) {
     if (!this.db)
       return;
@@ -1483,6 +3204,9 @@ var SyncStateDb = class {
     });
   }
 };
+function pathUnderPrefix(localPath, prefix) {
+  return localPath === prefix || localPath.startsWith(`${prefix}/`);
+}
 
 // src/syncScope.ts
 var DATA_SCHEMA_VERSION = 2;
@@ -1532,7 +3256,7 @@ function stripPersistedMeta(raw) {
   const { lastSyncTime, dataSchemaVersion, activeScopeKey, syncScopes, ...rest } = raw;
   return rest;
 }
-var XgkbSyncPlugin = class extends import_obsidian3.Plugin {
+var XgkbSyncPlugin = class extends import_obsidian4.Plugin {
   constructor() {
     super(...arguments);
     this.dataSchemaVersion = DATA_SCHEMA_VERSION;
@@ -1553,8 +3277,65 @@ var XgkbSyncPlugin = class extends import_obsidian3.Plugin {
         await this.runSync();
       }
     });
+    this.registerVaultRenameHandler();
     this.addSettingTab(new XgkbPluginSettingTab(this.app, this));
     this.scheduleAutoSync();
+  }
+  registerVaultRenameHandler() {
+    this.registerEvent(
+      this.app.vault.on("rename", (file, oldPath) => {
+        void this.onVaultRename(file, oldPath);
+      })
+    );
+  }
+  /** 本地 rename 时迁键 IndexedDB，避免下轮误判 upload-new（pull 模式也需迁键，不调远端 API） */
+  async onVaultRename(file, oldPath) {
+    const exts = normalizeSyncExtensions(this.settings.syncFileExtensions);
+    const fsLocal = new FsLocal(this.app, this.settings.syncFolder, exts);
+    const oldRel = fsLocal.toSyncRelativePath(oldPath);
+    const newRel = fsLocal.toSyncRelativePath(file.path);
+    const scopeKey = await computeScopeKey(this.settings);
+    const db = new SyncStateDb();
+    try {
+      const openResult = await db.open();
+      if (!openResult.ok)
+        return;
+      if (oldRel != null && newRel == null) {
+        if (file instanceof Obsidian2.TFolder) {
+          const removed = await db.deleteRecordsByPrefix(scopeKey, oldRel);
+          if (removed > 0) {
+            console.debug(
+              `[XGKB Sync] Vault \u6587\u4EF6\u5939\u79FB\u51FA sync \u6839: ${oldRel}\uFF08\u5DF2\u6E05\u9664 ${removed} \u6761\u72B6\u6001\uFF09`
+            );
+          }
+        } else if (file instanceof Obsidian2.TFile && exts.includes(file.extension)) {
+          await db.delete(scopeKey, oldRel);
+          console.debug(`[XGKB Sync] Vault \u6587\u4EF6\u79FB\u51FA sync \u6839: ${oldRel}\uFF08\u5DF2\u6E05\u9664\u72B6\u6001\uFF09`);
+        }
+        return;
+      }
+      if (oldRel == null || newRel == null || oldRel === newRel)
+        return;
+      if (file instanceof Obsidian2.TFolder) {
+        const moved2 = await db.relocateRecordsByPrefix(scopeKey, oldRel, newRel);
+        if (moved2 > 0) {
+          console.debug(
+            `[XGKB Sync] Vault \u6587\u4EF6\u5939 rename: ${oldRel} \u2192 ${newRel}\uFF08\u5DF2\u66F4\u65B0 ${moved2} \u6761\u72B6\u6001\uFF09`
+          );
+        }
+        return;
+      }
+      if (!(file instanceof Obsidian2.TFile))
+        return;
+      if (!exts.includes(file.extension))
+        return;
+      const moved = await db.relocateRecord(scopeKey, oldRel, newRel);
+      if (moved) {
+        console.debug(`[XGKB Sync] Vault rename: ${oldRel} \u2192 ${newRel}\uFF08\u5DF2\u66F4\u65B0\u72B6\u6001\u5E93\uFF09`);
+      }
+    } finally {
+      db.close();
+    }
   }
   scheduleAutoSync() {
     var _a;
@@ -1582,6 +3363,7 @@ var XgkbSyncPlugin = class extends import_obsidian3.Plugin {
     }
     const { dataSchemaVersion, activeScopeKey, syncScopes, ...rest } = raw;
     this.settings = Object.assign({}, DEFAULT_SETTINGS, stripPersistedMeta(rest));
+    this.settings.syncFileExtensions = normalizeSyncExtensions(this.settings.syncFileExtensions);
     this.dataSchemaVersion = typeof dataSchemaVersion === "number" ? dataSchemaVersion : DATA_SCHEMA_VERSION;
     this.syncScopes = syncScopes && typeof syncScopes === "object" ? syncScopes : {};
     this.activeScopeKey = typeof activeScopeKey === "string" ? activeScopeKey : await computeScopeKey(this.settings);
@@ -1593,6 +3375,7 @@ var XgkbSyncPlugin = class extends import_obsidian3.Plugin {
       await db.clear();
     db.close();
     this.settings = Object.assign({}, DEFAULT_SETTINGS, stripPersistedMeta(raw));
+    this.settings.syncFileExtensions = normalizeSyncExtensions(this.settings.syncFileExtensions);
     const scopeKey = await computeScopeKey(this.settings);
     this.dataSchemaVersion = DATA_SCHEMA_VERSION;
     this.syncScopes = {
@@ -1600,7 +3383,7 @@ var XgkbSyncPlugin = class extends import_obsidian3.Plugin {
     };
     this.activeScopeKey = scopeKey;
     await this.saveSettings();
-    new import_obsidian3.Notice(
+    new import_obsidian4.Notice(
       "\u5DF2\u5347\u7EA7\u5230\u591A\u4F5C\u7528\u57DF\u540C\u6B65\uFF1A\u65E7\u6C34\u4F4D\u672A\u8FC1\u79FB\uFF0C\u4E0B\u6B21\u5C06\u6267\u884C\u5168\u91CF\u5BF9\u8D26",
       8e3
     );
@@ -1618,17 +3401,17 @@ var XgkbSyncPlugin = class extends import_obsidian3.Plugin {
     const newKey = await computeScopeKey(this.settings);
     const prevKey = this.activeScopeKey;
     this.activeScopeKey = newKey;
-    if (newKey === prevKey && this.syncScopes[newKey]) {
+    if (newKey === prevKey) {
       await this.saveSettings();
       return;
     }
     if (!this.syncScopes[newKey]) {
       this.syncScopes[newKey] = { fingerprint: buildScopeFingerprint(this.settings) };
-      new import_obsidian3.Notice("\u65B0\u7684\u540C\u6B65\u76EE\u6807\uFF0C\u9996\u6B21\u5C06\u6267\u884C\u5168\u91CF\u5BF9\u8D26", 6e3);
+      new import_obsidian4.Notice("\u65B0\u7684\u540C\u6B65\u76EE\u6807\uFF0C\u9996\u6B21\u5C06\u6267\u884C\u5168\u91CF\u5BF9\u8D26", 6e3);
     } else {
       const entry = this.syncScopes[newKey];
       const when = entry.lastSuccessAt ? new Date(entry.lastSuccessAt).toLocaleString("zh-CN") : "\u672A\u77E5";
-      new import_obsidian3.Notice(
+      new import_obsidian4.Notice(
         `\u5DF2\u5207\u6362\u5230\u6B64\u524D\u4F7F\u7528\u8FC7\u7684\u540C\u6B65\u76EE\u6807\uFF08\u4E0A\u6B21\u6210\u529F: ${when}\uFF09\uFF0C\u5C06\u6CBF\u7528\u8BE5\u76EE\u6807\u7684\u6C34\u4F4D`,
         6e3
       );
@@ -1645,7 +3428,7 @@ var XgkbSyncPlugin = class extends import_obsidian3.Plugin {
       await db.deleteAllForScope(key);
     db.close();
     await this.saveSettings();
-    new import_obsidian3.Notice("\u5DF2\u91CD\u7F6E\u5F53\u524D\u540C\u6B65\u4F5C\u7528\u57DF\uFF0C\u4E0B\u6B21\u5C06\u5168\u91CF\u5BF9\u8D26", 6e3);
+    new import_obsidian4.Notice("\u5DF2\u91CD\u7F6E\u5F53\u524D\u540C\u6B65\u4F5C\u7528\u57DF\uFF0C\u4E0B\u6B21\u5C06\u5168\u91CF\u5BF9\u8D26", 6e3);
   }
   async resetAllSyncScopes() {
     this.syncScopes = {};
@@ -1659,7 +3442,7 @@ var XgkbSyncPlugin = class extends import_obsidian3.Plugin {
       await db.clear();
     db.close();
     await this.saveSettings();
-    new import_obsidian3.Notice("\u5DF2\u91CD\u7F6E\u5168\u90E8\u540C\u6B65\u4F5C\u7528\u57DF\uFF0C\u4E0B\u6B21\u5C06\u5168\u91CF\u5BF9\u8D26", 6e3);
+    new import_obsidian4.Notice("\u5DF2\u91CD\u7F6E\u5168\u90E8\u540C\u6B65\u4F5C\u7528\u57DF\uFF0C\u4E0B\u6B21\u5C06\u5168\u91CF\u5BF9\u8D26", 6e3);
   }
   getScopeDiagnosticLines() {
     var _a;
@@ -1686,12 +3469,12 @@ var XgkbSyncPlugin = class extends import_obsidian3.Plugin {
   async runSync() {
     var _a;
     if (!this.settings.appKey) {
-      new import_obsidian3.Notice("Xgkb sync: configure app key first");
+      new import_obsidian4.Notice("Xgkb sync: configure app key first");
       return;
     }
     if (this.isSyncing) {
       console.debug("[XGKB Sync] \u4E0A\u6B21\u540C\u6B65\u4ECD\u5728\u8FDB\u884C\uFF0C\u8DF3\u8FC7\u672C\u6B21\u89E6\u53D1");
-      new import_obsidian3.Notice("XGKB Sync: \u540C\u6B65\u8FDB\u884C\u4E2D\uFF0C\u8BF7\u52FF\u91CD\u590D\u70B9\u51FB", 5e3);
+      new import_obsidian4.Notice("XGKB Sync: \u540C\u6B65\u8FDB\u884C\u4E2D\uFF0C\u8BF7\u52FF\u91CD\u590D\u70B9\u51FB", 5e3);
       return;
     }
     this.isSyncing = true;
@@ -1706,27 +3489,38 @@ var XgkbSyncPlugin = class extends import_obsidian3.Plugin {
     console.debug(
       `[XGKB Sync] ===== \u5F00\u59CB\u540C\u6B65 scope=${scopeKey.slice(0, 8)}... mode=${isIncremental ? "\u589E\u91CF" : "\u5168\u91CF"} lastSyncTime=${since != null ? since : "-"} (${sinceStr}) =====`
     );
-    new import_obsidian3.Notice(`XGKB Sync: \u5F00\u59CB${isIncremental ? "\u589E\u91CF" : "\u5168\u91CF"}\u540C\u6B65...`);
+    new import_obsidian4.Notice(`XGKB Sync: \u5F00\u59CB${isIncremental ? "\u589E\u91CF" : "\u5168\u91CF"}\u540C\u6B65...`);
     const db = new SyncStateDb();
     let dbOpened = false;
     try {
       const dbResult = await db.open();
       if (!dbResult.ok) {
-        new import_obsidian3.Notice(`XGKB Sync: \u6570\u636E\u5E93\u6253\u5F00\u5931\u8D25 - ${dbResult.error}`);
+        new import_obsidian4.Notice(`XGKB Sync: \u6570\u636E\u5E93\u6253\u5F00\u5931\u8D25 - ${dbResult.error}`);
         return;
       }
       dbOpened = true;
       const api = new XgkbApi(this.settings.serverUrl, this.settings.appKey);
-      const fsLocal = new FsLocal(this.app, this.settings.syncFolder);
-      const fsXgkb = new FsXgkb(api, this.settings.targetFolderName, this.settings.projectId);
+      const syncExtensions = normalizeSyncExtensions(this.settings.syncFileExtensions);
+      const fsLocal = new FsLocal(this.app, this.settings.syncFolder, syncExtensions);
+      const fsXgkb = new FsXgkb(
+        api,
+        this.settings.targetFolderName,
+        this.settings.projectId,
+        {
+          usePhysicalUpload: this.settings.usePhysicalUpload !== false,
+          uploadContentFallback: this.settings.uploadContentFallback !== false
+        },
+        syncExtensions
+      );
       const engine = new SyncEngine(fsLocal, fsXgkb, db, this.settings, scopeKey);
       let lastProgressNotice = 0;
       const stats = await engine.runSync((msg) => {
         const now = Date.now();
-        if (msg.startsWith("\u4E0B\u8F7D\u8FDB\u5EA6") && now - lastProgressNotice < 8e3)
+        if ((msg.startsWith("\u4E0B\u8F7D\u8FDB\u5EA6") || msg.startsWith("\u4E0A\u4F20\u8FDB\u5EA6")) && now - lastProgressNotice < 8e3) {
           return;
+        }
         lastProgressNotice = now;
-        new import_obsidian3.Notice(`XGKB Sync: ${msg}`, 3e3);
+        new import_obsidian4.Notice(`XGKB Sync: ${msg}`, 3e3);
       }, since);
       if (stats.newSince) {
         const rootId = fsXgkb.getRootId();
@@ -1754,10 +3548,10 @@ var XgkbSyncPlugin = class extends import_obsidian3.Plugin {
       if (stats.skipped > 0)
         lines.push(`\u8DF3\u8FC7:${stats.skipped}`);
       const summary = lines.length > 0 ? lines.join(" ") : "\u65E0\u53D8\u5316";
-      new import_obsidian3.Notice(`XGKB Sync \u5B8C\u6210: ${summary}`, stats.failed > 0 ? 8e3 : 4e3);
+      new import_obsidian4.Notice(`XGKB Sync \u5B8C\u6210: ${summary}`, stats.failed > 0 ? 8e3 : 4e3);
       if (stats.errors.length > 0) {
         console.error("[XGKB Sync] \u540C\u6B65\u9519\u8BEF:", stats.errors);
-        new import_obsidian3.Notice(
+        new import_obsidian4.Notice(
           `XGKB Sync: ${stats.errors.length} \u4E2A\u6587\u4EF6\u5931\u8D25\uFF08\u5DF2\u8BB0\u5F55\uFF0C\u4E0B\u6B21\u4F18\u5148\u91CD\u8BD5\uFF1B\u6C34\u4F4D\u5DF2\u63A8\u8FDB\uFF09`,
           8e3
         );
@@ -1765,7 +3559,7 @@ var XgkbSyncPlugin = class extends import_obsidian3.Plugin {
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       console.error("[XGKB Sync] \u540C\u6B65\u5F02\u5E38:", msg);
-      new import_obsidian3.Notice(`XGKB Sync \u540C\u6B65\u5931\u8D25: ${msg}`, 8e3);
+      new import_obsidian4.Notice(`XGKB Sync \u540C\u6B65\u5931\u8D25: ${msg}`, 8e3);
     } finally {
       if (dbOpened)
         db.close();

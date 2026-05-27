@@ -7,6 +7,15 @@ import type {
 	FileContentVO,
 	BatchGetContentFileRef,
 	DownloadInfoVO,
+	MoveFileParams,
+	MoveFileResult,
+	SaveFileToProjectParams,
+	SaveResourceParams,
+	SliceCheckResult,
+	UpdateFileNameParams,
+	UpdateFileNameResult,
+	UpdateFileVersionParams,
+	UploadFileSliceParams,
 	XgkbListDescendantFilesData,
 	XgkbListChangesData,
 	XgkbMetaItem,
@@ -205,6 +214,54 @@ export class XgkbApi {
 		const r = await this.request<boolean>("POST", API_PATHS.deleteFile, { fileId });
 		if (!r.ok) return r;
 		return { ok: true, value: true };
+	}
+
+	// ==================== 分片上传 ====================
+
+	async getSliceIdByMd5V2(md5: string, size: number, suffix?: string): Promise<Result<SliceCheckResult>> {
+		const params: Record<string, unknown> = { md5, size };
+		if (suffix) params.suffix = suffix;
+		return this.request<SliceCheckResult>("GET", API_PATHS.getSliceIdByMd5V2, params);
+	}
+
+	async uploadFileSliceV2(params: UploadFileSliceParams): Promise<Result<number>> {
+		return this.request<number>("POST", API_PATHS.uploadFileSliceV2, { ...params });
+	}
+
+	async saveResource(params: SaveResourceParams): Promise<Result<number>> {
+		return this.request<number>("POST", API_PATHS.saveResource, { ...params });
+	}
+
+	// ==================== 物理文件入库 ====================
+
+	async saveFileByPath(params: SaveFileToProjectParams): Promise<Result<number>> {
+		return this.request<number>("POST", API_PATHS.saveFileByPath, { ...params });
+	}
+
+	async updateFileVersion(params: UpdateFileVersionParams): Promise<Result<number>> {
+		return this.request<number>("POST", API_PATHS.updateFileVersion, { ...params });
+	}
+
+	async updateFileName(params: UpdateFileNameParams): Promise<Result<UpdateFileNameResult>> {
+		return this.request<UpdateFileNameResult>("POST", API_PATHS.updateFileName, {
+			fileId: params.fileId,
+			newName: params.newName,
+			...(params.projectId !== undefined && { projectId: params.projectId }),
+			...(params.nameConflictStrategy !== undefined && {
+				nameConflictStrategy: params.nameConflictStrategy,
+			}),
+		});
+	}
+
+	async moveFile(params: MoveFileParams): Promise<Result<MoveFileResult>> {
+		return this.request<MoveFileResult>("POST", API_PATHS.moveFile, {
+			fileId: params.fileId,
+			targetParentId: params.targetParentId,
+			...(params.projectId !== undefined && { projectId: params.projectId }),
+			...(params.nameConflictStrategy !== undefined && {
+				nameConflictStrategy: params.nameConflictStrategy,
+			}),
+		});
 	}
 
 	/** 显式创建空目录（4.24） */

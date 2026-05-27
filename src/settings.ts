@@ -6,9 +6,16 @@ import { XgkbApi } from "./xgkbApi";
 import { FsLocal } from "./fsLocal";
 import { FsXgkb } from "./fsXgkb";
 import { normalizeTargetFolderPath } from "./pathSanitize";
+import {
+	AVAILABLE_SYNC_EXTENSIONS,
+	formatSyncExtensionsLabel,
+	normalizeSyncExtensions,
+} from "./syncFileTypes";
 
 export class XgkbPluginSettingTab extends PluginSettingTab {
 	private plugin: XgkbSyncPlugin;
+	/** 作用域身份变更防抖，避免逐字输入时重复弹 Notice */
+	private scopeIdentityTimer: number | undefined;
 
 	constructor(app: App, plugin: XgkbSyncPlugin) {
 		super(app, plugin);
@@ -16,74 +23,102 @@ export class XgkbPluginSettingTab extends PluginSettingTab {
 	}
 
 	display(): void {
+		if (this.scopeIdentityTimer !== undefined) {
+			window.clearTimeout(this.scopeIdentityTimer);
+			this.scopeIdentityTimer = undefined;
+		}
+
 		const { containerEl } = this;
 		containerEl.empty();
 
 		new Setting(containerEl)
 			.setName("App key")
 			.setDesc("玄关知识库 API 密钥")
-			.addText((text) =>
-				text
-					.setPlaceholder("Enter app key")
-					.setValue(this.plugin.settings.appKey)
-					.onChange(async (value) => {
-						this.plugin.settings.appKey = value;
-						await this.plugin.onScopeIdentityChanged();
-					})
-			);
+			.addText((text) => {
+				text.setPlaceholder("Enter app key").setValue(this.plugin.settings.appKey);
+				this.bindScopeIdentityText(text, (value) => {
+					this.plugin.settings.appKey = value;
+				});
+			});
 
 		new Setting(containerEl)
 			.setName("Server URL")
 			.setDesc("玄关知识库 API 地址")
-			.addText((text) =>
+			.addText((text) => {
 				text
 					.setPlaceholder(DEFAULT_SETTINGS.serverUrl)
-					.setValue(this.plugin.settings.serverUrl)
-					.onChange(async (value) => {
-						this.plugin.settings.serverUrl = value || DEFAULT_SETTINGS.serverUrl;
-						await this.plugin.onScopeIdentityChanged();
-					})
-			);
+					.setValue(this.plugin.settings.serverUrl);
+				this.bindScopeIdentityText(text, (value) => {
+					this.plugin.settings.serverUrl = value || DEFAULT_SETTINGS.serverUrl;
+				});
+			});
 
 		new Setting(containerEl)
 			.setName("Project ID")
 			.setDesc("目标知识库空间 ID；留空则同步到个人知识库。切换空间将自动使用独立水位。")
-			.addText((text) =>
+			.addText((text) => {
 				text
 					.setPlaceholder("留空 = 个人知识库")
-					.setValue(this.plugin.settings.projectId ?? "")
-					.onChange(async (value) => {
-						this.plugin.settings.projectId = value.trim();
-						await this.plugin.onScopeIdentityChanged();
-					})
-			);
+					.setValue(this.plugin.settings.projectId ?? "");
+				this.bindScopeIdentityText(text, (value) => {
+					this.plugin.settings.projectId = value.trim();
+				});
+			});
 
 		new Setting(containerEl)
 			.setName("Sync folder")
 			.setDesc("Obsidian 中用于同步的文件夹路径（空 = 同步整个 vault）")
-			.addText((text) =>
-				text
-					.setPlaceholder("Example: notes")
-					.setValue(this.plugin.settings.syncFolder)
-					.onChange(async (value) => {
-						this.plugin.settings.syncFolder = value;
-						await this.plugin.onScopeIdentityChanged();
-					})
-			);
+			.addText((text) => {
+				text.setPlaceholder("Example: notes").setValue(this.plugin.settings.syncFolder);
+				this.bindScopeIdentityText(text, (value) => {
+					this.plugin.settings.syncFolder = value;
+				});
+			});
 
 		new Setting(containerEl)
 			.setName("Cloud target folder")
 			.setDesc("知识库中的同步根目录；支持多级路径，如 Obsidian 或 A/B（不存在时自动创建）")
-			.addText((text) =>
+			.addText((text) => {
 				text
 					.setPlaceholder("Obsidian 或 A/B")
-					.setValue(this.plugin.settings.targetFolderName)
-					.onChange(async (value) => {
-						const normalized = normalizeTargetFolderPath(value);
-						this.plugin.settings.targetFolderName = normalized || "Obsidian";
-						await this.plugin.onScopeIdentityChanged();
-					})
-			);
+					.setValue(this.plugin.settings.targetFolderName);
+				this.bindScopeIdentityText(text, (value) => {
+					const normalized = normalizeTargetFolderPath(value);
+					this.plugin.settings.targetFolderName = normalized || "Obsidian";
+				});
+			});
+
+		const fileTypesWrap = containerEl.createDiv({ cls: "xgkb-sync-file-types" });
+		new Setting(fileTypesWrap)
+			.setName("Sync file types")
+			.setDesc("选择要同步的文件类型（至少保留一种）");
+
+		for (const ext of AVAILABLE_SYNC_EXTENSIONS) {
+			const desc =
+				ext === "md" ? "Markdown 笔记" : ext === "json" ? "JSON 配置/数据" : "HTML 页面";
+			new Setting(fileTypesWrap)
+				.setName(`.${ext}`)
+				.setDesc(desc)
+				.addToggle((toggle) => {
+					const current = normalizeSyncExtensions(this.plugin.settings.syncFileExtensions);
+					toggle.setValue(current.includes(ext));
+					toggle.onChange(async (enabled) => {
+						let next = [...normalizeSyncExtensions(this.plugin.settings.syncFileExtensions)];
+						if (enabled) {
+							if (!next.includes(ext)) next.push(ext);
+						} else {
+							next = next.filter((item) => item !== ext);
+							if (next.length === 0) {
+								new Notice("至少保留一种文件类型", 3000);
+								toggle.setValue(true);
+								return;
+							}
+						}
+						this.plugin.settings.syncFileExtensions = normalizeSyncExtensions(next);
+						await this.plugin.saveSettings();
+					});
+				});
+		}
 
 		new Setting(containerEl)
 			.setName("Sync direction")
@@ -143,6 +178,30 @@ export class XgkbPluginSettingTab extends PluginSettingTab {
 		});
 	}
 
+	/** 文本类设置：防抖后再切换作用域并提示（失焦时立即提交） */
+	private bindScopeIdentityText(
+		text: import("obsidian").TextComponent,
+		apply: (value: string) => void
+	): void {
+		const commitScope = () => {
+			if (this.scopeIdentityTimer !== undefined) {
+				window.clearTimeout(this.scopeIdentityTimer);
+				this.scopeIdentityTimer = undefined;
+			}
+			void this.plugin.onScopeIdentityChanged();
+		};
+
+		text.onChange((value) => {
+			apply(value);
+			if (this.scopeIdentityTimer !== undefined) {
+				window.clearTimeout(this.scopeIdentityTimer);
+			}
+			this.scopeIdentityTimer = window.setTimeout(commitScope, 600);
+		});
+
+		text.inputEl.addEventListener("blur", commitScope);
+	}
+
 	private async testConnection(): Promise<void> {
 		const { appKey, serverUrl, targetFolderName, projectId } = this.plugin.settings;
 		if (!appKey) {
@@ -162,7 +221,13 @@ export class XgkbPluginSettingTab extends PluginSettingTab {
 		const resolvedId = projectIdResult.value;
 		const spaceLabel = projectId?.trim() ? `空间 ${resolvedId}` : `个人知识库 (${resolvedId})`;
 
-		const fsXgkb = new FsXgkb(api, targetFolderName, projectId);
+		const fsXgkb = new FsXgkb(
+			api,
+			targetFolderName,
+			projectId,
+			undefined,
+			normalizeSyncExtensions(this.plugin.settings.syncFileExtensions)
+		);
 		const initResult = await fsXgkb.init();
 		if (!initResult.ok) {
 			new Notice(`❌ 目录解析失败: ${initResult.error}`, 8000);
@@ -178,10 +243,14 @@ export class XgkbPluginSettingTab extends PluginSettingTab {
 		}
 
 		const items = filesResult.value || [];
-		const mdCount = items.filter((f) => f.type === 2 && f.suffix === "md").length;
+		const syncExtensions = normalizeSyncExtensions(this.plugin.settings.syncFileExtensions);
+		const syncCount = items.filter(
+			(f) => f.type === 2 && f.suffix && syncExtensions.includes(f.suffix.toLowerCase())
+		).length;
 		const folderCount = items.filter((f) => f.type === 1).length;
+		const typesLabel = formatSyncExtensionsLabel(syncExtensions);
 		new Notice(
-			`✅ 连接成功（${spaceLabel}）！"${displayPath}" 含 ${mdCount} 个 .md 文件、${folderCount} 个子文件夹`,
+			`✅ 连接成功（${spaceLabel}）！"${displayPath}" 含 ${syncCount} 个 ${typesLabel} 文件、${folderCount} 个子文件夹`,
 			5000
 		);
 	}
@@ -206,12 +275,14 @@ export class XgkbPluginSettingTab extends PluginSettingTab {
 		lines.push("");
 
 		try {
-			const fsLocal = new FsLocal(this.plugin.app, syncFolder);
-			const fsXgkb = new FsXgkb(api, targetFolderName, projectId);
+			const syncExtensions = normalizeSyncExtensions(this.plugin.settings.syncFileExtensions);
+			const typesLabel = formatSyncExtensionsLabel(syncExtensions);
+			const fsLocal = new FsLocal(this.plugin.app, syncFolder, syncExtensions);
+			const fsXgkb = new FsXgkb(api, targetFolderName, projectId, undefined, syncExtensions);
 
 			// 本地文件
-			const localFiles = fsLocal.listFiles();
-			lines.push(`本地 .md 文件: ${localFiles.length} 个`);
+			const localFiles = await fsLocal.listFiles();
+			lines.push(`本地 ${typesLabel} 文件: ${localFiles.length} 个`);
 			for (const f of localFiles.slice(0, 10)) {
 				lines.push(`  📄 ${f.path}  (${new Date(f.mtime).toLocaleString()})`);
 			}
@@ -227,7 +298,7 @@ export class XgkbPluginSettingTab extends PluginSettingTab {
 					lines.push(`\n❌ 获取云端文件失败: ${remoteResult.error}`);
 				} else {
 					const remoteFiles = remoteResult.value;
-					lines.push(`\n云端 .md 文件: ${remoteFiles.length} 个`);
+					lines.push(`\n云端 ${typesLabel} 文件: ${remoteFiles.length} 个`);
 					for (const f of remoteFiles.slice(0, 10)) {
 						lines.push(`  ☁️ ${f.path}  (${new Date(f.mtime).toLocaleString()})`);
 					}

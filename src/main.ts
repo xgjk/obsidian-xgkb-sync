@@ -1,4 +1,5 @@
 import { Notice, Plugin } from "obsidian";
+import * as Obsidian from "obsidian";
 import type { XgkbPluginSettings, SyncScopeEntry } from "./types";
 import { DEFAULT_SETTINGS } from "./constants";
 import { XgkbPluginSettingTab } from "./settings";
@@ -14,6 +15,7 @@ import {
 	isLegacyPersistedData,
 	formatScopeLabel,
 } from "./syncScope";
+import { normalizeSyncExtensions } from "./syncFileTypes";
 
 function stripPersistedMeta(raw: Record<string, unknown>): Partial<XgkbPluginSettings> {
 	const { lastSyncTime, dataSchemaVersion, activeScopeKey, syncScopes, ...rest } = raw;
@@ -48,9 +50,72 @@ export default class XgkbSyncPlugin extends Plugin {
 			},
 		});
 
+		this.registerVaultRenameHandler();
+
 		this.addSettingTab(new XgkbPluginSettingTab(this.app, this));
 
 		this.scheduleAutoSync();
+	}
+
+	private registerVaultRenameHandler(): void {
+		this.registerEvent(
+			this.app.vault.on("rename", (file, oldPath) => {
+				void this.onVaultRename(file, oldPath);
+			})
+		);
+	}
+
+	/** 本地 rename 时迁键 IndexedDB，避免下轮误判 upload-new（pull 模式也需迁键，不调远端 API） */
+	private async onVaultRename(file: Obsidian.TAbstractFile, oldPath: string): Promise<void> {
+		const exts = normalizeSyncExtensions(this.settings.syncFileExtensions);
+		const fsLocal = new FsLocal(this.app, this.settings.syncFolder, exts);
+		const oldRel = fsLocal.toSyncRelativePath(oldPath);
+		const newRel = fsLocal.toSyncRelativePath(file.path);
+
+		const scopeKey = await computeScopeKey(this.settings);
+		const db = new SyncStateDb();
+		try {
+			const openResult = await db.open();
+			if (!openResult.ok) return;
+
+			// 移出 sync 根：清理 IDB，避免幽灵 record
+			if (oldRel != null && newRel == null) {
+				if (file instanceof Obsidian.TFolder) {
+					const removed = await db.deleteRecordsByPrefix(scopeKey, oldRel);
+					if (removed > 0) {
+						console.debug(
+							`[XGKB Sync] Vault 文件夹移出 sync 根: ${oldRel}（已清除 ${removed} 条状态）`
+						);
+					}
+				} else if (file instanceof Obsidian.TFile && exts.includes(file.extension)) {
+					await db.delete(scopeKey, oldRel);
+					console.debug(`[XGKB Sync] Vault 文件移出 sync 根: ${oldRel}（已清除状态）`);
+				}
+				return;
+			}
+
+			if (oldRel == null || newRel == null || oldRel === newRel) return;
+
+			if (file instanceof Obsidian.TFolder) {
+				const moved = await db.relocateRecordsByPrefix(scopeKey, oldRel, newRel);
+				if (moved > 0) {
+					console.debug(
+						`[XGKB Sync] Vault 文件夹 rename: ${oldRel} → ${newRel}（已更新 ${moved} 条状态）`
+					);
+				}
+				return;
+			}
+
+			if (!(file instanceof Obsidian.TFile)) return;
+			if (!exts.includes(file.extension)) return;
+
+			const moved = await db.relocateRecord(scopeKey, oldRel, newRel);
+			if (moved) {
+				console.debug(`[XGKB Sync] Vault rename: ${oldRel} → ${newRel}（已更新状态库）`);
+			}
+		} finally {
+			db.close();
+		}
 	}
 
 	scheduleAutoSync(): void {
@@ -81,6 +146,7 @@ export default class XgkbSyncPlugin extends Plugin {
 
 		const { dataSchemaVersion, activeScopeKey, syncScopes, ...rest } = raw;
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, stripPersistedMeta(rest));
+		this.settings.syncFileExtensions = normalizeSyncExtensions(this.settings.syncFileExtensions);
 		this.dataSchemaVersion =
 			typeof dataSchemaVersion === "number" ? dataSchemaVersion : DATA_SCHEMA_VERSION;
 		this.syncScopes =
@@ -100,6 +166,7 @@ export default class XgkbSyncPlugin extends Plugin {
 		db.close();
 
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, stripPersistedMeta(raw));
+		this.settings.syncFileExtensions = normalizeSyncExtensions(this.settings.syncFileExtensions);
 		const scopeKey = await computeScopeKey(this.settings);
 		this.dataSchemaVersion = DATA_SCHEMA_VERSION;
 		this.syncScopes = {
@@ -128,7 +195,7 @@ export default class XgkbSyncPlugin extends Plugin {
 		const prevKey = this.activeScopeKey;
 		this.activeScopeKey = newKey;
 
-		if (newKey === prevKey && this.syncScopes[newKey]) {
+		if (newKey === prevKey) {
 			await this.saveSettings();
 			return;
 		}
@@ -241,14 +308,29 @@ export default class XgkbSyncPlugin extends Plugin {
 			dbOpened = true;
 
 			const api = new XgkbApi(this.settings.serverUrl, this.settings.appKey);
-			const fsLocal = new FsLocal(this.app, this.settings.syncFolder);
-			const fsXgkb = new FsXgkb(api, this.settings.targetFolderName, this.settings.projectId);
+			const syncExtensions = normalizeSyncExtensions(this.settings.syncFileExtensions);
+			const fsLocal = new FsLocal(this.app, this.settings.syncFolder, syncExtensions);
+			const fsXgkb = new FsXgkb(
+				api,
+				this.settings.targetFolderName,
+				this.settings.projectId,
+				{
+					usePhysicalUpload: this.settings.usePhysicalUpload !== false,
+					uploadContentFallback: this.settings.uploadContentFallback !== false,
+				},
+				syncExtensions
+			);
 			const engine = new SyncEngine(fsLocal, fsXgkb, db, this.settings, scopeKey);
 
 			let lastProgressNotice = 0;
 			const stats = await engine.runSync((msg) => {
 				const now = Date.now();
-				if (msg.startsWith("下载进度") && now - lastProgressNotice < 8000) return;
+				if (
+					(msg.startsWith("下载进度") || msg.startsWith("上传进度")) &&
+					now - lastProgressNotice < 8000
+				) {
+					return;
+				}
 				lastProgressNotice = now;
 				new Notice(`XGKB Sync: ${msg}`, 3000);
 			}, since);

@@ -94,6 +94,88 @@ export class SyncStateDb {
 		});
 	}
 
+	async getByFileId(scopeKey: string, xgkbFileId: string): Promise<SyncStateRecord | undefined> {
+		if (!this.db) return undefined;
+		return new Promise((resolve) => {
+			const tx = this.db!.transaction(DB_STORE_NAME, "readonly");
+			const store = tx.objectStore(DB_STORE_NAME);
+			const index = store.index("xgkbFileId");
+			const request = index.getAll(xgkbFileId);
+			request.onsuccess = () => {
+				const rows = (request.result as SyncStateRecord[]) || [];
+				resolve(rows.find((r) => r.scopeKey === scopeKey));
+			};
+			request.onerror = () => resolve(undefined);
+		});
+	}
+
+	/** Vault rename：迁键 localPath，保留 xgkbFileId 等字段 */
+	async relocateRecord(scopeKey: string, oldPath: string, newPath: string): Promise<boolean> {
+		const record = await this.get(scopeKey, oldPath);
+		if (!record) return false;
+		await this.delete(scopeKey, oldPath);
+		await this.put({ ...record, localPath: newPath, lastSyncAt: Date.now() });
+		return true;
+	}
+
+	/** 文件夹 rename/move：批量更新 oldPrefix 下所有 record 的路径前缀 */
+	async relocateRecordsByPrefix(
+		scopeKey: string,
+		oldPrefix: string,
+		newPrefix: string
+	): Promise<number> {
+		if (!oldPrefix || oldPrefix === newPrefix) return 0;
+		const all = await this.getAll(scopeKey);
+		let moved = 0;
+		for (const record of all) {
+			if (!pathUnderPrefix(record.localPath, oldPrefix)) continue;
+			const suffix = record.localPath.slice(oldPrefix.length);
+			const newPath = `${newPrefix}${suffix}`;
+			if (newPath === record.localPath) continue;
+			await this.delete(scopeKey, record.localPath);
+			await this.put({ ...record, localPath: newPath, lastSyncAt: Date.now() });
+			moved++;
+		}
+		return moved;
+	}
+
+	/** moveFile 返回的 fileId 映射（目录 move 后子文件 id 可能变化） */
+	async applyFileIdMappings(
+		scopeKey: string,
+		mappings: Array<{ sourceFileId: string; targetFileId: string }>
+	): Promise<number> {
+		if (mappings.length === 0) return 0;
+		const lookup = new Map(mappings.map((m) => [m.sourceFileId, m.targetFileId]));
+		const all = await this.getAll(scopeKey);
+		let updated = 0;
+		for (const record of all) {
+			const nextFileId = lookup.get(record.xgkbFileId);
+			const nextFolderId = lookup.get(record.xgkbFolderId);
+			if (!nextFileId && !nextFolderId) continue;
+			await this.put({
+				...record,
+				...(nextFileId ? { xgkbFileId: nextFileId } : {}),
+				...(nextFolderId ? { xgkbFolderId: nextFolderId } : {}),
+				lastSyncAt: Date.now(),
+			});
+			updated++;
+		}
+		return updated;
+	}
+
+	/** 移出 syncFolder 或删除时清理该前缀下所有 record */
+	async deleteRecordsByPrefix(scopeKey: string, prefix: string): Promise<number> {
+		if (!this.db || !prefix) return 0;
+		const all = await this.getAll(scopeKey);
+		let deleted = 0;
+		for (const record of all) {
+			if (!pathUnderPrefix(record.localPath, prefix)) continue;
+			await this.delete(scopeKey, record.localPath);
+			deleted++;
+		}
+		return deleted;
+	}
+
 	async deleteAllForScope(scopeKey: string): Promise<void> {
 		if (!this.db) return;
 		const records = await this.getAll(scopeKey);
@@ -123,4 +205,8 @@ export class SyncStateDb {
 			request.onerror = () => reject(requestError(request));
 		});
 	}
+}
+
+function pathUnderPrefix(localPath: string, prefix: string): boolean {
+	return localPath === prefix || localPath.startsWith(`${prefix}/`);
 }
