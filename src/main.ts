@@ -16,6 +16,7 @@ import {
 	formatScopeLabel,
 } from "./syncScope";
 import { normalizeSyncExtensions } from "./syncFileTypes";
+import { SyncProgressNotice } from "./syncProgressNotice";
 
 function stripPersistedMeta(raw: Record<string, unknown>): Partial<XgkbPluginSettings> {
 	const { lastSyncTime, dataSchemaVersion, activeScopeKey, syncScopes, ...rest } = raw;
@@ -111,6 +112,10 @@ export default class XgkbSyncPlugin extends Plugin {
 
 			const moved = await db.relocateRecord(scopeKey, oldRel, newRel);
 			if (moved) {
+				// push/bidirectional：记录待推送远端动作，避免被增量路径推导“提前对齐”短路。
+				if (this.settings.syncDirection !== "pull") {
+					await db.markPendingRemoteRenameOrMove(scopeKey, newRel, oldRel, newRel);
+				}
 				console.debug(`[XGKB Sync] Vault rename: ${oldRel} → ${newRel}（已更新状态库）`);
 			}
 		} finally {
@@ -130,7 +135,7 @@ export default class XgkbSyncPlugin extends Plugin {
 		const intervalMs = intervalMin * 60 * 1000;
 		this.autoSyncHandle = this.registerInterval(
 			window.setInterval(() => {
-				void this.runSync();
+				void this.runSync({ quietIfBusy: true });
 			}, intervalMs)
 		);
 		console.debug(`[XGKB Sync] 自动同步已启动，间隔 ${intervalMin} 分钟`);
@@ -268,7 +273,7 @@ export default class XgkbSyncPlugin extends Plugin {
 		return lines;
 	}
 
-	private async runSync() {
+	private async runSync(options?: { quietIfBusy?: boolean }) {
 		if (!this.settings.appKey) {
 			new Notice("Xgkb sync: configure app key first");
 			return;
@@ -276,10 +281,14 @@ export default class XgkbSyncPlugin extends Plugin {
 
 		if (this.isSyncing) {
 			console.debug("[XGKB Sync] 上次同步仍在进行，跳过本次触发");
-			new Notice("XGKB Sync: 同步进行中，请勿重复点击", 5000);
+			if (!options?.quietIfBusy) {
+				new Notice("XGKB Sync: 同步进行中，请勿重复点击", 5000);
+			}
 			return;
 		}
 		this.isSyncing = true;
+
+		const progressNotice = new SyncProgressNotice();
 
 		const scopeKey = await computeScopeKey(this.settings);
 		this.activeScopeKey = scopeKey;
@@ -295,14 +304,14 @@ export default class XgkbSyncPlugin extends Plugin {
 		console.debug(
 			`[XGKB Sync] ===== 开始同步 scope=${scopeKey.slice(0, 8)}... mode=${isIncremental ? "增量" : "全量"} lastSyncTime=${since ?? "-"} (${sinceStr}) =====`
 		);
-		new Notice(`XGKB Sync: 开始${isIncremental ? "增量" : "全量"}同步...`);
+		progressNotice.update(`开始${isIncremental ? "增量" : "全量"}同步...`);
 		const db = new SyncStateDb();
 		let dbOpened = false;
 
 		try {
 			const dbResult = await db.open();
 			if (!dbResult.ok) {
-				new Notice(`XGKB Sync: 数据库打开失败 - ${dbResult.error}`);
+				progressNotice.finish(`数据库打开失败 - ${dbResult.error}`, 8000);
 				return;
 			}
 			dbOpened = true;
@@ -322,17 +331,17 @@ export default class XgkbSyncPlugin extends Plugin {
 			);
 			const engine = new SyncEngine(fsLocal, fsXgkb, db, this.settings, scopeKey);
 
-			let lastProgressNotice = 0;
+			let lastProgressUpdate = 0;
 			const stats = await engine.runSync((msg) => {
 				const now = Date.now();
 				if (
 					(msg.startsWith("下载进度") || msg.startsWith("上传进度")) &&
-					now - lastProgressNotice < 8000
+					now - lastProgressUpdate < 8000
 				) {
 					return;
 				}
-				lastProgressNotice = now;
-				new Notice(`XGKB Sync: ${msg}`, 3000);
+				lastProgressUpdate = now;
+				progressNotice.update(msg);
 			}, since);
 
 			if (stats.newSince) {
@@ -358,19 +367,16 @@ export default class XgkbSyncPlugin extends Plugin {
 			if (stats.skipped > 0) lines.push(`跳过:${stats.skipped}`);
 
 			const summary = lines.length > 0 ? lines.join(" ") : "无变化";
-			new Notice(`XGKB Sync 完成: ${summary}`, stats.failed > 0 ? 8000 : 4000);
-
+			let finishMsg = `完成: ${summary}`;
 			if (stats.errors.length > 0) {
 				console.error("[XGKB Sync] 同步错误:", stats.errors);
-				new Notice(
-					`XGKB Sync: ${stats.errors.length} 个文件失败（已记录，下次优先重试；水位已推进）`,
-					8000
-				);
+				finishMsg += `（${stats.errors.length} 个失败，下次重试）`;
 			}
+			progressNotice.finish(finishMsg, stats.failed > 0 ? 8000 : 4000);
 		} catch (e) {
 			const msg = e instanceof Error ? e.message : String(e);
 			console.error("[XGKB Sync] 同步异常:", msg);
-			new Notice(`XGKB Sync 同步失败: ${msg}`, 8000);
+			progressNotice.finish(`同步失败: ${msg}`, 8000);
 		} finally {
 			if (dbOpened) db.close();
 			this.isSyncing = false;

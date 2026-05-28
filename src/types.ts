@@ -34,6 +34,13 @@ export interface SyncScopeEntry {
 
 export type SyncStatus = "done" | "failed";
 
+export interface PendingRemoteRenameOp {
+	op: "rename-or-move";
+	oldPath: string;
+	newPath: string;
+	setAt: number;
+}
+
 export interface SyncStateRecord {
 	scopeKey: string;          // 复合主键之一：同步作用域
 	localPath: string;         // 复合主键之一：相对路径，如 "日常学习/笔记.md"
@@ -44,6 +51,12 @@ export interface SyncStateRecord {
 	syncStatus: SyncStatus;
 	lastSyncAt: number;        // 上次同步时间戳
 	lastError?: string;
+	/** 本地 rename/move 后待推送到远端的动作（用于 push/bidirectional 的确定性执行） */
+	pendingRemoteOp?: "rename-or-move";
+	pendingOldPath?: string;
+	pendingNewPath?: string;
+	pendingSetAt?: number;
+	pendingRemoteOps?: PendingRemoteRenameOp[];
 }
 
 /** 本地文件条目 */
@@ -130,6 +143,21 @@ export interface UpdateFileResult {
 
 export type Result<T> = { ok: true; value: T } | { ok: false; error: string };
 
+export interface SyncPlanTraceItem {
+	op: string;
+	path: string;
+	targetPath?: string;
+	remoteOldPath?: string;
+	isDirectory?: boolean;
+}
+
+export interface SyncExecTraceItem {
+	op: string;
+	path: string;
+	status: "ok" | "failed";
+	message?: string;
+}
+
 export interface SyncStats {
 	uploaded: number;
 	downloaded: number;
@@ -141,6 +169,8 @@ export interface SyncStats {
 	retriedFailed?: number;
 	renamed?: number;
 	moved?: number;
+	planTrace?: SyncPlanTraceItem[];
+	execTrace?: SyncExecTraceItem[];
 }
 
 /** getDownloadInfo（4.1）响应 */

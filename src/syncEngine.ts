@@ -1,8 +1,11 @@
 import type {
 	XgkbPluginSettings,
 	FileEntry,
+	PendingRemoteRenameOp,
 	SyncStateRecord,
 	SyncStats,
+	SyncPlanTraceItem,
+	SyncExecTraceItem,
 	ProgressCallback,
 	MoveFileResult,
 	XgkbMetaItem,
@@ -18,8 +21,6 @@ import {
 	EXECUTE_BATCH_PAUSE_MS,
 	MTIME_TOLERANCE_MS,
 	CHANGES_SAFETY_WINDOW_MS,
-	DIR_RENAME_COVERAGE_RATIO,
-	DIR_RENAME_MIN_FILES,
 	XGKB_NODE_FOLDER,
 } from "./constants";
 import {
@@ -44,7 +45,11 @@ type RemoteMapBuild = {
 	/** 增量：listChanges.serverTime；全量：子树内最大 updateTime */
 	watermarkCandidate: number;
 	scanMode: "incremental" | "full";
+	/** 本轮 listChanges 明确 delete 的文件/目录 fileId */
+	deletedFileIds: Set<string>;
+	deletedFolderIds: Set<string>;
 };
+const TRACE_LIMIT = 300;
 
 /**
  * 同步引擎（Last-Write-Wins）
@@ -63,6 +68,10 @@ export class SyncEngine {
 	private successfulRemoteMtimes: number[] = [];
 	/** 上传/rename-remote 完成后批量刷新远端 mtime（fileId → localPath） */
 	private mtimeRefreshQueue = new Map<string, string>();
+	/** 本轮增量 listChanges 确认的远端删除（用于 pull 本地删除，避免误删） */
+	private remoteDeletedFileIds = new Set<string>();
+	private remoteDeletedFolderIds = new Set<string>();
+	private remoteDeletedLocalPaths = new Set<string>();
 
 	constructor(
 		fsLocal: FsLocal,
@@ -93,6 +102,8 @@ export class SyncEngine {
 			errors: [],
 			renamed: 0,
 			moved: 0,
+			planTrace: [],
+			execTrace: [],
 		};
 	}
 
@@ -100,6 +111,9 @@ export class SyncEngine {
 		this.stats = this.emptyStats();
 		this.successfulRemoteMtimes = [];
 		this.mtimeRefreshQueue.clear();
+		this.remoteDeletedFileIds = new Set();
+		this.remoteDeletedFolderIds = new Set();
+		this.remoteDeletedLocalPaths = new Set();
 		this.progress = onProgress || (() => {});
 		const prog = (msg: string) => {
 			console.debug(`[XGKB Sync] ${msg}`);
@@ -116,6 +130,8 @@ export class SyncEngine {
 
 		const remoteBuild = await this.buildRemoteMap(since, prog);
 		let remoteMap = remoteBuild.map;
+		this.remoteDeletedFileIds = remoteBuild.deletedFileIds;
+		this.remoteDeletedFolderIds = remoteBuild.deletedFolderIds;
 		prog(`云端: ${remoteMap.size} 个文件（${formatSyncExtensionsLabel(normalizeSyncExtensions(this.settings.syncFileExtensions))}，候选水位 ${remoteBuild.watermarkCandidate}）`);
 
 		const retried = await this.injectFailedRetries(remoteMap, prog);
@@ -126,13 +142,42 @@ export class SyncEngine {
 
 		const localMap = new Map<string, FileEntry>();
 		for (const f of localFiles) localMap.set(f.path, f);
+		const executionPlan = await this.planSync(localMap, remoteMap, prog);
+		await this.applyPlannedOps(executionPlan, prog);
+		this.emitTraceSnapshot(prog);
 
+		await this.flushMtimeRefreshQueue();
+
+		this.stats.newSince = this.computeCommittedWatermark(remoteBuild);
+
+		prog(
+			`完成: ↑${this.stats.uploaded} ↓${this.stats.downloaded} ↻${this.stats.renamed ?? 0} ✗${this.stats.deleted} fail:${this.stats.failed} ∅${this.stats.skipped} 水位=${this.stats.newSince ?? "-"}`
+		);
+		return this.stats;
+	}
+
+	private async planSync(
+		localMap: Map<string, FileEntry>,
+		remoteMap: Map<string, FileEntry>,
+		prog: (msg: string) => void
+	): Promise<SyncExecutionPlan> {
 		const allRecords = await this.db.getAll(this.scopeKey);
 		const recordMap = new Map<string, SyncStateRecord>();
 		for (const r of allRecords) recordMap.set(r.localPath, r);
 
+		this.remoteDeletedLocalPaths = this.collectRemoteDeletedLocalPaths(
+			allRecords,
+			this.remoteDeletedFileIds,
+			this.remoteDeletedFolderIds
+		);
+		if (this.remoteDeletedLocalPaths.size > 0) {
+			prog(
+				`远端已删除 ${this.remoteDeletedFileIds.size} 个文件、${this.remoteDeletedFolderIds.size} 个目录，计划本地清理 ${this.remoteDeletedLocalPaths.size} 个路径`
+			);
+		}
+
 		const consumedPaths = new Set<string>();
-		const rawReconcilePlans = this.buildPathReconcilePlans(
+		const rawReconcilePlans = await this.buildPathReconcilePlans(
 			localMap,
 			remoteMap,
 			recordMap,
@@ -141,10 +186,10 @@ export class SyncEngine {
 		);
 		const reconcilePlans = await this.collapseDirectoryReconcilePlans(
 			rawReconcilePlans,
-			allRecords,
+			localMap,
+			remoteMap,
 			prog
 		);
-		// collapse 可能新增 consume 路径
 		for (const plan of reconcilePlans) {
 			if (!plan.isDirectory) continue;
 			for (const p of plan.consumedPaths ?? []) consumedPaths.add(p);
@@ -171,60 +216,88 @@ export class SyncEngine {
 			plans.push({ path, local, remote, record, op });
 		}
 
-		const renameLocalPlans = plans.filter((p) => p.op === "rename-local");
-		const renameRemotePlans = plans.filter((p) => p.op === "rename-remote");
-		const deletePlans = plans.filter((p) => p.op === "delete-local" || p.op === "delete-remote");
-		const downloadPlans = plans.filter((p) => p.op === "download-new" || p.op === "download-update");
-		const uploadPlans = plans.filter((p) => p.op === "upload-new" || p.op === "upload-update");
 		const skipCount = plans.filter((p) => p.op === "skip").length;
 		this.stats.skipped += skipCount;
+		this.capturePlanTrace(plans);
 
-		for (const plan of renameLocalPlans) {
+		return {
+			plans,
+			renameLocalPlans: plans.filter((p) => p.op === "rename-local"),
+			renameRemotePlans: plans.filter((p) => p.op === "rename-remote"),
+			deletePlans: plans.filter((p) => p.op === "delete-local" || p.op === "delete-remote"),
+			downloadPlans: plans.filter((p) => p.op === "download-new" || p.op === "download-update"),
+			uploadPlans: plans.filter((p) => p.op === "upload-new" || p.op === "upload-update"),
+		};
+	}
+
+	private capturePlanTrace(plans: SyncPlan[]): void {
+		const compact: SyncPlanTraceItem[] = plans.slice(0, TRACE_LIMIT).map((plan) => ({
+			op: plan.op,
+			path: plan.path,
+			targetPath: plan.targetPath,
+			remoteOldPath: plan.remoteOldPath,
+			isDirectory: plan.isDirectory,
+		}));
+		this.stats.planTrace = compact;
+	}
+
+	private appendExecTrace(plan: SyncPlan, status: "ok" | "failed", message?: string): void {
+		if (!this.stats.execTrace) this.stats.execTrace = [];
+		if (this.stats.execTrace.length >= TRACE_LIMIT) return;
+		const item: SyncExecTraceItem = { op: plan.op, path: plan.path, status };
+		if (message) item.message = message;
+		this.stats.execTrace.push(item);
+	}
+
+	private emitTraceSnapshot(prog: (msg: string) => void): void {
+		const planCount = this.stats.planTrace?.length ?? 0;
+		const execCount = this.stats.execTrace?.length ?? 0;
+		prog(`trace: plan=${planCount} exec=${execCount} (limit=${TRACE_LIMIT})`);
+		console.debug("[XGKB Sync][trace] plan", this.stats.planTrace);
+		console.debug("[XGKB Sync][trace] exec", this.stats.execTrace);
+	}
+
+	private async applyPlannedOps(
+		execution: SyncExecutionPlan,
+		prog: (msg: string) => void
+	): Promise<void> {
+		for (const plan of execution.renameLocalPlans) {
 			await this.executePlan(plan);
 		}
-		for (const plan of deletePlans) {
+		for (const plan of execution.deletePlans) {
 			await this.executePlan(plan);
 		}
 
-		if (downloadPlans.length > 0) {
-			prog(`开始下载 ${downloadPlans.length} 个文件（并发 ${DOWNLOAD_CONCURRENCY}）...`);
+		if (execution.downloadPlans.length > 0) {
+			prog(`开始下载 ${execution.downloadPlans.length} 个文件（并发 ${DOWNLOAD_CONCURRENCY}）...`);
 			let done = 0;
-			await this.runWithConcurrency(downloadPlans, DOWNLOAD_CONCURRENCY, async (plan) => {
+			await this.runWithConcurrency(execution.downloadPlans, DOWNLOAD_CONCURRENCY, async (plan) => {
 				await this.executePlan(plan);
 				done++;
-				if (done % 5 === 0 || done === downloadPlans.length) {
-					prog(`下载进度 ${done}/${downloadPlans.length}（↓${this.stats.downloaded} 失败 ${this.stats.failed}）`);
+				if (done % 5 === 0 || done === execution.downloadPlans.length) {
+					prog(`下载进度 ${done}/${execution.downloadPlans.length}（↓${this.stats.downloaded} 失败 ${this.stats.failed}）`);
 				}
 			});
 		}
 
-		for (const plan of renameRemotePlans) {
+		for (const plan of execution.renameRemotePlans) {
 			await this.executePlan(plan);
 		}
 
-		if (uploadPlans.length > 0) {
-			prog(`开始上传 ${uploadPlans.length} 个文件（并发 ${UPLOAD_CONCURRENCY}）...`);
+		if (execution.uploadPlans.length > 0) {
+			prog(`开始上传 ${execution.uploadPlans.length} 个文件（并发 ${UPLOAD_CONCURRENCY}）...`);
 			let done = 0;
-			await this.runWithConcurrency(uploadPlans, UPLOAD_CONCURRENCY, async (plan) => {
+			await this.runWithConcurrency(execution.uploadPlans, UPLOAD_CONCURRENCY, async (plan) => {
 				await this.executePlan(plan);
 				done++;
-				if (done % 3 === 0 || done === uploadPlans.length) {
-					prog(`上传进度 ${done}/${uploadPlans.length}（↑${this.stats.uploaded} 失败 ${this.stats.failed}）`);
+				if (done % 3 === 0 || done === execution.uploadPlans.length) {
+					prog(`上传进度 ${done}/${execution.uploadPlans.length}（↑${this.stats.uploaded} 失败 ${this.stats.failed}）`);
 				}
 				if (done % UPLOAD_CONCURRENCY === 0) {
 					await this.delay(EXECUTE_BATCH_PAUSE_MS);
 				}
 			});
 		}
-
-		await this.flushMtimeRefreshQueue();
-
-		this.stats.newSince = this.computeCommittedWatermark(remoteBuild);
-
-		prog(
-			`完成: ↑${this.stats.uploaded} ↓${this.stats.downloaded} ↻${this.stats.renamed ?? 0} ✗${this.stats.deleted} fail:${this.stats.failed} ∅${this.stats.skipped} 水位=${this.stats.newSince ?? "-"}`
-		);
-		return this.stats;
 	}
 
 	private computeCommittedWatermark(build: RemoteMapBuild): number {
@@ -300,13 +373,13 @@ export class SyncEngine {
 	}
 
 	/** 同 fileId 路径不一致 → rename 计划（零额外 KB list 调用） */
-	private buildPathReconcilePlans(
+	private async buildPathReconcilePlans(
 		localMap: Map<string, FileEntry>,
 		remoteMap: Map<string, FileEntry>,
 		recordMap: Map<string, SyncStateRecord>,
 		prog: (msg: string) => void,
 		consumed: Set<string>
-	): SyncPlan[] {
+	): Promise<SyncPlan[]> {
 		const plans: SyncPlan[] = [];
 		const dir = this.settings.syncDirection;
 		const fileIdToRemote = new Map<string, FileEntry>();
@@ -315,13 +388,38 @@ export class SyncEngine {
 		}
 
 		for (const record of recordMap.values()) {
+			const pendingPlan = await this.buildPendingRemotePlan(record, localMap, fileIdToRemote);
+			if (pendingPlan) {
+				plans.push(pendingPlan);
+				consumed.add(record.localPath);
+				if (pendingPlan.remoteOldPath) consumed.add(pendingPlan.remoteOldPath);
+				syncDiagReconcile("plan", record.xgkbFileId, {
+					op: "rename-remote",
+					reason: "consume pendingRemoteOp",
+					from: pendingPlan.remoteOldPath ?? record.localPath,
+					to: pendingPlan.path,
+					pendingSetAt: pendingPlan.pendingSetAt ?? null,
+				});
+				continue;
+			}
+
 			const remote = fileIdToRemote.get(record.xgkbFileId);
 			if (!remote) {
-				syncDiagReconcile("skip", record.xgkbFileId, {
-					reason: "remoteMap 中无此 fileId",
-					recordPath: record.localPath,
-					syncStatus: record.syncStatus,
-				});
+				if (this.isRemoteConfirmedDeleted(record)) {
+					syncDiagReconcile("match", record.xgkbFileId, {
+						recordPath: record.localPath,
+						remotePath: "(deleted)",
+						localAtRecord: Boolean(localMap.get(record.localPath)),
+						localAtRemote: false,
+						op: "delete-local",
+					});
+				} else {
+					syncDiagReconcile("skip", record.xgkbFileId, {
+						reason: "remoteMap 中无此 fileId",
+						recordPath: record.localPath,
+						syncStatus: record.syncStatus,
+					});
+				}
 				continue;
 			}
 			if (remote.path === record.localPath) continue;
@@ -432,10 +530,82 @@ export class SyncEngine {
 		return plans;
 	}
 
+	private async buildPendingRemotePlan(
+		record: SyncStateRecord,
+		localMap: Map<string, FileEntry>,
+		fileIdToRemote?: Map<string, FileEntry>
+	): Promise<SyncPlan | null> {
+		if (this.settings.syncDirection === "pull") return null;
+		const pendingOps = this.getPendingRemoteRenameOps(record);
+		if (pendingOps.length === 0) return null;
+		const pending = this.getEffectivePendingRemoteRename(pendingOps);
+		if (!pending) return null;
+		const expectedNewPath = pending.newPath;
+		if (expectedNewPath !== record.localPath) return null;
+		const local = localMap.get(record.localPath);
+		if (!local) return null;
+		// 优先使用远端实际路径（来自增量扫描），避免多次连续 rename 后
+		// pendingOldPath 指向中间路径导致目录聚合错误。
+		const actualRemote = fileIdToRemote?.get(record.xgkbFileId);
+		const remoteOldPath = actualRemote?.path || pending.oldPath || record.localPath;
+		// 远端已在目标路径：不再生成 rename 计划，避免 no-op 干扰目录聚合。
+		if (remoteOldPath === record.localPath) {
+			await this.db.clearPendingRemoteOps(this.scopeKey, record.localPath);
+			syncDiagReconcile("skip", record.xgkbFileId, {
+				reason: "pending no-op（远端路径已对齐），已清理 pending",
+				recordPath: record.localPath,
+			});
+			return null;
+		}
+		return {
+			path: record.localPath,
+			remoteOldPath,
+			pendingSetAt: pending.setAt,
+			local,
+			remote: actualRemote,
+			record,
+			op: "rename-remote",
+		};
+	}
+
+	private getPendingRemoteRenameOps(record: SyncStateRecord): PendingRemoteRenameOp[] {
+		if (record.pendingRemoteOps?.length) return record.pendingRemoteOps;
+		if (
+			record.pendingRemoteOp === "rename-or-move" &&
+			record.pendingOldPath &&
+			record.pendingNewPath
+		) {
+			return [
+				{
+					op: "rename-or-move",
+					oldPath: record.pendingOldPath,
+					newPath: record.pendingNewPath,
+					setAt: record.pendingSetAt ?? record.lastSyncAt,
+				},
+			];
+		}
+		return [];
+	}
+
+	private getEffectivePendingRemoteRename(
+		ops: PendingRemoteRenameOp[]
+	): { oldPath: string; newPath: string; setAt: number } | null {
+		if (ops.length === 0) return null;
+		const first = ops[0];
+		const last = ops[ops.length - 1];
+		if (!first.oldPath || !last.newPath) return null;
+		return {
+			oldPath: first.oldPath,
+			newPath: last.newPath,
+			setAt: last.setAt,
+		};
+	}
+
 	/** 将同前缀变更的多文件 rename 聚合为目录级计划（1 次 folder API） */
 	private async collapseDirectoryReconcilePlans(
 		plans: SyncPlan[],
-		allRecords: SyncStateRecord[],
+		localMap: Map<string, FileEntry>,
+		remoteMap: Map<string, FileEntry>,
 		prog: (msg: string) => void
 	): Promise<SyncPlan[]> {
 		const renamePlans = plans.filter((p) => p.op === "rename-local" || p.op === "rename-remote");
@@ -463,16 +633,52 @@ export class SyncEngine {
 		const consumed = new Set<SyncPlan>();
 
 		for (const group of groups.values()) {
-			const countPrefix = group.op === "rename-local" ? group.oldPrefix : group.newPrefix;
-			const totalUnderPrefix = allRecords.filter(
-				(r) =>
-					r.syncStatus !== "failed" &&
-					(r.localPath === countPrefix || r.localPath.startsWith(`${countPrefix}/`))
-			).length;
-			const meetsThreshold =
-				group.items.length >= DIR_RENAME_MIN_FILES &&
-				totalUnderPrefix > 0 &&
-				group.items.length >= totalUnderPrefix * DIR_RENAME_COVERAGE_RATIO;
+			// 单文件计划不做目录聚合：优先走文件级 rename/move，避免误把“文件跨目录移动”
+			// 升级为“整目录移动”导致目标目录冲突（如 sub4 已存在）。
+			if (group.items.length < 2) {
+				for (const item of group.items) collapsed.push(item);
+				continue;
+			}
+
+			// 仅在“可证明整目录搬迁”时才做目录聚合：
+			// - rename-local：group 覆盖 oldPrefix 下全部本地文件
+			// - rename-remote：group 覆盖 oldPrefix 下全部远端文件
+			// 否则保留文件级计划，避免误把单文件 move 升级成目录 move。
+			let totalUnderPrefix = 0;
+			let meetsThreshold = false;
+			if (group.op === "rename-local") {
+				const localOldPaths = [...localMap.keys()].filter((p) =>
+					pathUnderPrefix(p, group.oldPrefix)
+				);
+				totalUnderPrefix = localOldPaths.length;
+				const groupedOldPaths = new Set(group.items.map((item) => item.path));
+				meetsThreshold =
+					totalUnderPrefix > 0 &&
+					group.items.length === totalUnderPrefix &&
+					localOldPaths.every((p) => groupedOldPaths.has(p));
+			} else {
+				const remoteEntriesUnderOldPrefix = [...remoteMap.values()].filter((entry) =>
+					pathUnderPrefix(entry.path, group.oldPrefix)
+				);
+				totalUnderPrefix = remoteEntriesUnderOldPrefix.length;
+				const groupedRemoteIds = new Set(
+					group.items.map((item) => item.record?.xgkbFileId || item.remote?.xgkbFileId).filter(Boolean)
+				);
+				const groupedRemoteOldPaths = new Set(
+					group.items
+						.map((item) => item.remoteOldPath || item.remote?.path)
+						.filter((p): p is string => Boolean(p))
+				);
+				const allRemoteCovered = remoteEntriesUnderOldPrefix.every((entry) =>
+					entry.xgkbFileId
+						? groupedRemoteIds.has(entry.xgkbFileId)
+						: groupedRemoteOldPaths.has(entry.path)
+				);
+				meetsThreshold =
+					totalUnderPrefix > 0 &&
+					group.items.length === totalUnderPrefix &&
+					allRemoteCovered;
+			}
 
 			if (!meetsThreshold) {
 				for (const item of group.items) collapsed.push(item);
@@ -497,6 +703,24 @@ export class SyncEngine {
 				const resolved = await this.fsXgkb.resolveFolderIdForRelativePath(group.oldPrefix);
 				if (resolved.ok) remoteFolderFileId = resolved.value;
 			}
+			// 远端目录聚合必须拿到目录 fileId，否则回退文件级计划。
+			if (group.op === "rename-remote" && !remoteFolderFileId) {
+				prog(`目录聚合回退: 无法解析远端目录 ID，改用文件级计划 (${group.oldPrefix} -> ${group.newPrefix})`);
+				for (const item of group.items) collapsed.push(item);
+				continue;
+			}
+			// 远端目标前缀下已存在文件时，不执行目录级 rename/move，避免 API 400001 冲突。
+			if (
+				group.op === "rename-remote" &&
+				group.oldPrefix !== group.newPrefix &&
+				[...remoteMap.values()].some((entry) => pathUnderPrefix(entry.path, group.newPrefix))
+			) {
+				prog(
+					`目录聚合回退: 目标目录已存在内容，改用文件级计划 (${group.oldPrefix} -> ${group.newPrefix})`
+				);
+				for (const item of group.items) collapsed.push(item);
+				continue;
+			}
 
 			const newFolderName = group.newPrefix.split("/").pop() || group.newPrefix;
 			collapsed.push({
@@ -519,9 +743,30 @@ export class SyncEngine {
 			if (!consumed.has(plan)) collapsed.push(plan);
 		}
 
-		const dirCount = collapsed.filter((p) => p.isDirectory).length;
+		// 父目录 rename/move 已覆盖子目录时，丢弃子目录计划，避免执行顺序导致“目录不存在”。
+		const dirPlans = collapsed.filter((p) => p.isDirectory);
+		const dedupedDirPlans: SyncPlan[] = [];
+		let droppedNestedDirPlans = 0;
+		const sortedDirPlans = [...dirPlans].sort(
+			(a, b) => (a.directoryOldPath?.length ?? 0) - (b.directoryOldPath?.length ?? 0)
+		);
+		for (const plan of sortedDirPlans) {
+			const covered = dedupedDirPlans.some((parent) => isNestedDirectoryPlanCovered(parent, plan));
+			if (covered) {
+				droppedNestedDirPlans++;
+				continue;
+			}
+			dedupedDirPlans.push(plan);
+		}
+		if (droppedNestedDirPlans > 0) {
+			prog(`目录计划去重: 跳过 ${droppedNestedDirPlans} 个被父目录覆盖的子目录计划`);
+		}
+
+		const nonDirPlans = collapsed.filter((p) => !p.isDirectory);
+		const finalPlans = [...nonDirPlans, ...dedupedDirPlans];
+		const dirCount = dedupedDirPlans.length;
 		if (dirCount > 0) prog(`目录级 rename/move: ${dirCount} 组（由 ${renamePlans.length} 个文件计划聚合）`);
-		return collapsed;
+		return finalPlans;
 	}
 
 	private async runWithConcurrency<T>(
@@ -575,10 +820,17 @@ export class SyncEngine {
 
 		const upsertById = new Map<string, (typeof items)[0]>();
 		const deleteIds = new Set<string>();
+		const deletedFileIds = new Set<string>();
+		const deletedFolderIds = new Set<string>();
 		for (const item of items) {
 			const id = String(item.fileId);
-			if (item.event === "delete") deleteIds.add(id);
-			else upsertById.set(id, item);
+			if (item.event === "delete") {
+				deleteIds.add(id);
+				if (item.type === XGKB_NODE_FOLDER) deletedFolderIds.add(id);
+				else deletedFileIds.add(id);
+			} else {
+				upsertById.set(id, item);
+			}
 		}
 
 		const allRecords = await this.db.getAll(this.scopeKey);
@@ -793,7 +1045,13 @@ export class SyncEngine {
 			});
 		}
 
-		return { map, watermarkCandidate, scanMode: "incremental" };
+		return {
+			map,
+			watermarkCandidate,
+			scanMode: "incremental",
+			deletedFileIds,
+			deletedFolderIds,
+		};
 	}
 
 	private buildFolderIdToPathFromRecords(records: SyncStateRecord[]): Map<string, string> {
@@ -801,7 +1059,11 @@ export class SyncEngine {
 		const rootId = this.fsXgkb.getRootId();
 		if (rootId) folderIdToPath.set(rootId, "");
 		for (const record of records) {
-			const parts = record.localPath.split("/");
+			// pending rename/move 时，localPath 已是“本地新路径”，而 xgkbFolderId 仍指向“远端旧父目录”。
+			// 这里必须用 pending.oldPath 的父目录作为远端目录映射，避免增量路径重建被本地状态污染。
+			const pending = this.getEffectivePendingRemoteRename(this.getPendingRemoteRenameOps(record));
+			const pathForRemoteFolderMap = pending?.oldPath || record.localPath;
+			const parts = pathForRemoteFolderMap.split("/");
 			const folderPath = parts.length > 1 ? parts.slice(0, -1).join("/") : "";
 			folderIdToPath.set(record.xgkbFolderId, folderPath);
 		}
@@ -1033,7 +1295,55 @@ export class SyncEngine {
 		console.debug(
 			`[XGKB Sync] 全量扫描完成: ${map.size} 个文件，候选水位=${watermarkCandidate} (${new Date(watermarkCandidate).toLocaleString("zh-CN")})`
 		);
-		return { map, watermarkCandidate, scanMode: "full" };
+		return {
+			map,
+			watermarkCandidate,
+			scanMode: "full",
+			deletedFileIds: new Set(),
+			deletedFolderIds: new Set(),
+		};
+	}
+
+	/** listChanges delete 事件 → 需要本地删除的相对路径 */
+	private collectRemoteDeletedLocalPaths(
+		allRecords: SyncStateRecord[],
+		deletedFileIds: Set<string>,
+		deletedFolderIds: Set<string>
+	): Set<string> {
+		const paths = new Set<string>();
+		if (deletedFileIds.size === 0 && deletedFolderIds.size === 0) return paths;
+
+		const folderPrefixes = new Set<string>();
+		for (const folderId of deletedFolderIds) {
+			for (const record of allRecords) {
+				if (record.xgkbFolderId !== folderId) continue;
+				const prefix = parentPathOf(record.localPath);
+				if (prefix) folderPrefixes.add(prefix);
+			}
+		}
+
+		for (const record of allRecords) {
+			if (deletedFileIds.has(record.xgkbFileId)) {
+				paths.add(record.localPath);
+				continue;
+			}
+			for (const prefix of folderPrefixes) {
+				if (
+					record.localPath === prefix ||
+					record.localPath.startsWith(`${prefix}/`)
+				) {
+					paths.add(record.localPath);
+					break;
+				}
+			}
+		}
+		return paths;
+	}
+
+	private isRemoteConfirmedDeleted(record?: SyncStateRecord): boolean {
+		if (!record) return false;
+		if (this.remoteDeletedFileIds.has(record.xgkbFileId)) return true;
+		return this.remoteDeletedLocalPaths.has(record.localPath);
 	}
 
 	private async executePlan(plan: SyncPlan): Promise<void> {
@@ -1073,10 +1383,12 @@ export class SyncEngine {
 				case "skip":
 					break;
 			}
+			this.appendExecTrace(plan, "ok");
 		} catch (e) {
 			const msg = e instanceof Error ? e.message : String(e);
 			this.stats.failed++;
 			this.stats.errors.push(`${path}: ${msg}`);
+			this.appendExecTrace(plan, "failed", msg);
 			console.error(`[XGKB Sync] 同步失败 ${path}:`, msg);
 			if (op !== "skip" && op !== "delete-local" && op !== "delete-remote") {
 				const failRecords =
@@ -1105,10 +1417,13 @@ export class SyncEngine {
 
 		if (record?.syncStatus === "failed") {
 			if (!remote) {
+				if (local && this.isRemoteConfirmedDeleted(record)) {
+					return dir === "push" ? "skip" : "delete-local";
+				}
 				return local && dir !== "pull" ? "upload-new" : "skip";
 			}
 			if (dir === "pull") return "download-update";
-			if (dir === "push") return local ? "upload-update" : "skip";
+			if (dir === "push") return local ? "upload-update" : "delete-remote";
 			if (!local) return "download-update";
 			return local.mtime >= remote.mtime ? "upload-update" : "download-update";
 		}
@@ -1127,12 +1442,15 @@ export class SyncEngine {
 		if (!local && !remote) return "skip";
 
 		if (!local && remote) {
-			if (dir === "push") return "skip";
+			if (dir === "push") return "delete-remote";
 			const remoteChanged = remote.mtime > record.remoteMtime + MTIME_TOLERANCE_MS;
 			return remoteChanged ? "download-update" : "delete-remote";
 		}
 
 		if (local && !remote) {
+			if (this.isRemoteConfirmedDeleted(record)) {
+				return dir === "push" ? "skip" : "delete-local";
+			}
 			if (dir === "pull") return "skip";
 			const localChanged = local.mtime > record.localMtime + MTIME_TOLERANCE_MS;
 			if (localChanged) return "upload-new";
@@ -1295,12 +1613,17 @@ export class SyncEngine {
 	private async doRenameRemote(plan: SyncPlan): Promise<void> {
 		const { local, path, remote, remoteOldPath } = plan;
 		let { record } = plan;
-		if (!record || !local || !remote) throw new Error("rename-remote 参数不完整");
+		if (!record || !local) throw new Error("rename-remote 参数不完整");
 		const fileId = record.xgkbFileId;
-		const oldRemotePath = remoteOldPath || remote.path;
+		const pending = this.getEffectivePendingRemoteRename(this.getPendingRemoteRenameOps(record));
+		const oldRemotePath =
+			remoteOldPath || remote?.path || pending?.oldPath || record.localPath;
 		const newFileName = path.split("/").pop() || path;
 		const oldParent = parentPathOf(oldRemotePath);
 		const newParent = parentPathOf(path);
+		console.debug(
+			`[XGKB Sync] rename-remote 计划: fileId=${fileId} oldPath="${oldRemotePath}" newPath="${path}" oldParent="${oldParent}" newParent="${newParent}"`
+		);
 
 		if (oldParent === newParent) {
 			const r = await this.fsXgkb.renameRemoteFile(fileId, newFileName);
@@ -1321,6 +1644,19 @@ export class SyncEngine {
 			record = { ...record, xgkbFolderId: targetFolderId };
 		}
 
+		// rename/move 完成后检查内容是否在此次操作前已被修改（先 move 再上传，顺序不能颠倒）
+		const localChanged = local.mtime > record.localMtime + MTIME_TOLERANCE_MS;
+		if (localChanged) {
+			const content = await this.fsLocal.readFile(path);
+			const fileName = path.split("/").pop() || path;
+			const updateResult = await this.fsXgkb.updateFile(fileId, fileName, content);
+			if (!updateResult.ok) throw new Error(`rename-remote 后内容更新失败: ${updateResult.error}`);
+			this.stats.uploaded++;
+			this.progress(`↻↑ 远端移动并更新内容 → ${path}`);
+		} else {
+			this.progress(`↻ 远端 → ${path}`);
+		}
+
 		const interimMtime = plan.remote?.mtime ?? record.remoteMtime;
 		await this.db.put(
 			this.buildDbRecord(path, {
@@ -1332,13 +1668,25 @@ export class SyncEngine {
 			})
 		);
 		this.queueMtimeRefresh(fileId, path);
-		this.progress(`↻ 远端 → ${path}`);
 	}
 
 	private async doRenameLocalDirectory(plan: SyncPlan): Promise<void> {
 		const oldPrefix = plan.directoryOldPath;
 		const newPrefix = plan.directoryNewPath;
 		if (!oldPrefix || !newPrefix) throw new Error("rename-local(目录) 参数不完整");
+
+		// 幂等防护：父目录计划已执行时，子目录旧路径可能已不存在。
+		// 若新目录已存在则视为成功，避免“目录不存在”导致整轮 fail。
+		const oldExists = await this.fsLocal.folderExists(oldPrefix);
+		if (!oldExists) {
+			const newExists = await this.fsLocal.folderExists(newPrefix);
+			if (newExists) {
+				const moved = await this.db.relocateRecordsByPrefix(this.scopeKey, oldPrefix, newPrefix);
+				this.progress(`↻ 本地目录 ${oldPrefix} → ${newPrefix}（已存在目标目录，跳过重复执行，${moved} 个文件）`);
+				return;
+			}
+			throw new Error(`目录不存在: ${oldPrefix}`);
+		}
 
 		await this.fsLocal.renameFolder(oldPrefix, newPrefix);
 		const moved = await this.db.relocateRecordsByPrefix(this.scopeKey, oldPrefix, newPrefix);
@@ -1362,9 +1710,25 @@ export class SyncEngine {
 		if (!r.ok) throw new Error(r.error);
 
 		await this.db.relocateRecordsByPrefix(this.scopeKey, oldPrefix, newPrefix);
+		await this.db.clearPendingRemoteOpsByPrefix(this.scopeKey, newPrefix);
+
+		// 目录 rename 完成后，检查各文件内容是否在此次操作前已被修改
 		for (const rec of affectedRecords) {
 			const suffix = rec.localPath.slice(oldPrefix.length);
 			const newPath = `${newPrefix}${suffix}`;
+			const currentMtime = await this.fsLocal.getMtime(newPath);
+			if (
+				currentMtime != null &&
+				rec.xgkbFileId &&
+				currentMtime > rec.localMtime + MTIME_TOLERANCE_MS
+			) {
+				const content = await this.fsLocal.readFile(newPath);
+				const fileName = newPath.split("/").pop() || newPath;
+				const upd = await this.fsXgkb.updateFile(rec.xgkbFileId, fileName, content);
+				if (!upd.ok) throw new Error(`目录 rename 后内容更新失败 ${newPath}: ${upd.error}`);
+				this.stats.uploaded++;
+				this.progress(`↻↑ 目录 rename 后更新内容 → ${newPath}`);
+			}
 			if (rec.xgkbFileId) this.queueMtimeRefresh(rec.xgkbFileId, newPath);
 		}
 
@@ -1406,6 +1770,7 @@ export class SyncEngine {
 		}
 
 		await this.db.relocateRecordsByPrefix(this.scopeKey, oldPrefix, newPrefix);
+		await this.db.clearPendingRemoteOpsByPrefix(this.scopeKey, newPrefix);
 
 		// 直接子文件的 parent folderId 随目录 move 变化
 		const all = await this.db.getAll(this.scopeKey);
@@ -1417,6 +1782,25 @@ export class SyncEngine {
 				await this.db.put({ ...rec, xgkbFolderId: folderFileId, lastSyncAt: Date.now() });
 			}
 			this.queueMtimeRefresh(rec.xgkbFileId, rec.localPath);
+		}
+
+		// 目录 move 完成后，检查各文件内容是否在此次操作前已被修改
+		for (const rec of affectedRecords) {
+			const suffix = rec.localPath.slice(oldPrefix.length);
+			const newPath = `${newPrefix}${suffix}`;
+			const currentMtime = await this.fsLocal.getMtime(newPath);
+			if (
+				currentMtime != null &&
+				rec.xgkbFileId &&
+				currentMtime > rec.localMtime + MTIME_TOLERANCE_MS
+			) {
+				const content = await this.fsLocal.readFile(newPath);
+				const fileName = newPath.split("/").pop() || newPath;
+				const upd = await this.fsXgkb.updateFile(rec.xgkbFileId, fileName, content);
+				if (!upd.ok) throw new Error(`目录 move 后内容更新失败 ${newPath}: ${upd.error}`);
+				this.stats.uploaded++;
+				this.progress(`↻↑ 目录 move 后更新内容 → ${newPath}`);
+			}
 		}
 
 		this.stats.moved = (this.stats.moved ?? 0) + 1;
@@ -1480,6 +1864,7 @@ type SyncPlan = {
 	path: string;
 	targetPath?: string;
 	remoteOldPath?: string;
+	pendingSetAt?: number;
 	local: FileEntry | undefined;
 	remote: FileEntry | undefined;
 	record: SyncStateRecord | undefined;
@@ -1493,43 +1878,80 @@ type SyncPlan = {
 	consumedPaths?: string[];
 };
 
+type SyncExecutionPlan = {
+	plans: SyncPlan[];
+	renameLocalPlans: SyncPlan[];
+	renameRemotePlans: SyncPlan[];
+	deletePlans: SyncPlan[];
+	downloadPlans: SyncPlan[];
+	uploadPlans: SyncPlan[];
+};
+
 function parentPathOf(relativePath: string): string {
 	const i = relativePath.lastIndexOf("/");
 	return i > 0 ? relativePath.substring(0, i) : "";
 }
 
-/** 从单文件路径变化推导目录前缀变更（仅一个路径段不同且文件名不变） */
+/** 从单文件路径变化推导目录前缀变更（同级 rename 或整夹 move，文件名不变） */
 function deriveDirPrefixChange(
 	oldPath: string,
 	newPath: string
 ): { oldPrefix: string; newPrefix: string } | null {
-	const oldSlash = oldPath.lastIndexOf("/");
-	const newSlash = newPath.lastIndexOf("/");
-	if (oldSlash !== newSlash) return null;
-	const fileName = oldSlash >= 0 ? oldPath.slice(oldSlash + 1) : oldPath;
-	if ((newSlash >= 0 ? newPath.slice(newSlash + 1) : newPath) !== fileName) return null;
+	const oldParts = oldPath.split("/");
+	const newParts = newPath.split("/");
+	if (oldParts.length === 0 || newParts.length === 0) return null;
 
-	const oldDir = oldSlash >= 0 ? oldPath.slice(0, oldSlash) : "";
-	const newDir = newSlash >= 0 ? newPath.slice(0, newSlash) : "";
-	if (oldDir === newDir) return null;
+	const fileName = oldParts[oldParts.length - 1];
+	if (fileName !== newParts[newParts.length - 1]) return null;
 
-	const oldParts = oldDir ? oldDir.split("/") : [];
-	const newParts = newDir ? newDir.split("/") : [];
-	if (oldParts.length !== newParts.length) return null;
-
-	let diffIdx = -1;
-	for (let i = 0; i < oldParts.length; i++) {
-		if (oldParts[i] !== newParts[i]) {
-			if (diffIdx >= 0) return null;
-			diffIdx = i;
-		}
+	const oldDirs = oldParts.slice(0, -1);
+	const newDirs = newParts.slice(0, -1);
+	if (oldDirs.join("/") === newDirs.join("/")) return null;
+	// 通过「公共前缀 + 公共后缀」切分目录段，得到被 rename/move 的最小目录块。
+	let prefixLen = 0;
+	while (
+		prefixLen < oldDirs.length &&
+		prefixLen < newDirs.length &&
+		oldDirs[prefixLen] === newDirs[prefixLen]
+	) {
+		prefixLen++;
 	}
-	if (diffIdx < 0) return null;
 
-	return {
-		oldPrefix: oldParts.slice(0, diffIdx + 1).join("/"),
-		newPrefix: newParts.slice(0, diffIdx + 1).join("/"),
-	};
+	let suffixLen = 0;
+	while (
+		suffixLen < oldDirs.length - prefixLen &&
+		suffixLen < newDirs.length - prefixLen &&
+		oldDirs[oldDirs.length - 1 - suffixLen] === newDirs[newDirs.length - 1 - suffixLen]
+	) {
+		suffixLen++;
+	}
+
+	let oldMid = oldDirs.slice(prefixLen, oldDirs.length - suffixLen);
+	let newMid = newDirs.slice(prefixLen, newDirs.length - suffixLen);
+	// 处理“整夹挂到新父目录下 / 从父目录提出来”的情况：
+	// 这两类变化会表现为一侧中段为空，需要把公共后缀中的首段纳入被移动目录。
+	if (oldMid.length === 0 && newMid.length > 0 && prefixLen < oldDirs.length) {
+		oldMid = [oldDirs[prefixLen]];
+		newMid = [...newMid, oldDirs[prefixLen]];
+	} else if (newMid.length === 0 && oldMid.length > 0 && prefixLen < newDirs.length) {
+		oldMid = [...oldMid, newDirs[prefixLen]];
+		newMid = [newDirs[prefixLen]];
+	}
+	if (oldMid.length === 0 || newMid.length === 0) return null;
+
+	const oldPrefix = oldDirs.slice(0, prefixLen + oldMid.length).join("/");
+	const newPrefix = newDirs.slice(0, prefixLen + newMid.length).join("/");
+
+	if (!oldPrefix || oldPrefix === newPrefix) return null;
+
+	const suffix = oldPath.slice(oldPrefix.length);
+	const expected =
+		suffix.startsWith("/") || suffix.length === 0
+			? `${newPrefix}${suffix}`
+			: `${newPrefix}/${suffix}`;
+	if (newPath !== expected) return null;
+
+	return { oldPrefix, newPrefix };
 }
 
 function pickDirectChildFolderId(records: SyncStateRecord[], oldPrefix: string): string | undefined {
@@ -1539,6 +1961,25 @@ function pickDirectChildFolderId(records: SyncStateRecord[], oldPrefix: string):
 		if (!rest.includes("/") && rec.xgkbFolderId) return rec.xgkbFolderId;
 	}
 	return undefined;
+}
+
+function isNestedDirectoryPlanCovered(parent: SyncPlan, child: SyncPlan): boolean {
+	if (!parent.isDirectory || !child.isDirectory) return false;
+	if (parent.op !== child.op) return false;
+	const pOld = parent.directoryOldPath;
+	const pNew = parent.directoryNewPath;
+	const cOld = child.directoryOldPath;
+	const cNew = child.directoryNewPath;
+	if (!pOld || !pNew || !cOld || !cNew) return false;
+	if (cOld === pOld) return true;
+	if (!cOld.startsWith(`${pOld}/`)) return false;
+	const suffix = cOld.slice(pOld.length);
+	return cNew === `${pNew}${suffix}`;
+}
+
+function pathUnderPrefix(path: string, prefix: string): boolean {
+	if (!prefix) return false;
+	return path === prefix || path.startsWith(`${prefix}/`);
 }
 
 function collectMoveIdMappings(

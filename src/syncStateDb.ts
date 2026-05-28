@@ -1,4 +1,4 @@
-import type { SyncStateRecord } from "./types";
+import type { PendingRemoteRenameOp, SyncStateRecord } from "./types";
 import { DB_NAME, DB_VERSION, DB_STORE_NAME } from "./constants";
 import type { Result } from "./types";
 
@@ -118,6 +118,48 @@ export class SyncStateDb {
 		return true;
 	}
 
+	/** 标记文件待推送的远端 rename/move 动作。
+	 *  连续多次 rename/move 时，保留最早一次的 pendingOldPath（= 远端文件实际所在路径），
+	 *  仅更新 pendingNewPath 为最新目标路径，避免目录聚合使用过期中间路径。
+	 */
+	async markPendingRemoteRenameOrMove(
+		scopeKey: string,
+		localPath: string,
+		oldPath: string,
+		newPath: string
+	): Promise<boolean> {
+		const record = await this.get(scopeKey, localPath);
+		if (!record) return false;
+		const existingQueue = this.normalizePendingQueue(record);
+		const now = Date.now();
+		let nextQueue: PendingRemoteRenameOp[];
+		if (existingQueue.length === 0) {
+			nextQueue = [{ op: "rename-or-move", oldPath, newPath, setAt: now }];
+		} else {
+			nextQueue = [...existingQueue];
+			const tail = nextQueue[nextQueue.length - 1];
+			// 连续链式移动（A->B, B->C）压缩为同一链尾更新，减少噪音与中间态。
+			if (tail.newPath === oldPath) {
+				nextQueue[nextQueue.length - 1] = { ...tail, newPath, setAt: now };
+			} else {
+				nextQueue.push({ op: "rename-or-move", oldPath, newPath, setAt: now });
+			}
+		}
+		const effective = {
+			pendingRemoteOp: "rename-or-move" as const,
+			pendingOldPath: nextQueue[0].oldPath,
+			pendingNewPath: nextQueue[nextQueue.length - 1].newPath,
+			pendingSetAt: nextQueue[nextQueue.length - 1].setAt,
+			pendingRemoteOps: nextQueue,
+		};
+		await this.put({
+			...record,
+			...effective,
+			lastSyncAt: Date.now(),
+		});
+		return true;
+	}
+
 	/** 文件夹 rename/move：批量更新 oldPrefix 下所有 record 的路径前缀 */
 	async relocateRecordsByPrefix(
 		scopeKey: string,
@@ -137,6 +179,63 @@ export class SyncStateDb {
 			moved++;
 		}
 		return moved;
+	}
+
+	/** 目录级远端操作完成后，清除该前缀下所有 record 的 pendingRemoteOp */
+	async clearPendingRemoteOpsByPrefix(scopeKey: string, prefix: string): Promise<void> {
+		const all = await this.getAll(scopeKey);
+		for (const record of all) {
+			if (!pathUnderPrefix(record.localPath, prefix)) continue;
+			if (!record.pendingRemoteOp && (!record.pendingRemoteOps || record.pendingRemoteOps.length === 0)) {
+				continue;
+			}
+			const {
+				pendingRemoteOp,
+				pendingOldPath,
+				pendingNewPath,
+				pendingSetAt,
+				pendingRemoteOps,
+				...rest
+			} = record;
+			await this.put({ ...rest, lastSyncAt: Date.now() });
+		}
+	}
+
+	/** 单文件 pending no-op 场景：清理该记录上的 pending 字段 */
+	async clearPendingRemoteOps(scopeKey: string, localPath: string): Promise<void> {
+		const record = await this.get(scopeKey, localPath);
+		if (!record) return;
+		if (!record.pendingRemoteOp && (!record.pendingRemoteOps || record.pendingRemoteOps.length === 0)) {
+			return;
+		}
+		const {
+			pendingRemoteOp,
+			pendingOldPath,
+			pendingNewPath,
+			pendingSetAt,
+			pendingRemoteOps,
+			...rest
+		} = record;
+		await this.put({ ...rest, lastSyncAt: Date.now() });
+	}
+
+	private normalizePendingQueue(record: SyncStateRecord): PendingRemoteRenameOp[] {
+		if (record.pendingRemoteOps?.length) return [...record.pendingRemoteOps];
+		if (
+			record.pendingRemoteOp === "rename-or-move" &&
+			record.pendingOldPath &&
+			record.pendingNewPath
+		) {
+			return [
+				{
+					op: "rename-or-move",
+					oldPath: record.pendingOldPath,
+					newPath: record.pendingNewPath,
+					setAt: record.pendingSetAt ?? Date.now(),
+				},
+			];
+		}
+		return [];
 	}
 
 	/** moveFile 返回的 fileId 映射（目录 move 后子文件 id 可能变化） */

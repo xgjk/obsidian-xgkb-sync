@@ -172,6 +172,19 @@ export class FsLocal {
 		await this.app.fileManager.renameFile(folder, newFull);
 	}
 
+	/** 判断相对路径对应目录是否存在 */
+	async folderExists(relativePath: string): Promise<boolean> {
+		const full = this.resolve(relativePath);
+		const node = this.app.vault.getAbstractFileByPath(full);
+		if (node instanceof Obsidian.TFolder) return true;
+		try {
+			const stat = await this.app.vault.adapter.stat(full);
+			return stat?.type === "folder";
+		} catch {
+			return false;
+		}
+	}
+
 	/** 读取文件内容 */
 	async readFile(relativePath: string): Promise<string> {
 		const fullPath = this.resolve(relativePath);

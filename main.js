@@ -37,7 +37,7 @@ __export(main_exports, {
   default: () => XgkbSyncPlugin
 });
 module.exports = __toCommonJS(main_exports);
-var import_obsidian4 = require("obsidian");
+var import_obsidian5 = require("obsidian");
 var Obsidian2 = __toESM(require("obsidian"));
 
 // src/constants.ts
@@ -87,8 +87,6 @@ var UPLOAD_CHUNK_SIZE = 5 * 1024 * 1024;
 var VERSION_REMARK = "XGKB Sync plugin update";
 var DEFAULT_RENAME_NAME_CONFLICT_STRATEGY = 1;
 var DEFAULT_MOVE_NAME_CONFLICT_STRATEGY = 0;
-var DIR_RENAME_COVERAGE_RATIO = 0.8;
-var DIR_RENAME_MIN_FILES = 2;
 var BATCH_GET_META_MAX = 50;
 var CHANGES_SAFETY_WINDOW_MS = 5e3;
 var DB_NAME = "xgkb-sync-state";
@@ -506,6 +504,19 @@ var FsLocal = class {
       throw new Error(`\u76EE\u5F55\u4E0D\u5B58\u5728: ${oldFull}`);
     }
     await this.app.fileManager.renameFile(folder, newFull);
+  }
+  /** 判断相对路径对应目录是否存在 */
+  async folderExists(relativePath) {
+    const full = this.resolve(relativePath);
+    const node = this.app.vault.getAbstractFileByPath(full);
+    if (node instanceof Obsidian.TFolder)
+      return true;
+    try {
+      const stat = await this.app.vault.adapter.stat(full);
+      return (stat == null ? void 0 : stat.type) === "folder";
+    } catch (e) {
+      return false;
+    }
   }
   /** 读取文件内容 */
   async readFile(relativePath) {
@@ -1169,6 +1180,9 @@ var FsXgkb = class {
   async moveRemoteFile(fileId, targetParentId) {
     if (!this.projectId)
       return { ok: false, error: "\u672A\u521D\u59CB\u5316 projectId" };
+    console.debug(
+      `[XGKB Sync] moveFile \u8C03\u7528: fileId=${fileId} targetParentId=${targetParentId} projectId=${this.projectId}`
+    );
     const r = await this.api.moveFile({
       fileId,
       targetParentId,
@@ -1206,10 +1220,14 @@ var FsXgkb = class {
           return { ok: false, error: `\u521B\u5EFA\u76EE\u5F55 "${seg}" \u5931\u8D25: ${createResult.error}` };
         }
         currentId = createResult.value;
+        console.debug(`[XGKB Sync] createFolder \u6210\u529F: name="${seg}" folderId=${currentId}`);
       } else {
         currentId = found.id;
       }
     }
+    console.debug(
+      `[XGKB Sync] resolveFolderIdForRelativePath: "${relativeFolderPath || "(root)"}" -> ${currentId}`
+    );
     return { ok: true, value: currentId };
   }
   splitRelativePath(relativePath) {
@@ -1677,6 +1695,7 @@ function syncDiagReconcile(kind, fileId, detail) {
 }
 
 // src/syncEngine.ts
+var TRACE_LIMIT = 300;
 var SyncEngine = class {
   constructor(fsLocal, fsXgkb, db, settings, scopeKey) {
     this.progress = () => {
@@ -1684,6 +1703,10 @@ var SyncEngine = class {
     this.successfulRemoteMtimes = [];
     /** 上传/rename-remote 完成后批量刷新远端 mtime（fileId → localPath） */
     this.mtimeRefreshQueue = /* @__PURE__ */ new Map();
+    /** 本轮增量 listChanges 确认的远端删除（用于 pull 本地删除，避免误删） */
+    this.remoteDeletedFileIds = /* @__PURE__ */ new Set();
+    this.remoteDeletedFolderIds = /* @__PURE__ */ new Set();
+    this.remoteDeletedLocalPaths = /* @__PURE__ */ new Set();
     this.fsLocal = fsLocal;
     this.fsXgkb = fsXgkb;
     this.db = db;
@@ -1703,14 +1726,19 @@ var SyncEngine = class {
       failed: 0,
       errors: [],
       renamed: 0,
-      moved: 0
+      moved: 0,
+      planTrace: [],
+      execTrace: []
     };
   }
   async runSync(onProgress, since) {
-    var _a, _b, _c;
+    var _a, _b;
     this.stats = this.emptyStats();
     this.successfulRemoteMtimes = [];
     this.mtimeRefreshQueue.clear();
+    this.remoteDeletedFileIds = /* @__PURE__ */ new Set();
+    this.remoteDeletedFolderIds = /* @__PURE__ */ new Set();
+    this.remoteDeletedLocalPaths = /* @__PURE__ */ new Set();
     this.progress = onProgress || (() => {
     });
     const prog = (msg) => {
@@ -1726,6 +1754,8 @@ var SyncEngine = class {
     prog(`\u672C\u5730: ${localFiles.length} \u4E2A\u6587\u4EF6\uFF08${formatSyncExtensionsLabel(normalizeSyncExtensions(this.settings.syncFileExtensions))}\uFF09`);
     const remoteBuild = await this.buildRemoteMap(since, prog);
     let remoteMap = remoteBuild.map;
+    this.remoteDeletedFileIds = remoteBuild.deletedFileIds;
+    this.remoteDeletedFolderIds = remoteBuild.deletedFolderIds;
     prog(`\u4E91\u7AEF: ${remoteMap.size} \u4E2A\u6587\u4EF6\uFF08${formatSyncExtensionsLabel(normalizeSyncExtensions(this.settings.syncFileExtensions))}\uFF0C\u5019\u9009\u6C34\u4F4D ${remoteBuild.watermarkCandidate}\uFF09`);
     const retried = await this.injectFailedRetries(remoteMap, prog);
     this.stats.retriedFailed = retried;
@@ -1735,12 +1765,34 @@ var SyncEngine = class {
     const localMap = /* @__PURE__ */ new Map();
     for (const f of localFiles)
       localMap.set(f.path, f);
+    const executionPlan = await this.planSync(localMap, remoteMap, prog);
+    await this.applyPlannedOps(executionPlan, prog);
+    this.emitTraceSnapshot(prog);
+    await this.flushMtimeRefreshQueue();
+    this.stats.newSince = this.computeCommittedWatermark(remoteBuild);
+    prog(
+      `\u5B8C\u6210: \u2191${this.stats.uploaded} \u2193${this.stats.downloaded} \u21BB${(_a = this.stats.renamed) != null ? _a : 0} \u2717${this.stats.deleted} fail:${this.stats.failed} \u2205${this.stats.skipped} \u6C34\u4F4D=${(_b = this.stats.newSince) != null ? _b : "-"}`
+    );
+    return this.stats;
+  }
+  async planSync(localMap, remoteMap, prog) {
+    var _a;
     const allRecords = await this.db.getAll(this.scopeKey);
     const recordMap = /* @__PURE__ */ new Map();
     for (const r of allRecords)
       recordMap.set(r.localPath, r);
+    this.remoteDeletedLocalPaths = this.collectRemoteDeletedLocalPaths(
+      allRecords,
+      this.remoteDeletedFileIds,
+      this.remoteDeletedFolderIds
+    );
+    if (this.remoteDeletedLocalPaths.size > 0) {
+      prog(
+        `\u8FDC\u7AEF\u5DF2\u5220\u9664 ${this.remoteDeletedFileIds.size} \u4E2A\u6587\u4EF6\u3001${this.remoteDeletedFolderIds.size} \u4E2A\u76EE\u5F55\uFF0C\u8BA1\u5212\u672C\u5730\u6E05\u7406 ${this.remoteDeletedLocalPaths.size} \u4E2A\u8DEF\u5F84`
+      );
+    }
     const consumedPaths = /* @__PURE__ */ new Set();
-    const rawReconcilePlans = this.buildPathReconcilePlans(
+    const rawReconcilePlans = await this.buildPathReconcilePlans(
       localMap,
       remoteMap,
       recordMap,
@@ -1749,7 +1801,8 @@ var SyncEngine = class {
     );
     const reconcilePlans = await this.collapseDirectoryReconcilePlans(
       rawReconcilePlans,
-      allRecords,
+      localMap,
+      remoteMap,
       prog
     );
     for (const plan of reconcilePlans) {
@@ -1779,53 +1832,81 @@ var SyncEngine = class {
       const op = this.decide(path, local, remote, record);
       plans.push({ path, local, remote, record, op });
     }
-    const renameLocalPlans = plans.filter((p) => p.op === "rename-local");
-    const renameRemotePlans = plans.filter((p) => p.op === "rename-remote");
-    const deletePlans = plans.filter((p) => p.op === "delete-local" || p.op === "delete-remote");
-    const downloadPlans = plans.filter((p) => p.op === "download-new" || p.op === "download-update");
-    const uploadPlans = plans.filter((p) => p.op === "upload-new" || p.op === "upload-update");
     const skipCount = plans.filter((p) => p.op === "skip").length;
     this.stats.skipped += skipCount;
-    for (const plan of renameLocalPlans) {
+    this.capturePlanTrace(plans);
+    return {
+      plans,
+      renameLocalPlans: plans.filter((p) => p.op === "rename-local"),
+      renameRemotePlans: plans.filter((p) => p.op === "rename-remote"),
+      deletePlans: plans.filter((p) => p.op === "delete-local" || p.op === "delete-remote"),
+      downloadPlans: plans.filter((p) => p.op === "download-new" || p.op === "download-update"),
+      uploadPlans: plans.filter((p) => p.op === "upload-new" || p.op === "upload-update")
+    };
+  }
+  capturePlanTrace(plans) {
+    const compact = plans.slice(0, TRACE_LIMIT).map((plan) => ({
+      op: plan.op,
+      path: plan.path,
+      targetPath: plan.targetPath,
+      remoteOldPath: plan.remoteOldPath,
+      isDirectory: plan.isDirectory
+    }));
+    this.stats.planTrace = compact;
+  }
+  appendExecTrace(plan, status, message) {
+    if (!this.stats.execTrace)
+      this.stats.execTrace = [];
+    if (this.stats.execTrace.length >= TRACE_LIMIT)
+      return;
+    const item = { op: plan.op, path: plan.path, status };
+    if (message)
+      item.message = message;
+    this.stats.execTrace.push(item);
+  }
+  emitTraceSnapshot(prog) {
+    var _a, _b, _c, _d;
+    const planCount = (_b = (_a = this.stats.planTrace) == null ? void 0 : _a.length) != null ? _b : 0;
+    const execCount = (_d = (_c = this.stats.execTrace) == null ? void 0 : _c.length) != null ? _d : 0;
+    prog(`trace: plan=${planCount} exec=${execCount} (limit=${TRACE_LIMIT})`);
+    console.debug("[XGKB Sync][trace] plan", this.stats.planTrace);
+    console.debug("[XGKB Sync][trace] exec", this.stats.execTrace);
+  }
+  async applyPlannedOps(execution, prog) {
+    for (const plan of execution.renameLocalPlans) {
       await this.executePlan(plan);
     }
-    for (const plan of deletePlans) {
+    for (const plan of execution.deletePlans) {
       await this.executePlan(plan);
     }
-    if (downloadPlans.length > 0) {
-      prog(`\u5F00\u59CB\u4E0B\u8F7D ${downloadPlans.length} \u4E2A\u6587\u4EF6\uFF08\u5E76\u53D1 ${DOWNLOAD_CONCURRENCY}\uFF09...`);
+    if (execution.downloadPlans.length > 0) {
+      prog(`\u5F00\u59CB\u4E0B\u8F7D ${execution.downloadPlans.length} \u4E2A\u6587\u4EF6\uFF08\u5E76\u53D1 ${DOWNLOAD_CONCURRENCY}\uFF09...`);
       let done = 0;
-      await this.runWithConcurrency(downloadPlans, DOWNLOAD_CONCURRENCY, async (plan) => {
+      await this.runWithConcurrency(execution.downloadPlans, DOWNLOAD_CONCURRENCY, async (plan) => {
         await this.executePlan(plan);
         done++;
-        if (done % 5 === 0 || done === downloadPlans.length) {
-          prog(`\u4E0B\u8F7D\u8FDB\u5EA6 ${done}/${downloadPlans.length}\uFF08\u2193${this.stats.downloaded} \u5931\u8D25 ${this.stats.failed}\uFF09`);
+        if (done % 5 === 0 || done === execution.downloadPlans.length) {
+          prog(`\u4E0B\u8F7D\u8FDB\u5EA6 ${done}/${execution.downloadPlans.length}\uFF08\u2193${this.stats.downloaded} \u5931\u8D25 ${this.stats.failed}\uFF09`);
         }
       });
     }
-    for (const plan of renameRemotePlans) {
+    for (const plan of execution.renameRemotePlans) {
       await this.executePlan(plan);
     }
-    if (uploadPlans.length > 0) {
-      prog(`\u5F00\u59CB\u4E0A\u4F20 ${uploadPlans.length} \u4E2A\u6587\u4EF6\uFF08\u5E76\u53D1 ${UPLOAD_CONCURRENCY}\uFF09...`);
+    if (execution.uploadPlans.length > 0) {
+      prog(`\u5F00\u59CB\u4E0A\u4F20 ${execution.uploadPlans.length} \u4E2A\u6587\u4EF6\uFF08\u5E76\u53D1 ${UPLOAD_CONCURRENCY}\uFF09...`);
       let done = 0;
-      await this.runWithConcurrency(uploadPlans, UPLOAD_CONCURRENCY, async (plan) => {
+      await this.runWithConcurrency(execution.uploadPlans, UPLOAD_CONCURRENCY, async (plan) => {
         await this.executePlan(plan);
         done++;
-        if (done % 3 === 0 || done === uploadPlans.length) {
-          prog(`\u4E0A\u4F20\u8FDB\u5EA6 ${done}/${uploadPlans.length}\uFF08\u2191${this.stats.uploaded} \u5931\u8D25 ${this.stats.failed}\uFF09`);
+        if (done % 3 === 0 || done === execution.uploadPlans.length) {
+          prog(`\u4E0A\u4F20\u8FDB\u5EA6 ${done}/${execution.uploadPlans.length}\uFF08\u2191${this.stats.uploaded} \u5931\u8D25 ${this.stats.failed}\uFF09`);
         }
         if (done % UPLOAD_CONCURRENCY === 0) {
           await this.delay(EXECUTE_BATCH_PAUSE_MS);
         }
       });
     }
-    await this.flushMtimeRefreshQueue();
-    this.stats.newSince = this.computeCommittedWatermark(remoteBuild);
-    prog(
-      `\u5B8C\u6210: \u2191${this.stats.uploaded} \u2193${this.stats.downloaded} \u21BB${(_b = this.stats.renamed) != null ? _b : 0} \u2717${this.stats.deleted} fail:${this.stats.failed} \u2205${this.stats.skipped} \u6C34\u4F4D=${(_c = this.stats.newSince) != null ? _c : "-"}`
-    );
-    return this.stats;
   }
   computeCommittedWatermark(build) {
     const catalogMax = this.maxRemoteMtime(build.map);
@@ -1891,7 +1972,8 @@ var SyncEngine = class {
     return new Promise((resolve) => window.setTimeout(resolve, ms));
   }
   /** 同 fileId 路径不一致 → rename 计划（零额外 KB list 调用） */
-  buildPathReconcilePlans(localMap, remoteMap, recordMap, prog, consumed) {
+  async buildPathReconcilePlans(localMap, remoteMap, recordMap, prog, consumed) {
+    var _a, _b;
     const plans = [];
     const dir = this.settings.syncDirection;
     const fileIdToRemote = /* @__PURE__ */ new Map();
@@ -1900,13 +1982,38 @@ var SyncEngine = class {
         fileIdToRemote.set(remote.xgkbFileId, remote);
     }
     for (const record of recordMap.values()) {
+      const pendingPlan = await this.buildPendingRemotePlan(record, localMap, fileIdToRemote);
+      if (pendingPlan) {
+        plans.push(pendingPlan);
+        consumed.add(record.localPath);
+        if (pendingPlan.remoteOldPath)
+          consumed.add(pendingPlan.remoteOldPath);
+        syncDiagReconcile("plan", record.xgkbFileId, {
+          op: "rename-remote",
+          reason: "consume pendingRemoteOp",
+          from: (_a = pendingPlan.remoteOldPath) != null ? _a : record.localPath,
+          to: pendingPlan.path,
+          pendingSetAt: (_b = pendingPlan.pendingSetAt) != null ? _b : null
+        });
+        continue;
+      }
       const remote = fileIdToRemote.get(record.xgkbFileId);
       if (!remote) {
-        syncDiagReconcile("skip", record.xgkbFileId, {
-          reason: "remoteMap \u4E2D\u65E0\u6B64 fileId",
-          recordPath: record.localPath,
-          syncStatus: record.syncStatus
-        });
+        if (this.isRemoteConfirmedDeleted(record)) {
+          syncDiagReconcile("match", record.xgkbFileId, {
+            recordPath: record.localPath,
+            remotePath: "(deleted)",
+            localAtRecord: Boolean(localMap.get(record.localPath)),
+            localAtRemote: false,
+            op: "delete-local"
+          });
+        } else {
+          syncDiagReconcile("skip", record.xgkbFileId, {
+            reason: "remoteMap \u4E2D\u65E0\u6B64 fileId",
+            recordPath: record.localPath,
+            syncStatus: record.syncStatus
+          });
+        }
         continue;
       }
       if (remote.path === record.localPath)
@@ -2003,8 +2110,72 @@ var SyncEngine = class {
     }
     return plans;
   }
+  async buildPendingRemotePlan(record, localMap, fileIdToRemote) {
+    if (this.settings.syncDirection === "pull")
+      return null;
+    const pendingOps = this.getPendingRemoteRenameOps(record);
+    if (pendingOps.length === 0)
+      return null;
+    const pending = this.getEffectivePendingRemoteRename(pendingOps);
+    if (!pending)
+      return null;
+    const expectedNewPath = pending.newPath;
+    if (expectedNewPath !== record.localPath)
+      return null;
+    const local = localMap.get(record.localPath);
+    if (!local)
+      return null;
+    const actualRemote = fileIdToRemote == null ? void 0 : fileIdToRemote.get(record.xgkbFileId);
+    const remoteOldPath = (actualRemote == null ? void 0 : actualRemote.path) || pending.oldPath || record.localPath;
+    if (remoteOldPath === record.localPath) {
+      await this.db.clearPendingRemoteOps(this.scopeKey, record.localPath);
+      syncDiagReconcile("skip", record.xgkbFileId, {
+        reason: "pending no-op\uFF08\u8FDC\u7AEF\u8DEF\u5F84\u5DF2\u5BF9\u9F50\uFF09\uFF0C\u5DF2\u6E05\u7406 pending",
+        recordPath: record.localPath
+      });
+      return null;
+    }
+    return {
+      path: record.localPath,
+      remoteOldPath,
+      pendingSetAt: pending.setAt,
+      local,
+      remote: actualRemote,
+      record,
+      op: "rename-remote"
+    };
+  }
+  getPendingRemoteRenameOps(record) {
+    var _a, _b;
+    if ((_a = record.pendingRemoteOps) == null ? void 0 : _a.length)
+      return record.pendingRemoteOps;
+    if (record.pendingRemoteOp === "rename-or-move" && record.pendingOldPath && record.pendingNewPath) {
+      return [
+        {
+          op: "rename-or-move",
+          oldPath: record.pendingOldPath,
+          newPath: record.pendingNewPath,
+          setAt: (_b = record.pendingSetAt) != null ? _b : record.lastSyncAt
+        }
+      ];
+    }
+    return [];
+  }
+  getEffectivePendingRemoteRename(ops) {
+    if (ops.length === 0)
+      return null;
+    const first = ops[0];
+    const last = ops[ops.length - 1];
+    if (!first.oldPath || !last.newPath)
+      return null;
+    return {
+      oldPath: first.oldPath,
+      newPath: last.newPath,
+      setAt: last.setAt
+    };
+  }
   /** 将同前缀变更的多文件 rename 聚合为目录级计划（1 次 folder API） */
-  async collapseDirectoryReconcilePlans(plans, allRecords, prog) {
+  async collapseDirectoryReconcilePlans(plans, localMap, remoteMap, prog) {
     var _a, _b, _c, _d, _e;
     const renamePlans = plans.filter((p) => p.op === "rename-local" || p.op === "rename-remote");
     const others = plans.filter((p) => p.op !== "rename-local" && p.op !== "rename-remote");
@@ -2029,11 +2200,42 @@ var SyncEngine = class {
     const collapsed = [...others];
     const consumed = /* @__PURE__ */ new Set();
     for (const group of groups.values()) {
-      const countPrefix = group.op === "rename-local" ? group.oldPrefix : group.newPrefix;
-      const totalUnderPrefix = allRecords.filter(
-        (r) => r.syncStatus !== "failed" && (r.localPath === countPrefix || r.localPath.startsWith(`${countPrefix}/`))
-      ).length;
-      const meetsThreshold = group.items.length >= DIR_RENAME_MIN_FILES && totalUnderPrefix > 0 && group.items.length >= totalUnderPrefix * DIR_RENAME_COVERAGE_RATIO;
+      if (group.items.length < 2) {
+        for (const item of group.items)
+          collapsed.push(item);
+        continue;
+      }
+      let totalUnderPrefix = 0;
+      let meetsThreshold = false;
+      if (group.op === "rename-local") {
+        const localOldPaths = [...localMap.keys()].filter(
+          (p) => pathUnderPrefix(p, group.oldPrefix)
+        );
+        totalUnderPrefix = localOldPaths.length;
+        const groupedOldPaths = new Set(group.items.map((item) => item.path));
+        meetsThreshold = totalUnderPrefix > 0 && group.items.length === totalUnderPrefix && localOldPaths.every((p) => groupedOldPaths.has(p));
+      } else {
+        const remoteEntriesUnderOldPrefix = [...remoteMap.values()].filter(
+          (entry) => pathUnderPrefix(entry.path, group.oldPrefix)
+        );
+        totalUnderPrefix = remoteEntriesUnderOldPrefix.length;
+        const groupedRemoteIds = new Set(
+          group.items.map((item) => {
+            var _a2, _b2;
+            return ((_a2 = item.record) == null ? void 0 : _a2.xgkbFileId) || ((_b2 = item.remote) == null ? void 0 : _b2.xgkbFileId);
+          }).filter(Boolean)
+        );
+        const groupedRemoteOldPaths = new Set(
+          group.items.map((item) => {
+            var _a2;
+            return item.remoteOldPath || ((_a2 = item.remote) == null ? void 0 : _a2.path);
+          }).filter((p) => Boolean(p))
+        );
+        const allRemoteCovered = remoteEntriesUnderOldPrefix.every(
+          (entry) => entry.xgkbFileId ? groupedRemoteIds.has(entry.xgkbFileId) : groupedRemoteOldPaths.has(entry.path)
+        );
+        meetsThreshold = totalUnderPrefix > 0 && group.items.length === totalUnderPrefix && allRemoteCovered;
+      }
       if (!meetsThreshold) {
         for (const item of group.items)
           collapsed.push(item);
@@ -2058,6 +2260,20 @@ var SyncEngine = class {
         if (resolved.ok)
           remoteFolderFileId = resolved.value;
       }
+      if (group.op === "rename-remote" && !remoteFolderFileId) {
+        prog(`\u76EE\u5F55\u805A\u5408\u56DE\u9000: \u65E0\u6CD5\u89E3\u6790\u8FDC\u7AEF\u76EE\u5F55 ID\uFF0C\u6539\u7528\u6587\u4EF6\u7EA7\u8BA1\u5212 (${group.oldPrefix} -> ${group.newPrefix})`);
+        for (const item of group.items)
+          collapsed.push(item);
+        continue;
+      }
+      if (group.op === "rename-remote" && group.oldPrefix !== group.newPrefix && [...remoteMap.values()].some((entry) => pathUnderPrefix(entry.path, group.newPrefix))) {
+        prog(
+          `\u76EE\u5F55\u805A\u5408\u56DE\u9000: \u76EE\u6807\u76EE\u5F55\u5DF2\u5B58\u5728\u5185\u5BB9\uFF0C\u6539\u7528\u6587\u4EF6\u7EA7\u8BA1\u5212 (${group.oldPrefix} -> ${group.newPrefix})`
+        );
+        for (const item of group.items)
+          collapsed.push(item);
+        continue;
+      }
       const newFolderName = group.newPrefix.split("/").pop() || group.newPrefix;
       collapsed.push({
         op: group.op,
@@ -2078,10 +2294,32 @@ var SyncEngine = class {
       if (!consumed.has(plan))
         collapsed.push(plan);
     }
-    const dirCount = collapsed.filter((p) => p.isDirectory).length;
+    const dirPlans = collapsed.filter((p) => p.isDirectory);
+    const dedupedDirPlans = [];
+    let droppedNestedDirPlans = 0;
+    const sortedDirPlans = [...dirPlans].sort(
+      (a, b) => {
+        var _a2, _b2, _c2, _d2;
+        return ((_b2 = (_a2 = a.directoryOldPath) == null ? void 0 : _a2.length) != null ? _b2 : 0) - ((_d2 = (_c2 = b.directoryOldPath) == null ? void 0 : _c2.length) != null ? _d2 : 0);
+      }
+    );
+    for (const plan of sortedDirPlans) {
+      const covered = dedupedDirPlans.some((parent) => isNestedDirectoryPlanCovered(parent, plan));
+      if (covered) {
+        droppedNestedDirPlans++;
+        continue;
+      }
+      dedupedDirPlans.push(plan);
+    }
+    if (droppedNestedDirPlans > 0) {
+      prog(`\u76EE\u5F55\u8BA1\u5212\u53BB\u91CD: \u8DF3\u8FC7 ${droppedNestedDirPlans} \u4E2A\u88AB\u7236\u76EE\u5F55\u8986\u76D6\u7684\u5B50\u76EE\u5F55\u8BA1\u5212`);
+    }
+    const nonDirPlans = collapsed.filter((p) => !p.isDirectory);
+    const finalPlans = [...nonDirPlans, ...dedupedDirPlans];
+    const dirCount = dedupedDirPlans.length;
     if (dirCount > 0)
       prog(`\u76EE\u5F55\u7EA7 rename/move: ${dirCount} \u7EC4\uFF08\u7531 ${renamePlans.length} \u4E2A\u6587\u4EF6\u8BA1\u5212\u805A\u5408\uFF09`);
-    return collapsed;
+    return finalPlans;
   }
   async runWithConcurrency(items, concurrency, fn) {
     let cursor = 0;
@@ -2121,12 +2359,19 @@ var SyncEngine = class {
     prog(`\u589E\u91CF\u53D8\u66F4: ${items.length} \u6761`);
     const upsertById = /* @__PURE__ */ new Map();
     const deleteIds = /* @__PURE__ */ new Set();
+    const deletedFileIds = /* @__PURE__ */ new Set();
+    const deletedFolderIds = /* @__PURE__ */ new Set();
     for (const item of items) {
       const id = String(item.fileId);
-      if (item.event === "delete")
+      if (item.event === "delete") {
         deleteIds.add(id);
-      else
+        if (item.type === XGKB_NODE_FOLDER)
+          deletedFolderIds.add(id);
+        else
+          deletedFileIds.add(id);
+      } else {
         upsertById.set(id, item);
+      }
     }
     const allRecords = await this.db.getAll(this.scopeKey);
     const fileIdToRecord = /* @__PURE__ */ new Map();
@@ -2334,7 +2579,13 @@ var SyncEngine = class {
         xgkbFolderId: item.parentId != null ? String(item.parentId) : ""
       });
     }
-    return { map, watermarkCandidate, scanMode: "incremental" };
+    return {
+      map,
+      watermarkCandidate,
+      scanMode: "incremental",
+      deletedFileIds,
+      deletedFolderIds
+    };
   }
   buildFolderIdToPathFromRecords(records) {
     const folderIdToPath = /* @__PURE__ */ new Map();
@@ -2342,7 +2593,9 @@ var SyncEngine = class {
     if (rootId)
       folderIdToPath.set(rootId, "");
     for (const record of records) {
-      const parts = record.localPath.split("/");
+      const pending = this.getEffectivePendingRemoteRename(this.getPendingRemoteRenameOps(record));
+      const pathForRemoteFolderMap = (pending == null ? void 0 : pending.oldPath) || record.localPath;
+      const parts = pathForRemoteFolderMap.split("/");
       const folderPath = parts.length > 1 ? parts.slice(0, -1).join("/") : "";
       folderIdToPath.set(record.xgkbFolderId, folderPath);
     }
@@ -2537,7 +2790,49 @@ var SyncEngine = class {
     console.debug(
       `[XGKB Sync] \u5168\u91CF\u626B\u63CF\u5B8C\u6210: ${map.size} \u4E2A\u6587\u4EF6\uFF0C\u5019\u9009\u6C34\u4F4D=${watermarkCandidate} (${new Date(watermarkCandidate).toLocaleString("zh-CN")})`
     );
-    return { map, watermarkCandidate, scanMode: "full" };
+    return {
+      map,
+      watermarkCandidate,
+      scanMode: "full",
+      deletedFileIds: /* @__PURE__ */ new Set(),
+      deletedFolderIds: /* @__PURE__ */ new Set()
+    };
+  }
+  /** listChanges delete 事件 → 需要本地删除的相对路径 */
+  collectRemoteDeletedLocalPaths(allRecords, deletedFileIds, deletedFolderIds) {
+    const paths = /* @__PURE__ */ new Set();
+    if (deletedFileIds.size === 0 && deletedFolderIds.size === 0)
+      return paths;
+    const folderPrefixes = /* @__PURE__ */ new Set();
+    for (const folderId of deletedFolderIds) {
+      for (const record of allRecords) {
+        if (record.xgkbFolderId !== folderId)
+          continue;
+        const prefix = parentPathOf(record.localPath);
+        if (prefix)
+          folderPrefixes.add(prefix);
+      }
+    }
+    for (const record of allRecords) {
+      if (deletedFileIds.has(record.xgkbFileId)) {
+        paths.add(record.localPath);
+        continue;
+      }
+      for (const prefix of folderPrefixes) {
+        if (record.localPath === prefix || record.localPath.startsWith(`${prefix}/`)) {
+          paths.add(record.localPath);
+          break;
+        }
+      }
+    }
+    return paths;
+  }
+  isRemoteConfirmedDeleted(record) {
+    if (!record)
+      return false;
+    if (this.remoteDeletedFileIds.has(record.xgkbFileId))
+      return true;
+    return this.remoteDeletedLocalPaths.has(record.localPath);
   }
   async executePlan(plan) {
     var _a, _b, _c;
@@ -2581,10 +2876,12 @@ var SyncEngine = class {
         case "skip":
           break;
       }
+      this.appendExecTrace(plan, "ok");
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       this.stats.failed++;
       this.stats.errors.push(`${path}: ${msg}`);
+      this.appendExecTrace(plan, "failed", msg);
       console.error(`[XGKB Sync] \u540C\u6B65\u5931\u8D25 ${path}:`, msg);
       if (op !== "skip" && op !== "delete-local" && op !== "delete-remote") {
         const failRecords = plan.isDirectory && ((_c = plan.affectedRecords) == null ? void 0 : _c.length) ? plan.affectedRecords : record ? [record] : [];
@@ -2601,12 +2898,15 @@ var SyncEngine = class {
     const dir = this.settings.syncDirection;
     if ((record == null ? void 0 : record.syncStatus) === "failed") {
       if (!remote) {
+        if (local && this.isRemoteConfirmedDeleted(record)) {
+          return dir === "push" ? "skip" : "delete-local";
+        }
         return local && dir !== "pull" ? "upload-new" : "skip";
       }
       if (dir === "pull")
         return "download-update";
       if (dir === "push")
-        return local ? "upload-update" : "skip";
+        return local ? "upload-update" : "delete-remote";
       if (!local)
         return "download-update";
       return local.mtime >= remote.mtime ? "upload-update" : "download-update";
@@ -2629,11 +2929,14 @@ var SyncEngine = class {
       return "skip";
     if (!local && remote) {
       if (dir === "push")
-        return "skip";
+        return "delete-remote";
       const remoteChanged = remote.mtime > record.remoteMtime + MTIME_TOLERANCE_MS;
       return remoteChanged ? "download-update" : "delete-remote";
     }
     if (local && !remote) {
+      if (this.isRemoteConfirmedDeleted(record)) {
+        return dir === "push" ? "skip" : "delete-local";
+      }
       if (dir === "pull")
         return "skip";
       const localChanged = local.mtime > record.localMtime + MTIME_TOLERANCE_MS;
@@ -2787,13 +3090,17 @@ var SyncEngine = class {
     var _a, _b, _c, _d;
     const { local, path, remote, remoteOldPath } = plan;
     let { record } = plan;
-    if (!record || !local || !remote)
+    if (!record || !local)
       throw new Error("rename-remote \u53C2\u6570\u4E0D\u5B8C\u6574");
     const fileId = record.xgkbFileId;
-    const oldRemotePath = remoteOldPath || remote.path;
+    const pending = this.getEffectivePendingRemoteRename(this.getPendingRemoteRenameOps(record));
+    const oldRemotePath = remoteOldPath || (remote == null ? void 0 : remote.path) || (pending == null ? void 0 : pending.oldPath) || record.localPath;
     const newFileName = path.split("/").pop() || path;
     const oldParent = parentPathOf(oldRemotePath);
     const newParent = parentPathOf(path);
+    console.debug(
+      `[XGKB Sync] rename-remote \u8BA1\u5212: fileId=${fileId} oldPath="${oldRemotePath}" newPath="${path}" oldParent="${oldParent}" newParent="${newParent}"`
+    );
     if (oldParent === newParent) {
       const r = await this.fsXgkb.renameRemoteFile(fileId, newFileName);
       if (!r.ok)
@@ -2816,6 +3123,18 @@ var SyncEngine = class {
       this.stats.moved = ((_b = this.stats.moved) != null ? _b : 0) + 1;
       record = { ...record, xgkbFolderId: targetFolderId };
     }
+    const localChanged = local.mtime > record.localMtime + MTIME_TOLERANCE_MS;
+    if (localChanged) {
+      const content = await this.fsLocal.readFile(path);
+      const fileName = path.split("/").pop() || path;
+      const updateResult = await this.fsXgkb.updateFile(fileId, fileName, content);
+      if (!updateResult.ok)
+        throw new Error(`rename-remote \u540E\u5185\u5BB9\u66F4\u65B0\u5931\u8D25: ${updateResult.error}`);
+      this.stats.uploaded++;
+      this.progress(`\u21BB\u2191 \u8FDC\u7AEF\u79FB\u52A8\u5E76\u66F4\u65B0\u5185\u5BB9 \u2192 ${path}`);
+    } else {
+      this.progress(`\u21BB \u8FDC\u7AEF \u2192 ${path}`);
+    }
     const interimMtime = (_d = (_c = plan.remote) == null ? void 0 : _c.mtime) != null ? _d : record.remoteMtime;
     await this.db.put(
       this.buildDbRecord(path, {
@@ -2827,7 +3146,6 @@ var SyncEngine = class {
       })
     );
     this.queueMtimeRefresh(fileId, path);
-    this.progress(`\u21BB \u8FDC\u7AEF \u2192 ${path}`);
   }
   async doRenameLocalDirectory(plan) {
     var _a;
@@ -2835,6 +3153,16 @@ var SyncEngine = class {
     const newPrefix = plan.directoryNewPath;
     if (!oldPrefix || !newPrefix)
       throw new Error("rename-local(\u76EE\u5F55) \u53C2\u6570\u4E0D\u5B8C\u6574");
+    const oldExists = await this.fsLocal.folderExists(oldPrefix);
+    if (!oldExists) {
+      const newExists = await this.fsLocal.folderExists(newPrefix);
+      if (newExists) {
+        const moved2 = await this.db.relocateRecordsByPrefix(this.scopeKey, oldPrefix, newPrefix);
+        this.progress(`\u21BB \u672C\u5730\u76EE\u5F55 ${oldPrefix} \u2192 ${newPrefix}\uFF08\u5DF2\u5B58\u5728\u76EE\u6807\u76EE\u5F55\uFF0C\u8DF3\u8FC7\u91CD\u590D\u6267\u884C\uFF0C${moved2} \u4E2A\u6587\u4EF6\uFF09`);
+        return;
+      }
+      throw new Error(`\u76EE\u5F55\u4E0D\u5B58\u5728: ${oldPrefix}`);
+    }
     await this.fsLocal.renameFolder(oldPrefix, newPrefix);
     const moved = await this.db.relocateRecordsByPrefix(this.scopeKey, oldPrefix, newPrefix);
     this.stats.renamed = ((_a = this.stats.renamed) != null ? _a : 0) + 1;
@@ -2856,9 +3184,20 @@ var SyncEngine = class {
     if (!r.ok)
       throw new Error(r.error);
     await this.db.relocateRecordsByPrefix(this.scopeKey, oldPrefix, newPrefix);
+    await this.db.clearPendingRemoteOpsByPrefix(this.scopeKey, newPrefix);
     for (const rec of affectedRecords) {
       const suffix = rec.localPath.slice(oldPrefix.length);
       const newPath = `${newPrefix}${suffix}`;
+      const currentMtime = await this.fsLocal.getMtime(newPath);
+      if (currentMtime != null && rec.xgkbFileId && currentMtime > rec.localMtime + MTIME_TOLERANCE_MS) {
+        const content = await this.fsLocal.readFile(newPath);
+        const fileName = newPath.split("/").pop() || newPath;
+        const upd = await this.fsXgkb.updateFile(rec.xgkbFileId, fileName, content);
+        if (!upd.ok)
+          throw new Error(`\u76EE\u5F55 rename \u540E\u5185\u5BB9\u66F4\u65B0\u5931\u8D25 ${newPath}: ${upd.error}`);
+        this.stats.uploaded++;
+        this.progress(`\u21BB\u2191 \u76EE\u5F55 rename \u540E\u66F4\u65B0\u5185\u5BB9 \u2192 ${newPath}`);
+      }
       if (rec.xgkbFileId)
         this.queueMtimeRefresh(rec.xgkbFileId, newPath);
     }
@@ -2898,6 +3237,7 @@ var SyncEngine = class {
       await this.db.applyFileIdMappings(this.scopeKey, idMappings);
     }
     await this.db.relocateRecordsByPrefix(this.scopeKey, oldPrefix, newPrefix);
+    await this.db.clearPendingRemoteOpsByPrefix(this.scopeKey, newPrefix);
     const all = await this.db.getAll(this.scopeKey);
     for (const rec of all) {
       if (!rec.localPath.startsWith(`${newPrefix}/`) && rec.localPath !== newPrefix)
@@ -2909,6 +3249,20 @@ var SyncEngine = class {
         await this.db.put({ ...rec, xgkbFolderId: folderFileId, lastSyncAt: Date.now() });
       }
       this.queueMtimeRefresh(rec.xgkbFileId, rec.localPath);
+    }
+    for (const rec of affectedRecords) {
+      const suffix = rec.localPath.slice(oldPrefix.length);
+      const newPath = `${newPrefix}${suffix}`;
+      const currentMtime = await this.fsLocal.getMtime(newPath);
+      if (currentMtime != null && rec.xgkbFileId && currentMtime > rec.localMtime + MTIME_TOLERANCE_MS) {
+        const content = await this.fsLocal.readFile(newPath);
+        const fileName = newPath.split("/").pop() || newPath;
+        const upd = await this.fsXgkb.updateFile(rec.xgkbFileId, fileName, content);
+        if (!upd.ok)
+          throw new Error(`\u76EE\u5F55 move \u540E\u5185\u5BB9\u66F4\u65B0\u5931\u8D25 ${newPath}: ${upd.error}`);
+        this.stats.uploaded++;
+        this.progress(`\u21BB\u2191 \u76EE\u5F55 move \u540E\u66F4\u65B0\u5185\u5BB9 \u2192 ${newPath}`);
+      }
     }
     this.stats.moved = ((_a = this.stats.moved) != null ? _a : 0) + 1;
     this.progress(
@@ -2955,35 +3309,45 @@ function parentPathOf(relativePath) {
   return i > 0 ? relativePath.substring(0, i) : "";
 }
 function deriveDirPrefixChange(oldPath, newPath) {
-  const oldSlash = oldPath.lastIndexOf("/");
-  const newSlash = newPath.lastIndexOf("/");
-  if (oldSlash !== newSlash)
+  const oldParts = oldPath.split("/");
+  const newParts = newPath.split("/");
+  if (oldParts.length === 0 || newParts.length === 0)
     return null;
-  const fileName = oldSlash >= 0 ? oldPath.slice(oldSlash + 1) : oldPath;
-  if ((newSlash >= 0 ? newPath.slice(newSlash + 1) : newPath) !== fileName)
+  const fileName = oldParts[oldParts.length - 1];
+  if (fileName !== newParts[newParts.length - 1])
     return null;
-  const oldDir = oldSlash >= 0 ? oldPath.slice(0, oldSlash) : "";
-  const newDir = newSlash >= 0 ? newPath.slice(0, newSlash) : "";
-  if (oldDir === newDir)
+  const oldDirs = oldParts.slice(0, -1);
+  const newDirs = newParts.slice(0, -1);
+  if (oldDirs.join("/") === newDirs.join("/"))
     return null;
-  const oldParts = oldDir ? oldDir.split("/") : [];
-  const newParts = newDir ? newDir.split("/") : [];
-  if (oldParts.length !== newParts.length)
-    return null;
-  let diffIdx = -1;
-  for (let i = 0; i < oldParts.length; i++) {
-    if (oldParts[i] !== newParts[i]) {
-      if (diffIdx >= 0)
-        return null;
-      diffIdx = i;
-    }
+  let prefixLen = 0;
+  while (prefixLen < oldDirs.length && prefixLen < newDirs.length && oldDirs[prefixLen] === newDirs[prefixLen]) {
+    prefixLen++;
   }
-  if (diffIdx < 0)
+  let suffixLen = 0;
+  while (suffixLen < oldDirs.length - prefixLen && suffixLen < newDirs.length - prefixLen && oldDirs[oldDirs.length - 1 - suffixLen] === newDirs[newDirs.length - 1 - suffixLen]) {
+    suffixLen++;
+  }
+  let oldMid = oldDirs.slice(prefixLen, oldDirs.length - suffixLen);
+  let newMid = newDirs.slice(prefixLen, newDirs.length - suffixLen);
+  if (oldMid.length === 0 && newMid.length > 0 && prefixLen < oldDirs.length) {
+    oldMid = [oldDirs[prefixLen]];
+    newMid = [...newMid, oldDirs[prefixLen]];
+  } else if (newMid.length === 0 && oldMid.length > 0 && prefixLen < newDirs.length) {
+    oldMid = [...oldMid, newDirs[prefixLen]];
+    newMid = [newDirs[prefixLen]];
+  }
+  if (oldMid.length === 0 || newMid.length === 0)
     return null;
-  return {
-    oldPrefix: oldParts.slice(0, diffIdx + 1).join("/"),
-    newPrefix: newParts.slice(0, diffIdx + 1).join("/")
-  };
+  const oldPrefix = oldDirs.slice(0, prefixLen + oldMid.length).join("/");
+  const newPrefix = newDirs.slice(0, prefixLen + newMid.length).join("/");
+  if (!oldPrefix || oldPrefix === newPrefix)
+    return null;
+  const suffix = oldPath.slice(oldPrefix.length);
+  const expected = suffix.startsWith("/") || suffix.length === 0 ? `${newPrefix}${suffix}` : `${newPrefix}/${suffix}`;
+  if (newPath !== expected)
+    return null;
+  return { oldPrefix, newPrefix };
 }
 function pickDirectChildFolderId(records, oldPrefix) {
   for (const rec of records) {
@@ -2994,6 +3358,29 @@ function pickDirectChildFolderId(records, oldPrefix) {
       return rec.xgkbFolderId;
   }
   return void 0;
+}
+function isNestedDirectoryPlanCovered(parent, child) {
+  if (!parent.isDirectory || !child.isDirectory)
+    return false;
+  if (parent.op !== child.op)
+    return false;
+  const pOld = parent.directoryOldPath;
+  const pNew = parent.directoryNewPath;
+  const cOld = child.directoryOldPath;
+  const cNew = child.directoryNewPath;
+  if (!pOld || !pNew || !cOld || !cNew)
+    return false;
+  if (cOld === pOld)
+    return true;
+  if (!cOld.startsWith(`${pOld}/`))
+    return false;
+  const suffix = cOld.slice(pOld.length);
+  return cNew === `${pNew}${suffix}`;
+}
+function pathUnderPrefix(path, prefix) {
+  if (!prefix)
+    return false;
+  return path === prefix || path.startsWith(`${prefix}/`);
 }
 function collectMoveIdMappings(result) {
   var _a;
@@ -3116,6 +3503,42 @@ var SyncStateDb = class {
     await this.put({ ...record, localPath: newPath, lastSyncAt: Date.now() });
     return true;
   }
+  /** 标记文件待推送的远端 rename/move 动作。
+   *  连续多次 rename/move 时，保留最早一次的 pendingOldPath（= 远端文件实际所在路径），
+   *  仅更新 pendingNewPath 为最新目标路径，避免目录聚合使用过期中间路径。
+   */
+  async markPendingRemoteRenameOrMove(scopeKey, localPath, oldPath, newPath) {
+    const record = await this.get(scopeKey, localPath);
+    if (!record)
+      return false;
+    const existingQueue = this.normalizePendingQueue(record);
+    const now = Date.now();
+    let nextQueue;
+    if (existingQueue.length === 0) {
+      nextQueue = [{ op: "rename-or-move", oldPath, newPath, setAt: now }];
+    } else {
+      nextQueue = [...existingQueue];
+      const tail = nextQueue[nextQueue.length - 1];
+      if (tail.newPath === oldPath) {
+        nextQueue[nextQueue.length - 1] = { ...tail, newPath, setAt: now };
+      } else {
+        nextQueue.push({ op: "rename-or-move", oldPath, newPath, setAt: now });
+      }
+    }
+    const effective = {
+      pendingRemoteOp: "rename-or-move",
+      pendingOldPath: nextQueue[0].oldPath,
+      pendingNewPath: nextQueue[nextQueue.length - 1].newPath,
+      pendingSetAt: nextQueue[nextQueue.length - 1].setAt,
+      pendingRemoteOps: nextQueue
+    };
+    await this.put({
+      ...record,
+      ...effective,
+      lastSyncAt: Date.now()
+    });
+    return true;
+  }
   /** 文件夹 rename/move：批量更新 oldPrefix 下所有 record 的路径前缀 */
   async relocateRecordsByPrefix(scopeKey, oldPrefix, newPrefix) {
     if (!oldPrefix || oldPrefix === newPrefix)
@@ -3123,7 +3546,7 @@ var SyncStateDb = class {
     const all = await this.getAll(scopeKey);
     let moved = 0;
     for (const record of all) {
-      if (!pathUnderPrefix(record.localPath, oldPrefix))
+      if (!pathUnderPrefix2(record.localPath, oldPrefix))
         continue;
       const suffix = record.localPath.slice(oldPrefix.length);
       const newPath = `${newPrefix}${suffix}`;
@@ -3134,6 +3557,60 @@ var SyncStateDb = class {
       moved++;
     }
     return moved;
+  }
+  /** 目录级远端操作完成后，清除该前缀下所有 record 的 pendingRemoteOp */
+  async clearPendingRemoteOpsByPrefix(scopeKey, prefix) {
+    const all = await this.getAll(scopeKey);
+    for (const record of all) {
+      if (!pathUnderPrefix2(record.localPath, prefix))
+        continue;
+      if (!record.pendingRemoteOp && (!record.pendingRemoteOps || record.pendingRemoteOps.length === 0)) {
+        continue;
+      }
+      const {
+        pendingRemoteOp,
+        pendingOldPath,
+        pendingNewPath,
+        pendingSetAt,
+        pendingRemoteOps,
+        ...rest
+      } = record;
+      await this.put({ ...rest, lastSyncAt: Date.now() });
+    }
+  }
+  /** 单文件 pending no-op 场景：清理该记录上的 pending 字段 */
+  async clearPendingRemoteOps(scopeKey, localPath) {
+    const record = await this.get(scopeKey, localPath);
+    if (!record)
+      return;
+    if (!record.pendingRemoteOp && (!record.pendingRemoteOps || record.pendingRemoteOps.length === 0)) {
+      return;
+    }
+    const {
+      pendingRemoteOp,
+      pendingOldPath,
+      pendingNewPath,
+      pendingSetAt,
+      pendingRemoteOps,
+      ...rest
+    } = record;
+    await this.put({ ...rest, lastSyncAt: Date.now() });
+  }
+  normalizePendingQueue(record) {
+    var _a, _b;
+    if ((_a = record.pendingRemoteOps) == null ? void 0 : _a.length)
+      return [...record.pendingRemoteOps];
+    if (record.pendingRemoteOp === "rename-or-move" && record.pendingOldPath && record.pendingNewPath) {
+      return [
+        {
+          op: "rename-or-move",
+          oldPath: record.pendingOldPath,
+          newPath: record.pendingNewPath,
+          setAt: (_b = record.pendingSetAt) != null ? _b : Date.now()
+        }
+      ];
+    }
+    return [];
   }
   /** moveFile 返回的 fileId 映射（目录 move 后子文件 id 可能变化） */
   async applyFileIdMappings(scopeKey, mappings) {
@@ -3164,7 +3641,7 @@ var SyncStateDb = class {
     const all = await this.getAll(scopeKey);
     let deleted = 0;
     for (const record of all) {
-      if (!pathUnderPrefix(record.localPath, prefix))
+      if (!pathUnderPrefix2(record.localPath, prefix))
         continue;
       await this.delete(scopeKey, record.localPath);
       deleted++;
@@ -3204,7 +3681,7 @@ var SyncStateDb = class {
     });
   }
 };
-function pathUnderPrefix(localPath, prefix) {
+function pathUnderPrefix2(localPath, prefix) {
   return localPath === prefix || localPath.startsWith(`${prefix}/`);
 }
 
@@ -3251,12 +3728,54 @@ function isLegacyPersistedData(raw) {
   return false;
 }
 
+// src/syncProgressNotice.ts
+var import_obsidian4 = require("obsidian");
+var SyncProgressNotice = class {
+  constructor() {
+    this.notice = null;
+  }
+  update(message) {
+    const text = message.startsWith("XGKB Sync") ? message : `XGKB Sync: ${message}`;
+    this.clearHideTimer();
+    if (this.notice) {
+      this.notice.setMessage(text);
+    } else {
+      this.notice = new import_obsidian4.Notice(text, 0);
+    }
+  }
+  /** 同步结束：更新文案并在 timeoutMs 后收起 */
+  finish(message, timeoutMs) {
+    const text = message.startsWith("XGKB Sync") ? message : `XGKB Sync ${message}`;
+    this.clearHideTimer();
+    if (this.notice) {
+      this.notice.setMessage(text);
+    } else {
+      this.notice = new import_obsidian4.Notice(text, 0);
+    }
+    if (timeoutMs > 0) {
+      this.hideTimer = window.setTimeout(() => this.dismiss(), timeoutMs);
+    }
+  }
+  dismiss() {
+    var _a;
+    this.clearHideTimer();
+    (_a = this.notice) == null ? void 0 : _a.hide();
+    this.notice = null;
+  }
+  clearHideTimer() {
+    if (this.hideTimer !== void 0) {
+      window.clearTimeout(this.hideTimer);
+      this.hideTimer = void 0;
+    }
+  }
+};
+
 // src/main.ts
 function stripPersistedMeta(raw) {
   const { lastSyncTime, dataSchemaVersion, activeScopeKey, syncScopes, ...rest } = raw;
   return rest;
 }
-var XgkbSyncPlugin = class extends import_obsidian4.Plugin {
+var XgkbSyncPlugin = class extends import_obsidian5.Plugin {
   constructor() {
     super(...arguments);
     this.dataSchemaVersion = DATA_SCHEMA_VERSION;
@@ -3331,6 +3850,9 @@ var XgkbSyncPlugin = class extends import_obsidian4.Plugin {
         return;
       const moved = await db.relocateRecord(scopeKey, oldRel, newRel);
       if (moved) {
+        if (this.settings.syncDirection !== "pull") {
+          await db.markPendingRemoteRenameOrMove(scopeKey, newRel, oldRel, newRel);
+        }
         console.debug(`[XGKB Sync] Vault rename: ${oldRel} \u2192 ${newRel}\uFF08\u5DF2\u66F4\u65B0\u72B6\u6001\u5E93\uFF09`);
       }
     } finally {
@@ -3349,7 +3871,7 @@ var XgkbSyncPlugin = class extends import_obsidian4.Plugin {
     const intervalMs = intervalMin * 60 * 1e3;
     this.autoSyncHandle = this.registerInterval(
       window.setInterval(() => {
-        void this.runSync();
+        void this.runSync({ quietIfBusy: true });
       }, intervalMs)
     );
     console.debug(`[XGKB Sync] \u81EA\u52A8\u540C\u6B65\u5DF2\u542F\u52A8\uFF0C\u95F4\u9694 ${intervalMin} \u5206\u949F`);
@@ -3383,7 +3905,7 @@ var XgkbSyncPlugin = class extends import_obsidian4.Plugin {
     };
     this.activeScopeKey = scopeKey;
     await this.saveSettings();
-    new import_obsidian4.Notice(
+    new import_obsidian5.Notice(
       "\u5DF2\u5347\u7EA7\u5230\u591A\u4F5C\u7528\u57DF\u540C\u6B65\uFF1A\u65E7\u6C34\u4F4D\u672A\u8FC1\u79FB\uFF0C\u4E0B\u6B21\u5C06\u6267\u884C\u5168\u91CF\u5BF9\u8D26",
       8e3
     );
@@ -3407,11 +3929,11 @@ var XgkbSyncPlugin = class extends import_obsidian4.Plugin {
     }
     if (!this.syncScopes[newKey]) {
       this.syncScopes[newKey] = { fingerprint: buildScopeFingerprint(this.settings) };
-      new import_obsidian4.Notice("\u65B0\u7684\u540C\u6B65\u76EE\u6807\uFF0C\u9996\u6B21\u5C06\u6267\u884C\u5168\u91CF\u5BF9\u8D26", 6e3);
+      new import_obsidian5.Notice("\u65B0\u7684\u540C\u6B65\u76EE\u6807\uFF0C\u9996\u6B21\u5C06\u6267\u884C\u5168\u91CF\u5BF9\u8D26", 6e3);
     } else {
       const entry = this.syncScopes[newKey];
       const when = entry.lastSuccessAt ? new Date(entry.lastSuccessAt).toLocaleString("zh-CN") : "\u672A\u77E5";
-      new import_obsidian4.Notice(
+      new import_obsidian5.Notice(
         `\u5DF2\u5207\u6362\u5230\u6B64\u524D\u4F7F\u7528\u8FC7\u7684\u540C\u6B65\u76EE\u6807\uFF08\u4E0A\u6B21\u6210\u529F: ${when}\uFF09\uFF0C\u5C06\u6CBF\u7528\u8BE5\u76EE\u6807\u7684\u6C34\u4F4D`,
         6e3
       );
@@ -3428,7 +3950,7 @@ var XgkbSyncPlugin = class extends import_obsidian4.Plugin {
       await db.deleteAllForScope(key);
     db.close();
     await this.saveSettings();
-    new import_obsidian4.Notice("\u5DF2\u91CD\u7F6E\u5F53\u524D\u540C\u6B65\u4F5C\u7528\u57DF\uFF0C\u4E0B\u6B21\u5C06\u5168\u91CF\u5BF9\u8D26", 6e3);
+    new import_obsidian5.Notice("\u5DF2\u91CD\u7F6E\u5F53\u524D\u540C\u6B65\u4F5C\u7528\u57DF\uFF0C\u4E0B\u6B21\u5C06\u5168\u91CF\u5BF9\u8D26", 6e3);
   }
   async resetAllSyncScopes() {
     this.syncScopes = {};
@@ -3442,7 +3964,7 @@ var XgkbSyncPlugin = class extends import_obsidian4.Plugin {
       await db.clear();
     db.close();
     await this.saveSettings();
-    new import_obsidian4.Notice("\u5DF2\u91CD\u7F6E\u5168\u90E8\u540C\u6B65\u4F5C\u7528\u57DF\uFF0C\u4E0B\u6B21\u5C06\u5168\u91CF\u5BF9\u8D26", 6e3);
+    new import_obsidian5.Notice("\u5DF2\u91CD\u7F6E\u5168\u90E8\u540C\u6B65\u4F5C\u7528\u57DF\uFF0C\u4E0B\u6B21\u5C06\u5168\u91CF\u5BF9\u8D26", 6e3);
   }
   getScopeDiagnosticLines() {
     var _a;
@@ -3466,18 +3988,21 @@ var XgkbSyncPlugin = class extends import_obsidian4.Plugin {
     lines.push(`knownScopes: ${Object.keys(this.syncScopes).length} \u4E2A\uFF08${unique.join(", ") || "\u2014"}\uFF09`);
     return lines;
   }
-  async runSync() {
+  async runSync(options) {
     var _a;
     if (!this.settings.appKey) {
-      new import_obsidian4.Notice("Xgkb sync: configure app key first");
+      new import_obsidian5.Notice("Xgkb sync: configure app key first");
       return;
     }
     if (this.isSyncing) {
       console.debug("[XGKB Sync] \u4E0A\u6B21\u540C\u6B65\u4ECD\u5728\u8FDB\u884C\uFF0C\u8DF3\u8FC7\u672C\u6B21\u89E6\u53D1");
-      new import_obsidian4.Notice("XGKB Sync: \u540C\u6B65\u8FDB\u884C\u4E2D\uFF0C\u8BF7\u52FF\u91CD\u590D\u70B9\u51FB", 5e3);
+      if (!(options == null ? void 0 : options.quietIfBusy)) {
+        new import_obsidian5.Notice("XGKB Sync: \u540C\u6B65\u8FDB\u884C\u4E2D\uFF0C\u8BF7\u52FF\u91CD\u590D\u70B9\u51FB", 5e3);
+      }
       return;
     }
     this.isSyncing = true;
+    const progressNotice = new SyncProgressNotice();
     const scopeKey = await computeScopeKey(this.settings);
     this.activeScopeKey = scopeKey;
     if (!this.syncScopes[scopeKey]) {
@@ -3489,13 +4014,13 @@ var XgkbSyncPlugin = class extends import_obsidian4.Plugin {
     console.debug(
       `[XGKB Sync] ===== \u5F00\u59CB\u540C\u6B65 scope=${scopeKey.slice(0, 8)}... mode=${isIncremental ? "\u589E\u91CF" : "\u5168\u91CF"} lastSyncTime=${since != null ? since : "-"} (${sinceStr}) =====`
     );
-    new import_obsidian4.Notice(`XGKB Sync: \u5F00\u59CB${isIncremental ? "\u589E\u91CF" : "\u5168\u91CF"}\u540C\u6B65...`);
+    progressNotice.update(`\u5F00\u59CB${isIncremental ? "\u589E\u91CF" : "\u5168\u91CF"}\u540C\u6B65...`);
     const db = new SyncStateDb();
     let dbOpened = false;
     try {
       const dbResult = await db.open();
       if (!dbResult.ok) {
-        new import_obsidian4.Notice(`XGKB Sync: \u6570\u636E\u5E93\u6253\u5F00\u5931\u8D25 - ${dbResult.error}`);
+        progressNotice.finish(`\u6570\u636E\u5E93\u6253\u5F00\u5931\u8D25 - ${dbResult.error}`, 8e3);
         return;
       }
       dbOpened = true;
@@ -3513,14 +4038,14 @@ var XgkbSyncPlugin = class extends import_obsidian4.Plugin {
         syncExtensions
       );
       const engine = new SyncEngine(fsLocal, fsXgkb, db, this.settings, scopeKey);
-      let lastProgressNotice = 0;
+      let lastProgressUpdate = 0;
       const stats = await engine.runSync((msg) => {
         const now = Date.now();
-        if ((msg.startsWith("\u4E0B\u8F7D\u8FDB\u5EA6") || msg.startsWith("\u4E0A\u4F20\u8FDB\u5EA6")) && now - lastProgressNotice < 8e3) {
+        if ((msg.startsWith("\u4E0B\u8F7D\u8FDB\u5EA6") || msg.startsWith("\u4E0A\u4F20\u8FDB\u5EA6")) && now - lastProgressUpdate < 8e3) {
           return;
         }
-        lastProgressNotice = now;
-        new import_obsidian4.Notice(`XGKB Sync: ${msg}`, 3e3);
+        lastProgressUpdate = now;
+        progressNotice.update(msg);
       }, since);
       if (stats.newSince) {
         const rootId = fsXgkb.getRootId();
@@ -3548,18 +4073,16 @@ var XgkbSyncPlugin = class extends import_obsidian4.Plugin {
       if (stats.skipped > 0)
         lines.push(`\u8DF3\u8FC7:${stats.skipped}`);
       const summary = lines.length > 0 ? lines.join(" ") : "\u65E0\u53D8\u5316";
-      new import_obsidian4.Notice(`XGKB Sync \u5B8C\u6210: ${summary}`, stats.failed > 0 ? 8e3 : 4e3);
+      let finishMsg = `\u5B8C\u6210: ${summary}`;
       if (stats.errors.length > 0) {
         console.error("[XGKB Sync] \u540C\u6B65\u9519\u8BEF:", stats.errors);
-        new import_obsidian4.Notice(
-          `XGKB Sync: ${stats.errors.length} \u4E2A\u6587\u4EF6\u5931\u8D25\uFF08\u5DF2\u8BB0\u5F55\uFF0C\u4E0B\u6B21\u4F18\u5148\u91CD\u8BD5\uFF1B\u6C34\u4F4D\u5DF2\u63A8\u8FDB\uFF09`,
-          8e3
-        );
+        finishMsg += `\uFF08${stats.errors.length} \u4E2A\u5931\u8D25\uFF0C\u4E0B\u6B21\u91CD\u8BD5\uFF09`;
       }
+      progressNotice.finish(finishMsg, stats.failed > 0 ? 8e3 : 4e3);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       console.error("[XGKB Sync] \u540C\u6B65\u5F02\u5E38:", msg);
-      new import_obsidian4.Notice(`XGKB Sync \u540C\u6B65\u5931\u8D25: ${msg}`, 8e3);
+      progressNotice.finish(`\u540C\u6B65\u5931\u8D25: ${msg}`, 8e3);
     } finally {
       if (dbOpened)
         db.close();

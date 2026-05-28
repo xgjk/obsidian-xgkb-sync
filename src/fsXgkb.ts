@@ -320,6 +320,9 @@ export class FsXgkb {
 	/** 移动到其他父目录（远端） */
 	async moveRemoteFile(fileId: string, targetParentId: string): Promise<Result<MoveFileResult>> {
 		if (!this.projectId) return { ok: false, error: "未初始化 projectId" };
+		console.debug(
+			`[XGKB Sync] moveFile 调用: fileId=${fileId} targetParentId=${targetParentId} projectId=${this.projectId}`
+		);
 		const r = await this.api.moveFile({
 			fileId,
 			targetParentId,
@@ -355,10 +358,14 @@ export class FsXgkb {
 					return { ok: false, error: `创建目录 "${seg}" 失败: ${createResult.error}` };
 				}
 				currentId = createResult.value;
+				console.debug(`[XGKB Sync] createFolder 成功: name="${seg}" folderId=${currentId}`);
 			} else {
 				currentId = found.id;
 			}
 		}
+		console.debug(
+			`[XGKB Sync] resolveFolderIdForRelativePath: "${relativeFolderPath || "(root)"}" -> ${currentId}`
+		);
 		return { ok: true, value: currentId };
 	}
 
