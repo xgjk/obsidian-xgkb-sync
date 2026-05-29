@@ -52,7 +52,9 @@ var DEFAULT_SETTINGS = {
   autoSyncInterval: 0,
   usePhysicalUpload: true,
   uploadContentFallback: true,
-  syncFileExtensions: ["md"]
+  syncFileExtensions: ["md"],
+  /** Pull/双向：默认仅「云端已确认删除」才删本地 */
+  protectLocalDelete: true
 };
 var API_PATHS = {
   getChildFiles: "document-database/file/getChildFiles",
@@ -224,8 +226,13 @@ var XgkbApi = class {
     return this.request("POST", API_PATHS.batchGetContent, { files });
   }
   /** 批量元数据（4.23） */
-  async batchGetMeta(fileIds, projectId) {
-    return this.request("POST", API_PATHS.batchGetMeta, { fileIds, projectId });
+  async batchGetMeta(fileIds, projectId, opts) {
+    return this.request("POST", API_PATHS.batchGetMeta, {
+      fileIds,
+      projectId,
+      ...(opts == null ? void 0 : opts.includePath) !== void 0 && { includePath: opts.includePath },
+      ...(opts == null ? void 0 : opts.rootFileId) !== void 0 && { rootFileId: opts.rootFileId }
+    });
   }
   /**
    * 上传/更新文件（轻量高速通道）
@@ -274,7 +281,8 @@ var XgkbApi = class {
       ...params.projectId !== void 0 && { projectId: params.projectId },
       ...params.nameConflictStrategy !== void 0 && {
         nameConflictStrategy: params.nameConflictStrategy
-      }
+      },
+      ...params.rootFileId !== void 0 && { rootFileId: params.rootFileId }
     });
   }
   async moveFile(params) {
@@ -284,7 +292,8 @@ var XgkbApi = class {
       ...params.projectId !== void 0 && { projectId: params.projectId },
       ...params.nameConflictStrategy !== void 0 && {
         nameConflictStrategy: params.nameConflictStrategy
-      }
+      },
+      ...params.rootFileId !== void 0 && { rootFileId: params.rootFileId }
     });
   }
   /** 显式创建空目录（4.24） */
@@ -332,6 +341,15 @@ function formatTargetFolderLabel(folderPath) {
   if (syncAtProjectRoot)
     return "(\u6574\u4E2A\u77E5\u8BC6\u5E93\u7A7A\u95F4\u6839)";
   return relativePath;
+}
+function isKbSpaceParentId(parentId) {
+  if (parentId == null || parentId === "")
+    return true;
+  const s = String(parentId);
+  return s === "0";
+}
+function normalizeKbRelativePath(relativePath) {
+  return relativePath.split("/").filter(Boolean).map((seg) => sanitizePathSegment(seg)).join("/");
 }
 
 // src/syncFileTypes.ts
@@ -612,23 +630,35 @@ var FsLocal = class {
     await adapter.write(fullPath, content);
     return this.mtimeFromPathAsync(fullPath);
   }
-  /** 删除文件（走 Vault 回收站；隐藏点文件走 adapter.remove） */
+  /** 删除文件：优先 Obsidian 回收站；未编入 Vault 的文件移入 `.trash/` 而非永久删除 */
   async trashFile(relativePath) {
     const fullPath = this.resolve(relativePath);
-    if (isDotHiddenRelativePath(relativePath)) {
-      if (await this.app.vault.adapter.exists(fullPath)) {
-        await this.app.vault.adapter.remove(fullPath);
-      }
-      return;
-    }
     const file = this.app.vault.getAbstractFileByPath(fullPath);
     if (file instanceof Obsidian.TFile) {
       await this.app.fileManager.trashFile(file);
       return;
     }
     if (await this.app.vault.adapter.exists(fullPath)) {
-      await this.app.vault.adapter.remove(fullPath);
+      await this.trashAdapterFileToVaultTrash(fullPath, relativePath);
     }
+  }
+  /** 将 adapter 上的文件移入库根 `.trash/`（可恢复），避免 sync 误删时永久丢失 */
+  async trashAdapterFileToVaultTrash(fullPath, relativePath) {
+    const adapter = this.app.vault.adapter;
+    const trashRoot = (0, import_obsidian2.normalizePath)(`${this.app.vault.getRoot().path}/.trash`);
+    if (!this.app.vault.getAbstractFileByPath(trashRoot)) {
+      try {
+        await this.app.vault.createFolder(trashRoot);
+      } catch (e) {
+      }
+    }
+    const baseName = relativePath.split("/").pop() || "file";
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    let dest = (0, import_obsidian2.normalizePath)(`${trashRoot}/xgkb-sync-${stamp}-${baseName}`);
+    for (let n = 0; n < 20 && await adapter.exists(dest); n++) {
+      dest = (0, import_obsidian2.normalizePath)(`${trashRoot}/xgkb-sync-${stamp}-${n}-${baseName}`);
+    }
+    await adapter.rename(fullPath, dest);
   }
   /** 获取文件的 mtime */
   async getMtime(relativePath) {
@@ -1228,13 +1258,15 @@ var FsXgkb = class {
   }
   /** 同目录内改名（远端） */
   async renameRemoteFile(fileId, newFileName) {
+    var _a;
     if (!this.projectId)
       return { ok: false, error: "\u672A\u521D\u59CB\u5316 projectId" };
     const r = await this.api.updateFileName({
       fileId,
       newName: newFileName,
       projectId: this.projectId,
-      nameConflictStrategy: DEFAULT_RENAME_NAME_CONFLICT_STRATEGY
+      nameConflictStrategy: DEFAULT_RENAME_NAME_CONFLICT_STRATEGY,
+      rootFileId: (_a = this.rootId) != null ? _a : void 0
     });
     if (!r.ok)
       return { ok: false, error: r.error };
@@ -1242,6 +1274,7 @@ var FsXgkb = class {
   }
   /** 移动到其他父目录（远端） */
   async moveRemoteFile(fileId, targetParentId) {
+    var _a;
     if (!this.projectId)
       return { ok: false, error: "\u672A\u521D\u59CB\u5316 projectId" };
     console.debug(
@@ -1251,7 +1284,8 @@ var FsXgkb = class {
       fileId,
       targetParentId,
       projectId: this.projectId,
-      nameConflictStrategy: DEFAULT_MOVE_NAME_CONFLICT_STRATEGY
+      nameConflictStrategy: DEFAULT_MOVE_NAME_CONFLICT_STRATEGY,
+      rootFileId: (_a = this.rootId) != null ? _a : void 0
     });
     if (!r.ok)
       return { ok: false, error: r.error };
@@ -1368,7 +1402,8 @@ var FsXgkb = class {
         rootFileId: this.rootId,
         since: cursor ? void 0 : since,
         cursor,
-        limit: 200
+        limit: 200,
+        includePath: true
       });
       if (!r.ok)
         return { ok: false, error: r.error };
@@ -1388,13 +1423,16 @@ var FsXgkb = class {
    * 未返回的 fileId（不存在/无权限）不在 Map 中，调用方按删除处理。
    */
   async batchGetMetaAll(fileIds) {
-    var _a, _b;
+    var _a, _b, _c;
     const out = /* @__PURE__ */ new Map();
     const unique = [...new Set(fileIds.filter(Boolean))];
     console.debug(`[XGKB Sync] batchGetMeta: \u8BF7\u6C42 ${unique.length} \u4E2A fileId\uFF0C\u5206 ${Math.ceil(unique.length / BATCH_GET_META_MAX)} \u6279`);
     for (let i = 0; i < unique.length; i += BATCH_GET_META_MAX) {
       const chunk = unique.slice(i, i + BATCH_GET_META_MAX);
-      const r = await this.api.batchGetMeta(chunk, this.projectId || void 0);
+      const r = await this.api.batchGetMeta(chunk, this.projectId || void 0, {
+        includePath: true,
+        rootFileId: (_a = this.rootId) != null ? _a : void 0
+      });
       if (!r.ok) {
         console.warn("[XGKB Sync] batchGetMeta \u5931\u8D25:", r.error);
         continue;
@@ -1405,7 +1443,7 @@ var FsXgkb = class {
         if (item.deleted)
           deletedCount++;
       }
-      console.debug(`[XGKB Sync] batchGetMeta \u6279\u6B21[${Math.floor(i / BATCH_GET_META_MAX) + 1}]: \u8BF7\u6C42 ${chunk.length} \u4E2A\uFF0C\u8FD4\u56DE ${(_b = (_a = r.value) == null ? void 0 : _a.length) != null ? _b : 0} \u6761\uFF08\u5176\u4E2D deleted:${deletedCount}\uFF09`);
+      console.debug(`[XGKB Sync] batchGetMeta \u6279\u6B21[${Math.floor(i / BATCH_GET_META_MAX) + 1}]: \u8BF7\u6C42 ${chunk.length} \u4E2A\uFF0C\u8FD4\u56DE ${(_c = (_b = r.value) == null ? void 0 : _b.length) != null ? _c : 0} \u6761\uFF08\u5176\u4E2D deleted:${deletedCount}\uFF09`);
     }
     const missingCount = unique.length - out.size;
     console.debug(`[XGKB Sync] batchGetMeta \u5B8C\u6210: \u547D\u4E2D ${out.size} \u4E2A\uFF0C\u672A\u8FD4\u56DE/\u65E0\u6743\u9650 ${missingCount} \u4E2A\uFF08\u5C06\u89C6\u4E3A\u8FDC\u7AEF\u5220\u9664\uFF09`);
@@ -1452,7 +1490,7 @@ var XgkbPluginSettingTab = class extends import_obsidian3.PluginSettingTab {
       });
     });
     new import_obsidian3.Setting(containerEl).setName("Cloud target folder").setDesc(
-      "\u77E5\u8BC6\u5E93\u4E2D\u7684\u540C\u6B65\u6839\u76EE\u5F55\uFF1B\u652F\u6301\u591A\u7EA7\u8DEF\u5F84\u5982 Obsidian \u6216 A/B\uFF08\u4E0D\u5B58\u5728\u65F6\u81EA\u52A8\u521B\u5EFA\uFF09\u3002\u7559\u7A7A\u8868\u793A\u6620\u5C04\u5230\u6574\u4E2A\u77E5\u8BC6\u5E93\u7A7A\u95F4\u6839\uFF08rootFileId=0\uFF09\uFF0C\u5C06\u540C\u6B65\u8BE5\u7A7A\u95F4\u4E0B\u6240\u6709\u7B26\u5408\u7C7B\u578B\u7684\u6587\u4EF6\uFF0C\u8BF7\u8C28\u614E\u4F7F\u7528\u3002"
+      "\u77E5\u8BC6\u5E93\u4E2D\u7684\u540C\u6B65\u6839\u76EE\u5F55\uFF1B\u652F\u6301\u591A\u7EA7\u8DEF\u5F84\u5982 Obsidian \u6216 A/B\uFF08\u4E0D\u5B58\u5728\u65F6\u81EA\u52A8\u521B\u5EFA\uFF09\u3002\u7559\u7A7A=\u6620\u5C04\u5230\u6574\u4E2A\u77E5\u8BC6\u5E93\u7A7A\u95F4\u6839\uFF08rootFileId=0\uFF09\uFF1A\u589E\u91CF/\u5168\u91CF\u90FD\u4F1A\u8986\u76D6\u8BE5\u7A7A\u95F4\u5185\u6240\u6709\u7B26\u5408\u7C7B\u578B\u7684\u6587\u4EF6\uFF1B\u672C\u5730\u4ECD\u53D7 Sync folder \u9650\u5236\u3002\u4E0E Obsidian \u7B49\u5176\u5B83\u9876\u7EA7\u76EE\u5F55\u5E76\u5217\uFF0C\u8BF7\u8C28\u614E\u4F7F\u7528\u3002"
     ).addText((text) => {
       text.setPlaceholder("\u7559\u7A7A=\u6574\u4E2A\u7A7A\u95F4\u6839\uFF0C\u6216 Obsidian / A/B").setValue(this.plugin.settings.targetFolderName);
       let lastTargetFolder = normalizeTargetFolderPath(
@@ -1498,6 +1536,14 @@ var XgkbPluginSettingTab = class extends import_obsidian3.PluginSettingTab {
     new import_obsidian3.Setting(containerEl).setName("Sync direction").setDesc("\u53CC\u5411\u540C\u6B65 / \u4EC5\u63A8\u9001 / \u4EC5\u62C9\u53D6").addDropdown(
       (dropdown) => dropdown.addOption("bidirectional", "Bidirectional").addOption("push", "Push only").addOption("pull", "Pull only").setValue(this.plugin.settings.syncDirection).onChange(async (value) => {
         this.plugin.settings.syncDirection = value;
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian3.Setting(containerEl).setName("\u4FDD\u62A4\u672C\u5730\u6587\u4EF6\uFF08Pull / \u53CC\u5411\uFF09").setDesc(
+      "\u5F00\u542F\uFF08\u63A8\u8350\uFF09\uFF1A\u4EC5\u5F53\u4E91\u7AEF\u660E\u786E\u5220\u9664\u8BE5\u6587\u4EF6\u65F6\u624D\u5220\u672C\u5730\uFF1B\u5220\u9664\u65F6\u79FB\u5165 Obsidian \u56DE\u6536\u7AD9\uFF08\u542B\u70B9\u6587\u4EF6\uFF09\u3002\u5173\u95ED\uFF1A\u8FDC\u7AEF\u5217\u8868\u7F3A\u9879\u65F6\u4E5F\u53EF\u80FD\u5220\u672C\u5730\uFF08\u6709\u8BEF\u5220\u98CE\u9669\uFF09\u3002\u4EC5\u5F71\u54CD Pull / \u53CC\u5411\uFF0CPush \u4E0D\u53D7\u5F71\u54CD\u3002"
+    ).addToggle(
+      (toggle) => toggle.setValue(this.plugin.settings.protectLocalDelete !== false).onChange(async (value) => {
+        this.plugin.settings.protectLocalDelete = value;
         await this.plugin.saveSettings();
       })
     );
@@ -2490,6 +2536,12 @@ var SyncEngine = class {
       if (item.parentId != null)
         folderUpsertParentIds.push(String(item.parentId));
     }
+    for (const id of folderUpsertIds) {
+      const item = upsertById.get(id);
+      if (item.relativePath) {
+        folderIdToPath.set(id, normalizeKbRelativePath(item.relativePath));
+      }
+    }
     if (folderUpsertParentIds.length > 0) {
       syncDiagHydrate("\u76EE\u5F55 upsert \u524D\u5148\u8865\u9F50\u7236\u76EE\u5F55", {
         folderUpsertIds,
@@ -2569,11 +2621,18 @@ var SyncEngine = class {
       const item = upsertById.get(id);
       if (item.type === XGKB_NODE_FOLDER)
         continue;
-      const parentId = item.parentId != null ? String(item.parentId) : "";
-      const folderPath = folderIdToPath.get(parentId);
-      if (folderPath !== void 0) {
-        const safeName = sanitizePathSegment(item.name || id);
-        const filePath = folderPath ? `${folderPath}/${safeName}` : safeName;
+      let filePath;
+      if (item.relativePath) {
+        filePath = normalizeKbRelativePath(item.relativePath);
+      } else {
+        const parentId = item.parentId != null ? String(item.parentId) : "";
+        const folderPath = this.resolveParentFolderPath(parentId, folderIdToPath);
+        if (folderPath !== void 0) {
+          const safeName = sanitizePathSegment(item.name || id);
+          filePath = folderPath ? `${folderPath}/${safeName}` : safeName;
+        }
+      }
+      if (filePath !== void 0) {
         if (!pathMatchesSyncExtensions(filePath, this.syncExtensions))
           continue;
         resolvedNewFiles.push({ id, path: filePath, item });
@@ -2620,8 +2679,8 @@ var SyncEngine = class {
         syncDiagKnownUpsert(id, record, item, meta, folderIdToPath);
         const newParentId = this.effectiveParentId(item, meta);
         const fileNameUsed = (_a = item.name) != null ? _a : meta.name;
-        const folderPathFromMap = newParentId ? folderIdToPath.get(newParentId) : void 0;
-        const remotePath = this.remotePathFromParent(
+        const folderPathFromMap = newParentId ? this.resolveParentFolderPath(newParentId, folderIdToPath) : void 0;
+        const remotePath = meta.relativePath != null && meta.relativePath !== "" ? normalizeKbRelativePath(meta.relativePath) : item.relativePath ? normalizeKbRelativePath(item.relativePath) : this.remotePathFromParent(
           newParentId,
           fileNameUsed,
           folderIdToPath,
@@ -2704,7 +2763,15 @@ var SyncEngine = class {
         const folderId = String(item.fileId);
         const parentId = item.parentId != null ? String(item.parentId) : "";
         const oldPath = (_a = folderIdToPath.get(folderId)) != null ? _a : null;
-        const parentPath = folderIdToPath.get(parentId);
+        if (item.relativePath) {
+          const nextPath2 = normalizeKbRelativePath(item.relativePath);
+          if (folderIdToPath.get(folderId) !== nextPath2) {
+            folderIdToPath.set(folderId, nextPath2);
+            changed = true;
+          }
+          continue;
+        }
+        const parentPath = this.resolveParentFolderPath(parentId, folderIdToPath);
         if (parentPath === void 0) {
           if (pass === 1) {
             results.push({
@@ -2791,8 +2858,15 @@ var SyncEngine = class {
           name: meta.name,
           parentId: meta.parentId != null ? String(meta.parentId) : null
         });
+        if (meta.relativePath != null && meta.relativePath !== "") {
+          folderIdToPath.set(id, normalizeKbRelativePath(meta.relativePath));
+          continue;
+        }
         const parentId = meta.parentId != null ? String(meta.parentId) : "";
         if (parentId && parentId !== id && parentId !== rootId && !folderIdToPath.has(parentId)) {
+          if (isKbSpaceParentId(parentId) && !this.fsXgkb.isSyncAtProjectRoot()) {
+            continue;
+          }
           pending.add(parentId);
         }
       }
@@ -2807,8 +2881,10 @@ var SyncEngine = class {
       assignPass++;
       changed = false;
       for (const [folderId, meta] of metaById) {
+        if (folderIdToPath.has(folderId))
+          continue;
         const parentId = meta.parentId != null ? String(meta.parentId) : "";
-        const parentPath = parentId === rootId || parentId === "" || parentId === "0" ? folderIdToPath.has(rootId || "") || parentId === rootId ? "" : void 0 : folderIdToPath.get(parentId);
+        const parentPath = this.resolveParentFolderPath(parentId, folderIdToPath);
         if (parentPath === void 0)
           continue;
         const seg = sanitizePathSegment(meta.name || folderId);
@@ -2830,9 +2906,20 @@ var SyncEngine = class {
     }
     return true;
   }
+  resolveParentFolderPath(parentId, folderIdToPath) {
+    const rootId = this.fsXgkb.getRootId();
+    if (isKbSpaceParentId(parentId)) {
+      if (!this.fsXgkb.isSyncAtProjectRoot())
+        return void 0;
+      return rootId != null && folderIdToPath.has(rootId) ? "" : void 0;
+    }
+    if (rootId && parentId === rootId)
+      return "";
+    return folderIdToPath.get(parentId);
+  }
   remotePathForRecord(record, folderIdToPath) {
     const fileName = record.localPath.split("/").pop() || record.localPath;
-    const folderPath = folderIdToPath.get(record.xgkbFolderId);
+    const folderPath = this.resolveParentFolderPath(record.xgkbFolderId, folderIdToPath);
     if (folderPath === void 0)
       return record.localPath;
     return folderPath ? `${folderPath}/${fileName}` : fileName;
@@ -2845,15 +2932,16 @@ var SyncEngine = class {
     return "";
   }
   remotePathFromParent(parentId, fileName, folderIdToPath, fallback) {
-    if (!parentId)
-      return fallback;
-    const folderPath = folderIdToPath.get(parentId);
+    const folderPath = this.resolveParentFolderPath(parentId, folderIdToPath);
     if (folderPath === void 0)
       return fallback;
     const name = sanitizePathSegment(fileName || fallback.split("/").pop() || fallback);
     return folderPath ? `${folderPath}/${name}` : name;
   }
   remotePathFromMeta(meta, folderIdToPath, fallback) {
+    if (meta.relativePath != null && meta.relativePath !== "") {
+      return normalizeKbRelativePath(meta.relativePath);
+    }
     return this.remotePathFromParent(
       meta.parentId != null ? String(meta.parentId) : "",
       meta.name,
@@ -2921,6 +3009,18 @@ var SyncEngine = class {
       return true;
     return this.remoteDeletedLocalPaths.has(record.localPath);
   }
+  /** Pull/双向且开启保护时，禁止仅凭「远端 map 缺项」启发式删本地 */
+  allowsHeuristicLocalDelete() {
+    const dir = this.settings.syncDirection;
+    if (dir === "push")
+      return true;
+    return this.settings.protectLocalDelete === false;
+  }
+  shouldDeleteLocal(record) {
+    if (this.isRemoteConfirmedDeleted(record))
+      return true;
+    return this.allowsHeuristicLocalDelete();
+  }
   async executePlan(plan) {
     var _a, _b, _c;
     const { path, local, remote, record, op } = plan;
@@ -2986,7 +3086,9 @@ var SyncEngine = class {
     if ((record == null ? void 0 : record.syncStatus) === "failed") {
       if (!remote) {
         if (local && this.isRemoteConfirmedDeleted(record)) {
-          return dir === "push" ? "skip" : "delete-local";
+          if (dir === "push")
+            return "skip";
+          return this.shouldDeleteLocal(record) ? "delete-local" : "skip";
         }
         return local && dir !== "pull" ? "upload-new" : "skip";
       }
@@ -3022,7 +3124,9 @@ var SyncEngine = class {
     }
     if (local && !remote) {
       if (this.isRemoteConfirmedDeleted(record)) {
-        return dir === "push" ? "skip" : "delete-local";
+        if (dir === "push")
+          return "skip";
+        return this.shouldDeleteLocal(record) ? "delete-local" : "skip";
       }
       if (dir === "pull")
         return "skip";
@@ -3031,7 +3135,7 @@ var SyncEngine = class {
         return "upload-new";
       if (record.xgkbFileId)
         return "skip";
-      return "delete-local";
+      return this.allowsHeuristicLocalDelete() ? "delete-local" : "skip";
     }
     if (local && remote) {
       const localChanged = local.mtime > record.localMtime + MTIME_TOLERANCE_MS;
@@ -3377,10 +3481,15 @@ var SyncEngine = class {
     this.progress(`\u2193 ${path}`);
   }
   async doDeleteLocal(path, record) {
+    if (!this.shouldDeleteLocal(record)) {
+      console.debug(`[XGKB Sync] \u4FDD\u62A4\u672C\u5730\u6587\u4EF6\uFF0C\u8DF3\u8FC7\u5220\u9664: ${path}`);
+      this.progress(`\u2298 \u4FDD\u62A4\u672C\u5730 ${path}\uFF08\u672A\u786E\u8BA4\u4E91\u7AEF\u5220\u9664\uFF09`);
+      return;
+    }
     await this.fsLocal.trashFile(path);
     await this.db.delete(this.scopeKey, path);
     this.stats.deleted++;
-    this.progress(`\u2717 \u672C\u5730\u5220\u9664 ${path}`);
+    this.progress(`\u2717 \u672C\u5730\u79FB\u81F3\u56DE\u6536\u7AD9 ${path}`);
   }
   async doDeleteRemote(record) {
     const result = await this.fsXgkb.deleteFile(record.xgkbFileId);

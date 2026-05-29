@@ -51,3 +51,19 @@ export function formatTargetFolderLabel(folderPath: string): string {
 	if (syncAtProjectRoot) return "(整个知识库空间根)";
 	return relativePath;
 }
+
+/** 知识库 API 中表示空间根（parentId=0） */
+export function isKbSpaceParentId(parentId: string | number | null | undefined): boolean {
+	if (parentId == null || parentId === "") return true;
+	const s = String(parentId);
+	return s === "0";
+}
+
+/** 将 API 返回的 relativePath 规范为插件内相对路径 */
+export function normalizeKbRelativePath(relativePath: string): string {
+	return relativePath
+		.split("/")
+		.filter(Boolean)
+		.map((seg) => sanitizePathSegment(seg))
+		.join("/");
+}

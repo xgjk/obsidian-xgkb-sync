@@ -28,7 +28,11 @@ import {
 	normalizeSyncExtensions,
 	pathMatchesSyncExtensions,
 } from "./syncFileTypes";
-import { sanitizePathSegment } from "./pathSanitize";
+import {
+	isKbSpaceParentId,
+	normalizeKbRelativePath,
+	sanitizePathSegment,
+} from "./pathSanitize";
 import {
 	syncDiag,
 	syncDiagFolderMapSnapshot,
@@ -866,6 +870,13 @@ export class SyncEngine {
 			const item = upsertById.get(id)!;
 			if (item.parentId != null) folderUpsertParentIds.push(String(item.parentId));
 		}
+		for (const id of folderUpsertIds) {
+			const item = upsertById.get(id)!;
+			if (item.relativePath) {
+				folderIdToPath.set(id, normalizeKbRelativePath(item.relativePath));
+			}
+		}
+
 		if (folderUpsertParentIds.length > 0) {
 			syncDiagHydrate("目录 upsert 前先补齐父目录", {
 				folderUpsertIds,
@@ -947,11 +958,18 @@ export class SyncEngine {
 		for (const id of unknownUpsertIds) {
 			const item = upsertById.get(id)!;
 			if (item.type === XGKB_NODE_FOLDER) continue;
-			const parentId = item.parentId != null ? String(item.parentId) : "";
-			const folderPath = folderIdToPath.get(parentId);
-			if (folderPath !== undefined) {
-				const safeName = sanitizePathSegment(item.name || id);
-				const filePath = folderPath ? `${folderPath}/${safeName}` : safeName;
+			let filePath: string | undefined;
+			if (item.relativePath) {
+				filePath = normalizeKbRelativePath(item.relativePath);
+			} else {
+				const parentId = item.parentId != null ? String(item.parentId) : "";
+				const folderPath = this.resolveParentFolderPath(parentId, folderIdToPath);
+				if (folderPath !== undefined) {
+					const safeName = sanitizePathSegment(item.name || id);
+					filePath = folderPath ? `${folderPath}/${safeName}` : safeName;
+				}
+			}
+			if (filePath !== undefined) {
 				if (!pathMatchesSyncExtensions(filePath, this.syncExtensions)) continue;
 				resolvedNewFiles.push({ id, path: filePath, item });
 			} else {
@@ -1000,13 +1018,20 @@ export class SyncEngine {
 
 				const newParentId = this.effectiveParentId(item, meta);
 				const fileNameUsed = item.name ?? meta.name;
-				const folderPathFromMap = newParentId ? folderIdToPath.get(newParentId) : undefined;
-				const remotePath = this.remotePathFromParent(
-					newParentId,
-					fileNameUsed,
-					folderIdToPath,
-					record.localPath
-				);
+				const folderPathFromMap = newParentId
+					? this.resolveParentFolderPath(newParentId, folderIdToPath)
+					: undefined;
+				const remotePath =
+					meta.relativePath != null && meta.relativePath !== ""
+						? normalizeKbRelativePath(meta.relativePath)
+						: item.relativePath
+							? normalizeKbRelativePath(item.relativePath)
+							: this.remotePathFromParent(
+									newParentId,
+									fileNameUsed,
+									folderIdToPath,
+									record.localPath
+								);
 				const usedFallback =
 					remotePath === record.localPath && (!newParentId || folderPathFromMap === undefined);
 				syncDiagPathResolve(id, record.localPath, remotePath, {
@@ -1075,7 +1100,16 @@ export class SyncEngine {
 
 	/** listChanges 中的目录 upsert → 更新 folderId 对应路径（远端目录改名/新建） */
 	private applyFolderUpsertsToPathMap(
-		upsertById: Map<string, { type?: number; fileId: string | number; parentId?: string | number; name?: string }>,
+		upsertById: Map<
+			string,
+			{
+				type?: number;
+				fileId: string | number;
+				parentId?: string | number;
+				name?: string;
+				relativePath?: string;
+			}
+		>,
 		folderIdToPath: Map<string, string>
 	): Array<{
 		folderId: string;
@@ -1104,7 +1138,15 @@ export class SyncEngine {
 				const folderId = String(item.fileId);
 				const parentId = item.parentId != null ? String(item.parentId) : "";
 				const oldPath = folderIdToPath.get(folderId) ?? null;
-				const parentPath = folderIdToPath.get(parentId);
+				if (item.relativePath) {
+					const nextPath = normalizeKbRelativePath(item.relativePath);
+					if (folderIdToPath.get(folderId) !== nextPath) {
+						folderIdToPath.set(folderId, nextPath);
+						changed = true;
+					}
+					continue;
+				}
+				const parentPath = this.resolveParentFolderPath(parentId, folderIdToPath);
 				if (parentPath === undefined) {
 					if (pass === 1) {
 						results.push({
@@ -1198,8 +1240,15 @@ export class SyncEngine {
 					name: meta.name,
 					parentId: meta.parentId != null ? String(meta.parentId) : null,
 				});
+				if (meta.relativePath != null && meta.relativePath !== "") {
+					folderIdToPath.set(id, normalizeKbRelativePath(meta.relativePath));
+					continue;
+				}
 				const parentId = meta.parentId != null ? String(meta.parentId) : "";
 				if (parentId && parentId !== id && parentId !== rootId && !folderIdToPath.has(parentId)) {
+					if (isKbSpaceParentId(parentId) && !this.fsXgkb.isSyncAtProjectRoot()) {
+						continue;
+					}
 					pending.add(parentId);
 				}
 			}
@@ -1215,13 +1264,9 @@ export class SyncEngine {
 			assignPass++;
 			changed = false;
 			for (const [folderId, meta] of metaById) {
+				if (folderIdToPath.has(folderId)) continue;
 				const parentId = meta.parentId != null ? String(meta.parentId) : "";
-				const parentPath =
-					parentId === rootId || parentId === "" || parentId === "0"
-						? folderIdToPath.has(rootId || "") || parentId === rootId
-							? ""
-							: undefined
-						: folderIdToPath.get(parentId);
+				const parentPath = this.resolveParentFolderPath(parentId, folderIdToPath);
 				if (parentPath === undefined) continue;
 				const seg = sanitizePathSegment(meta.name || folderId);
 				const nextPath = parentPath ? `${parentPath}/${seg}` : seg;
@@ -1245,9 +1290,22 @@ export class SyncEngine {
 		return true;
 	}
 
+	private resolveParentFolderPath(
+		parentId: string,
+		folderIdToPath: Map<string, string>
+	): string | undefined {
+		const rootId = this.fsXgkb.getRootId();
+		if (isKbSpaceParentId(parentId)) {
+			if (!this.fsXgkb.isSyncAtProjectRoot()) return undefined;
+			return rootId != null && folderIdToPath.has(rootId) ? "" : undefined;
+		}
+		if (rootId && parentId === rootId) return "";
+		return folderIdToPath.get(parentId);
+	}
+
 	private remotePathForRecord(record: SyncStateRecord, folderIdToPath: Map<string, string>): string {
 		const fileName = record.localPath.split("/").pop() || record.localPath;
-		const folderPath = folderIdToPath.get(record.xgkbFolderId);
+		const folderPath = this.resolveParentFolderPath(record.xgkbFolderId, folderIdToPath);
 		if (folderPath === undefined) return record.localPath;
 		return folderPath ? `${folderPath}/${fileName}` : fileName;
 	}
@@ -1265,8 +1323,7 @@ export class SyncEngine {
 		folderIdToPath: Map<string, string>,
 		fallback: string
 	): string {
-		if (!parentId) return fallback;
-		const folderPath = folderIdToPath.get(parentId);
+		const folderPath = this.resolveParentFolderPath(parentId, folderIdToPath);
 		if (folderPath === undefined) return fallback;
 		const name = sanitizePathSegment(fileName || fallback.split("/").pop() || fallback);
 		return folderPath ? `${folderPath}/${name}` : name;
@@ -1277,6 +1334,9 @@ export class SyncEngine {
 		folderIdToPath: Map<string, string>,
 		fallback: string
 	): string {
+		if (meta.relativePath != null && meta.relativePath !== "") {
+			return normalizeKbRelativePath(meta.relativePath);
+		}
 		return this.remotePathFromParent(
 			meta.parentId != null ? String(meta.parentId) : "",
 			meta.name,
@@ -1347,6 +1407,18 @@ export class SyncEngine {
 		if (!record) return false;
 		if (this.remoteDeletedFileIds.has(record.xgkbFileId)) return true;
 		return this.remoteDeletedLocalPaths.has(record.localPath);
+	}
+
+	/** Pull/双向且开启保护时，禁止仅凭「远端 map 缺项」启发式删本地 */
+	private allowsHeuristicLocalDelete(): boolean {
+		const dir = this.settings.syncDirection;
+		if (dir === "push") return true;
+		return this.settings.protectLocalDelete === false;
+	}
+
+	private shouldDeleteLocal(record: SyncStateRecord): boolean {
+		if (this.isRemoteConfirmedDeleted(record)) return true;
+		return this.allowsHeuristicLocalDelete();
 	}
 
 	private async executePlan(plan: SyncPlan): Promise<void> {
@@ -1421,7 +1493,8 @@ export class SyncEngine {
 		if (record?.syncStatus === "failed") {
 			if (!remote) {
 				if (local && this.isRemoteConfirmedDeleted(record)) {
-					return dir === "push" ? "skip" : "delete-local";
+					if (dir === "push") return "skip";
+					return this.shouldDeleteLocal(record) ? "delete-local" : "skip";
 				}
 				return local && dir !== "pull" ? "upload-new" : "skip";
 			}
@@ -1452,14 +1525,15 @@ export class SyncEngine {
 
 		if (local && !remote) {
 			if (this.isRemoteConfirmedDeleted(record)) {
-				return dir === "push" ? "skip" : "delete-local";
+				if (dir === "push") return "skip";
+				return this.shouldDeleteLocal(record) ? "delete-local" : "skip";
 			}
 			if (dir === "pull") return "skip";
 			const localChanged = local.mtime > record.localMtime + MTIME_TOLERANCE_MS;
 			if (localChanged) return "upload-new";
 			// 有 fileId 时远端可能只是增量 map 漏报，避免误删本地
 			if (record.xgkbFileId) return "skip";
-			return "delete-local";
+			return this.allowsHeuristicLocalDelete() ? "delete-local" : "skip";
 		}
 
 		if (local && remote) {
@@ -1837,10 +1911,15 @@ export class SyncEngine {
 	}
 
 	private async doDeleteLocal(path: string, record: SyncStateRecord): Promise<void> {
+		if (!this.shouldDeleteLocal(record)) {
+			console.debug(`[XGKB Sync] 保护本地文件，跳过删除: ${path}`);
+			this.progress(`⊘ 保护本地 ${path}（未确认云端删除）`);
+			return;
+		}
 		await this.fsLocal.trashFile(path);
 		await this.db.delete(this.scopeKey, path);
 		this.stats.deleted++;
-		this.progress(`✗ 本地删除 ${path}`);
+		this.progress(`✗ 本地移至回收站 ${path}`);
 	}
 
 	private async doDeleteRemote(record: SyncStateRecord): Promise<void> {

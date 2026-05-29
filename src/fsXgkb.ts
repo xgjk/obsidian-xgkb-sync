@@ -333,6 +333,7 @@ export class FsXgkb {
 			newName: newFileName,
 			projectId: this.projectId,
 			nameConflictStrategy: DEFAULT_RENAME_NAME_CONFLICT_STRATEGY,
+			rootFileId: this.rootId ?? undefined,
 		});
 		if (!r.ok) return { ok: false, error: r.error };
 		return { ok: true, value: undefined };
@@ -349,6 +350,7 @@ export class FsXgkb {
 			targetParentId,
 			projectId: this.projectId,
 			nameConflictStrategy: DEFAULT_MOVE_NAME_CONFLICT_STRATEGY,
+			rootFileId: this.rootId ?? undefined,
 		});
 		if (!r.ok) return { ok: false, error: r.error };
 		if (r.value.mainSkipped) {
@@ -478,6 +480,7 @@ export class FsXgkb {
 				since: cursor ? undefined : since,
 				cursor,
 				limit: 200,
+				includePath: true,
 			});
 			if (!r.ok) return { ok: false, error: r.error };
 			const pageItems = r.value.items || [];
@@ -502,7 +505,10 @@ export class FsXgkb {
 		console.debug(`[XGKB Sync] batchGetMeta: 请求 ${unique.length} 个 fileId，分 ${Math.ceil(unique.length / BATCH_GET_META_MAX)} 批`);
 		for (let i = 0; i < unique.length; i += BATCH_GET_META_MAX) {
 			const chunk = unique.slice(i, i + BATCH_GET_META_MAX);
-			const r = await this.api.batchGetMeta(chunk, this.projectId || undefined);
+			const r = await this.api.batchGetMeta(chunk, this.projectId || undefined, {
+				includePath: true,
+				rootFileId: this.rootId ?? undefined,
+			});
 			if (!r.ok) {
 				console.warn("[XGKB Sync] batchGetMeta 失败:", r.error);
 				continue;

@@ -12,6 +12,8 @@ export const DEFAULT_SETTINGS: XgkbPluginSettings = {
 	usePhysicalUpload: true,
 	uploadContentFallback: true,
 	syncFileExtensions: ["md"],
+	/** Pull/双向：默认仅「云端已确认删除」才删本地 */
+	protectLocalDelete: true,
 };
 
 export const API_PATHS = {

@@ -291,23 +291,37 @@ export class FsLocal {
 		return this.mtimeFromPathAsync(fullPath);
 	}
 
-	/** 删除文件（走 Vault 回收站；隐藏点文件走 adapter.remove） */
+	/** 删除文件：优先 Obsidian 回收站；未编入 Vault 的文件移入 `.trash/` 而非永久删除 */
 	async trashFile(relativePath: string): Promise<void> {
 		const fullPath = this.resolve(relativePath);
-		if (isDotHiddenRelativePath(relativePath)) {
-			if (await this.app.vault.adapter.exists(fullPath)) {
-				await this.app.vault.adapter.remove(fullPath);
-			}
-			return;
-		}
 		const file = this.app.vault.getAbstractFileByPath(fullPath);
 		if (file instanceof Obsidian.TFile) {
 			await this.app.fileManager.trashFile(file);
 			return;
 		}
 		if (await this.app.vault.adapter.exists(fullPath)) {
-			await this.app.vault.adapter.remove(fullPath);
+			await this.trashAdapterFileToVaultTrash(fullPath, relativePath);
 		}
+	}
+
+	/** 将 adapter 上的文件移入库根 `.trash/`（可恢复），避免 sync 误删时永久丢失 */
+	private async trashAdapterFileToVaultTrash(fullPath: string, relativePath: string): Promise<void> {
+		const adapter = this.app.vault.adapter;
+		const trashRoot = normalizePath(`${this.app.vault.getRoot().path}/.trash`);
+		if (!this.app.vault.getAbstractFileByPath(trashRoot)) {
+			try {
+				await this.app.vault.createFolder(trashRoot);
+			} catch {
+				// 已存在或非 Vault 索引
+			}
+		}
+		const baseName = relativePath.split("/").pop() || "file";
+		const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+		let dest = normalizePath(`${trashRoot}/xgkb-sync-${stamp}-${baseName}`);
+		for (let n = 0; n < 20 && (await adapter.exists(dest)); n++) {
+			dest = normalizePath(`${trashRoot}/xgkb-sync-${stamp}-${n}-${baseName}`);
+		}
+		await adapter.rename(fullPath, dest);
 	}
 
 	/** 获取文件的 mtime */

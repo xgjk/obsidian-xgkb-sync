@@ -79,7 +79,8 @@ export class XgkbPluginSettingTab extends PluginSettingTab {
 			.setName("Cloud target folder")
 			.setDesc(
 				"知识库中的同步根目录；支持多级路径如 Obsidian 或 A/B（不存在时自动创建）。" +
-					"留空表示映射到整个知识库空间根（rootFileId=0），将同步该空间下所有符合类型的文件，请谨慎使用。"
+					"留空=映射到整个知识库空间根（rootFileId=0）：增量/全量都会覆盖该空间内所有符合类型的文件；" +
+					"本地仍受 Sync folder 限制。与 Obsidian 等其它顶级目录并列，请谨慎使用。"
 			)
 			.addText((text) => {
 				text
@@ -146,6 +147,19 @@ export class XgkbPluginSettingTab extends PluginSettingTab {
 						this.plugin.settings.syncDirection = value as XgkbPluginSettings["syncDirection"];
 						await this.plugin.saveSettings();
 					})
+			);
+
+		new Setting(containerEl)
+			.setName("保护本地文件（Pull / 双向）")
+			.setDesc(
+				"开启（推荐）：仅当云端明确删除该文件时才删本地；删除时移入 Obsidian 回收站（含点文件）。" +
+					"关闭：远端列表缺项时也可能删本地（有误删风险）。仅影响 Pull / 双向，Push 不受影响。"
+			)
+			.addToggle((toggle) =>
+				toggle.setValue(this.plugin.settings.protectLocalDelete !== false).onChange(async (value) => {
+					this.plugin.settings.protectLocalDelete = value;
+					await this.plugin.saveSettings();
+				})
 			);
 
 		new Setting(containerEl)

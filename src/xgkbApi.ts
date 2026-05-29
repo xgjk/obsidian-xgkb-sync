@@ -145,6 +145,7 @@ export class XgkbApi {
 		since?: number;
 		cursor?: string;
 		limit?: number;
+		includePath?: boolean;
 	}): Promise<Result<XgkbListChangesData>> {
 		return this.request<XgkbListChangesData>("GET", API_PATHS.listChanges, params);
 	}
@@ -185,8 +186,17 @@ export class XgkbApi {
 	}
 
 	/** 批量元数据（4.23） */
-	async batchGetMeta(fileIds: string[], projectId?: string): Promise<Result<XgkbMetaItem[]>> {
-		return this.request<XgkbMetaItem[]>("POST", API_PATHS.batchGetMeta, { fileIds, projectId });
+	async batchGetMeta(
+		fileIds: string[],
+		projectId?: string,
+		opts?: { includePath?: boolean; rootFileId?: string }
+	): Promise<Result<XgkbMetaItem[]>> {
+		return this.request<XgkbMetaItem[]>("POST", API_PATHS.batchGetMeta, {
+			fileIds,
+			projectId,
+			...(opts?.includePath !== undefined && { includePath: opts.includePath }),
+			...(opts?.rootFileId !== undefined && { rootFileId: opts.rootFileId }),
+		});
 	}
 
 	/**
@@ -250,6 +260,7 @@ export class XgkbApi {
 			...(params.nameConflictStrategy !== undefined && {
 				nameConflictStrategy: params.nameConflictStrategy,
 			}),
+			...(params.rootFileId !== undefined && { rootFileId: params.rootFileId }),
 		});
 	}
 
@@ -261,6 +272,7 @@ export class XgkbApi {
 			...(params.nameConflictStrategy !== undefined && {
 				nameConflictStrategy: params.nameConflictStrategy,
 			}),
+			...(params.rootFileId !== undefined && { rootFileId: params.rootFileId }),
 		});
 	}
 

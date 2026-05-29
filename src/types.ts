@@ -14,6 +14,11 @@ export interface XgkbPluginSettings {
 	uploadContentFallback: boolean;
 	/** 要同步的文件扩展名（不含点），至少一种 */
 	syncFileExtensions: string[];
+	/**
+	 * Pull/双向：仅当云端 listChanges 明确 delete 时才删本地（推荐开启，防误删）。
+	 * Push 模式不受影响。
+	 */
+	protectLocalDelete: boolean;
 }
 
 /** 同步作用域身份快照（用于展示与持久化） */
@@ -106,6 +111,8 @@ export interface XgkbChangeItem {
 	type?: number;
 	name?: string;
 	updateTime?: number;
+	/** includePath=true 且传 rootFileId 时由 KB 填充 */
+	relativePath?: string;
 	event: "upsert" | "delete" | (string & Record<never, never>);
 }
 
@@ -122,6 +129,8 @@ export interface XgkbMetaItem {
 	updateTime?: number;
 	size?: number;
 	deleted?: boolean;
+	/** batchGetMeta(includePath=true, rootFileId=映射根) */
+	relativePath?: string;
 }
 
 /** uploadContent 新建模式返回 */
@@ -248,6 +257,7 @@ export interface UpdateFileNameParams {
 	newName: string;
 	projectId?: string;
 	nameConflictStrategy?: 0 | 1;
+	rootFileId?: string;
 }
 
 export interface UpdateFileNameResult {
@@ -263,6 +273,7 @@ export interface MoveFileParams {
 	targetParentId: string;
 	projectId?: string;
 	nameConflictStrategy?: 0 | 1 | 2 | 3;
+	rootFileId?: string;
 }
 
 export interface MoveFileResult {
