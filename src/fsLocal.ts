@@ -13,6 +13,21 @@ function isDotHiddenRelativePath(relativePath: string): boolean {
 	return base.startsWith(".");
 }
 
+/** FileSystemAdapter：vault 相对路径 → 磁盘绝对路径 */
+interface FileSystemAdapterLike {
+	getFullPath(normalizedPath: string): string;
+}
+
+function tryRequireFs(): typeof import("fs") | null {
+	try {
+		// 动态加载：移动端无 fs，避免插件启动失败
+		// eslint-disable-next-line @typescript-eslint/no-require-imports
+		return require("fs") as typeof import("fs");
+	} catch {
+		return null;
+	}
+}
+
 /**
  * 本地文件系统操作（Vault API 封装）
  */
@@ -41,18 +56,22 @@ export class FsLocal {
 		const entries: FileEntry[] = [];
 		const seen = new Set<string>();
 		if (folder && folder instanceof Obsidian.TFolder) {
-			this.collectFromVaultTree(folder, entries, "", seen);
+			await this.collectFromVaultTree(folder, entries, "", seen);
 		}
+		// 补充仅存在于磁盘、未编入 Vault 树的目录（adapter 递归）
 		await this.collectDotFilesFromAdapter("", entries, seen);
 		return entries;
 	}
 
-	private collectFromVaultTree(
+	private async collectFromVaultTree(
 		folder: TFolder,
 		entries: FileEntry[],
 		prefix: string,
 		seen: Set<string>
-	): void {
+	): Promise<void> {
+		// Vault 树能到达的目录：逐层用 adapter 补扫点文件（子目录不能只靠根级 adapter.list 递归）
+		await this.collectDotFilesInAdapterDir(prefix, entries, seen);
+
 		for (const child of folder.children) {
 			if (child instanceof Obsidian.TFile) {
 				if (
@@ -74,33 +93,45 @@ export class FsLocal {
 				const seg = sanitizePathSegment(child.name);
 				const subPrefix = prefix ? `${prefix}/${seg}` : seg;
 				if (child.name.startsWith(".")) continue;
-				this.collectFromVaultTree(child, entries, subPrefix, seen);
+				await this.collectFromVaultTree(child, entries, subPrefix, seen);
 			}
 		}
 	}
 
-	/** 补充 Vault 树里没有、但磁盘上存在的 `.xxx` 文件（adapter 写入的 orphan） */
-	private async collectDotFilesFromAdapter(
+	/**
+	 * 列举目录下文件名。子目录中的点文件 Obsidian adapter.list 常漏报，桌面端改读磁盘。
+	 */
+	private async listFileNamesInVaultDir(normalizedDir: string): Promise<string[]> {
+		const adapter = this.app.vault.adapter as Partial<FileSystemAdapterLike>;
+		const fs = tryRequireFs();
+		if (typeof adapter.getFullPath === "function" && fs?.promises?.readdir) {
+			try {
+				const diskDir = adapter.getFullPath(normalizedDir);
+				const dirents = await fs.promises.readdir(diskDir, { withFileTypes: true });
+				return dirents.filter((d) => d.isFile()).map((d) => d.name);
+			} catch {
+				// 回退 adapter.list
+			}
+		}
+		try {
+			const listed = await this.app.vault.adapter.list(normalizedDir);
+			return listed.files;
+		} catch {
+			return [];
+		}
+	}
+
+	/** 在当前目录（相对 syncFolder）列举以 `.` 开头的可同步文件 */
+	private async collectDotFilesInAdapterDir(
 		relativeDir: string,
 		entries: FileEntry[],
 		seen: Set<string>
 	): Promise<void> {
 		const fullDir = relativeDir ? `${this.basePath}/${relativeDir}` : this.basePath;
 		const normalizedDir = normalizePath(fullDir);
-		let listed: { files: string[]; folders: string[] };
-		try {
-			listed = await this.app.vault.adapter.list(normalizedDir);
-		} catch {
-			return;
-		}
+		const fileNames = await this.listFileNamesInVaultDir(normalizedDir);
 
-		for (const name of listed.folders) {
-			if (name.startsWith(".")) continue;
-			const rel = relativeDir ? `${relativeDir}/${name}` : name;
-			await this.collectDotFilesFromAdapter(rel, entries, seen);
-		}
-
-		for (const name of listed.files) {
+		for (const name of fileNames) {
 			if (!name.startsWith(".")) continue;
 			const rel = relativeDir ? `${relativeDir}/${name}` : name;
 			const full = normalizePath(`${normalizedDir}/${name}`);
@@ -123,6 +154,30 @@ export class FsLocal {
 				mtime: stat.mtime,
 				size: stat.size,
 			});
+		}
+	}
+
+	/** 补充 Vault 树里没有、但磁盘上存在的目录中的点文件 */
+	private async collectDotFilesFromAdapter(
+		relativeDir: string,
+		entries: FileEntry[],
+		seen: Set<string>
+	): Promise<void> {
+		await this.collectDotFilesInAdapterDir(relativeDir, entries, seen);
+
+		const fullDir = relativeDir ? `${this.basePath}/${relativeDir}` : this.basePath;
+		const normalizedDir = normalizePath(fullDir);
+		let listed: { files: string[]; folders: string[] };
+		try {
+			listed = await this.app.vault.adapter.list(normalizedDir);
+		} catch {
+			return;
+		}
+
+		for (const name of listed.folders) {
+			if (name.startsWith(".")) continue;
+			const rel = relativeDir ? `${relativeDir}/${name}` : name;
+			await this.collectDotFilesFromAdapter(rel, entries, seen);
 		}
 	}
 

@@ -367,6 +367,13 @@ function isDotHiddenRelativePath(relativePath) {
   const base = slash >= 0 ? relativePath.slice(slash + 1) : relativePath;
   return base.startsWith(".");
 }
+function tryRequireFs() {
+  try {
+    return require("fs");
+  } catch (e) {
+    return null;
+  }
+}
 var FsLocal = class {
   constructor(app, syncFolder, syncExtensions = ["md"]) {
     this.app = app;
@@ -384,12 +391,13 @@ var FsLocal = class {
     const entries = [];
     const seen = /* @__PURE__ */ new Set();
     if (folder && folder instanceof Obsidian.TFolder) {
-      this.collectFromVaultTree(folder, entries, "", seen);
+      await this.collectFromVaultTree(folder, entries, "", seen);
     }
     await this.collectDotFilesFromAdapter("", entries, seen);
     return entries;
   }
-  collectFromVaultTree(folder, entries, prefix, seen) {
+  async collectFromVaultTree(folder, entries, prefix, seen) {
+    await this.collectDotFilesInAdapterDir(prefix, entries, seen);
     for (const child of folder.children) {
       if (child instanceof Obsidian.TFile) {
         if (this.syncExtensions.includes(child.extension) && !child.name.includes("_conflict_")) {
@@ -410,27 +418,38 @@ var FsLocal = class {
         const subPrefix = prefix ? `${prefix}/${seg}` : seg;
         if (child.name.startsWith("."))
           continue;
-        this.collectFromVaultTree(child, entries, subPrefix, seen);
+        await this.collectFromVaultTree(child, entries, subPrefix, seen);
       }
     }
   }
-  /** 补充 Vault 树里没有、但磁盘上存在的 `.xxx` 文件（adapter 写入的 orphan） */
-  async collectDotFilesFromAdapter(relativeDir, entries, seen) {
+  /**
+   * 列举目录下文件名。子目录中的点文件 Obsidian adapter.list 常漏报，桌面端改读磁盘。
+   */
+  async listFileNamesInVaultDir(normalizedDir) {
+    var _a;
+    const adapter = this.app.vault.adapter;
+    const fs = tryRequireFs();
+    if (typeof adapter.getFullPath === "function" && ((_a = fs == null ? void 0 : fs.promises) == null ? void 0 : _a.readdir)) {
+      try {
+        const diskDir = adapter.getFullPath(normalizedDir);
+        const dirents = await fs.promises.readdir(diskDir, { withFileTypes: true });
+        return dirents.filter((d) => d.isFile()).map((d) => d.name);
+      } catch (e) {
+      }
+    }
+    try {
+      const listed = await this.app.vault.adapter.list(normalizedDir);
+      return listed.files;
+    } catch (e) {
+      return [];
+    }
+  }
+  /** 在当前目录（相对 syncFolder）列举以 `.` 开头的可同步文件 */
+  async collectDotFilesInAdapterDir(relativeDir, entries, seen) {
     const fullDir = relativeDir ? `${this.basePath}/${relativeDir}` : this.basePath;
     const normalizedDir = (0, import_obsidian2.normalizePath)(fullDir);
-    let listed;
-    try {
-      listed = await this.app.vault.adapter.list(normalizedDir);
-    } catch (e) {
-      return;
-    }
-    for (const name of listed.folders) {
-      if (name.startsWith("."))
-        continue;
-      const rel = relativeDir ? `${relativeDir}/${name}` : name;
-      await this.collectDotFilesFromAdapter(rel, entries, seen);
-    }
-    for (const name of listed.files) {
+    const fileNames = await this.listFileNamesInVaultDir(normalizedDir);
+    for (const name of fileNames) {
       if (!name.startsWith("."))
         continue;
       const rel = relativeDir ? `${relativeDir}/${name}` : name;
@@ -458,6 +477,24 @@ var FsLocal = class {
         mtime: stat.mtime,
         size: stat.size
       });
+    }
+  }
+  /** 补充 Vault 树里没有、但磁盘上存在的目录中的点文件 */
+  async collectDotFilesFromAdapter(relativeDir, entries, seen) {
+    await this.collectDotFilesInAdapterDir(relativeDir, entries, seen);
+    const fullDir = relativeDir ? `${this.basePath}/${relativeDir}` : this.basePath;
+    const normalizedDir = (0, import_obsidian2.normalizePath)(fullDir);
+    let listed;
+    try {
+      listed = await this.app.vault.adapter.list(normalizedDir);
+    } catch (e) {
+      return;
+    }
+    for (const name of listed.folders) {
+      if (name.startsWith("."))
+        continue;
+      const rel = relativeDir ? `${relativeDir}/${name}` : name;
+      await this.collectDotFilesFromAdapter(rel, entries, seen);
     }
   }
   /** 将 Vault 绝对路径转为 syncFolder 相对路径；不在同步根下返回 null */
