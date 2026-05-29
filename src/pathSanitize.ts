@@ -32,3 +32,22 @@ export function parseTargetFolderSegments(folderPath: string): string[] {
 export function normalizeTargetFolderPath(folderPath: string): string {
 	return parseTargetFolderSegments(folderPath).join("/");
 }
+
+/** 解析 Cloud target folder 配置 */
+export function resolveTargetFolderConfig(folderPath: string): {
+	relativePath: string;
+	syncAtProjectRoot: boolean;
+} {
+	const relativePath = normalizeTargetFolderPath(folderPath);
+	return {
+		relativePath,
+		syncAtProjectRoot: relativePath.length === 0,
+	};
+}
+
+/** 设置页 / 诊断展示用 */
+export function formatTargetFolderLabel(folderPath: string): string {
+	const { relativePath, syncAtProjectRoot } = resolveTargetFolderConfig(folderPath);
+	if (syncAtProjectRoot) return "(整个知识库空间根)";
+	return relativePath;
+}

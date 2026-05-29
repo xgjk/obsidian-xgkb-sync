@@ -5,11 +5,16 @@ import {
 	BATCH_GET_META_MAX,
 	DEFAULT_MOVE_NAME_CONFLICT_STRATEGY,
 	DEFAULT_RENAME_NAME_CONFLICT_STRATEGY,
+	KB_PROJECT_ROOT_FILE_ID,
 	MAX_RETRIES,
 	RETRY_BASE_DELAY_MS,
 	cleanContent,
 } from "./constants";
-import { normalizeTargetFolderPath, parseTargetFolderSegments, sanitizePathSegment } from "./pathSanitize";
+import {
+	parseTargetFolderSegments,
+	resolveTargetFolderConfig,
+	sanitizePathSegment,
+} from "./pathSanitize";
 import { pathMatchesSyncExtensions, splitFileNameAndSuffix } from "./syncFileTypes";
 
 /**
@@ -19,6 +24,7 @@ export class FsXgkb {
 	private rootId: string | null = null;
 	private projectId: string | null = null;
 	private readonly targetFolderPath: string;
+	private readonly syncAtProjectRoot: boolean;
 	private readonly uploader: FileUploader;
 	private readonly syncExtensions: readonly string[];
 
@@ -32,7 +38,9 @@ export class FsXgkb {
 		},
 		syncExtensions: readonly string[] = ["md"]
 	) {
-		this.targetFolderPath = normalizeTargetFolderPath(targetFolderName) || "Obsidian";
+		const target = resolveTargetFolderConfig(targetFolderName);
+		this.targetFolderPath = target.relativePath;
+		this.syncAtProjectRoot = target.syncAtProjectRoot;
 		this.uploader = new FileUploader(api);
 		this.syncExtensions = syncExtensions;
 	}
@@ -43,6 +51,11 @@ export class FsXgkb {
 
 	getProjectId(): string | null {
 		return this.projectId;
+	}
+
+	/** 云端映射根是否为知识库空间根（rootFileId=0） */
+	isSyncAtProjectRoot(): boolean {
+		return this.syncAtProjectRoot;
 	}
 
 	/**
@@ -60,7 +73,15 @@ export class FsXgkb {
 		const source = this.configuredProjectId?.trim() ? "配置" : "个人知识库";
 		console.debug(`[XGKB Sync] init: projectId=${projectId} (${source})`);
 
-		// 2. 解析/创建多级目标目录（如 A/B）
+		if (this.syncAtProjectRoot) {
+			this.rootId = KB_PROJECT_ROOT_FILE_ID;
+			console.debug(
+				`[XGKB Sync] init: 同步根=知识库空间根 rootFileId=${this.rootId}（将同步整个 project 子树）`
+			);
+			return { ok: true, value: this.rootId };
+		}
+
+		// 解析/创建多级目标目录（如 A/B）
 		const resolveResult = await this.resolveFolderIdFromPath(projectId, this.targetFolderPath);
 		if (!resolveResult.ok) {
 			return { ok: false, error: resolveResult.error };
@@ -80,7 +101,7 @@ export class FsXgkb {
 	): Promise<Result<string>> {
 		const segments = parseTargetFolderSegments(folderPath);
 		if (segments.length === 0) {
-			return { ok: false, error: "云端目标目录路径不能为空" };
+			return { ok: false, error: "云端目标目录路径不能为空（空间根请留空 Cloud target folder）" };
 		}
 
 		const level1Result = await this.api.getLevel1Folders(projectId);
@@ -340,6 +361,9 @@ export class FsXgkb {
 	async resolveFolderIdForRelativePath(relativeFolderPath: string): Promise<Result<string>> {
 		if (!this.projectId || !this.rootId) return { ok: false, error: "未初始化" };
 		const segments = relativeFolderPath ? relativeFolderPath.split("/").filter(Boolean) : [];
+		if (segments.length === 0) {
+			return { ok: true, value: this.rootId };
+		}
 		let currentId = this.rootId;
 		for (let i = 0; i < segments.length; i++) {
 			const seg = segments[i];
@@ -373,9 +397,14 @@ export class FsXgkb {
 		const lastSlash = relativePath.lastIndexOf("/");
 		const folderPath = lastSlash > 0 ? relativePath.substring(0, lastSlash) : "";
 		const fileName = lastSlash > 0 ? relativePath.substring(lastSlash + 1) : relativePath;
-		const folderName = folderPath
-			? `${this.targetFolderPath}/${folderPath}`
-			: this.targetFolderPath;
+		let folderName: string;
+		if (this.syncAtProjectRoot) {
+			folderName = folderPath;
+		} else {
+			folderName = folderPath
+				? `${this.targetFolderPath}/${folderPath}`
+				: this.targetFolderPath;
+		}
 		return { folderName, fileName };
 	}
 

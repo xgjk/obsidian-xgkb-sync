@@ -101,6 +101,7 @@ function cleanContent(raw) {
   return raw.replace(/\n*Page \d+ of \d+\s*$/, "").trimEnd() + "\n";
 }
 var XGKB_NODE_FOLDER = 1;
+var KB_PROJECT_ROOT_FILE_ID = "0";
 
 // src/settings.ts
 var import_obsidian3 = require("obsidian");
@@ -318,6 +319,19 @@ function parseTargetFolderSegments(folderPath) {
 }
 function normalizeTargetFolderPath(folderPath) {
   return parseTargetFolderSegments(folderPath).join("/");
+}
+function resolveTargetFolderConfig(folderPath) {
+  const relativePath = normalizeTargetFolderPath(folderPath);
+  return {
+    relativePath,
+    syncAtProjectRoot: relativePath.length === 0
+  };
+}
+function formatTargetFolderLabel(folderPath) {
+  const { relativePath, syncAtProjectRoot } = resolveTargetFolderConfig(folderPath);
+  if (syncAtProjectRoot)
+    return "(\u6574\u4E2A\u77E5\u8BC6\u5E93\u7A7A\u95F4\u6839)";
+  return relativePath;
 }
 
 // src/syncFileTypes.ts
@@ -826,7 +840,7 @@ var FileUploader = class {
       return resourceResult;
     const saveResult = await this.api.saveFileByPath({
       projectId: params.projectId,
-      path: params.folderName || void 0,
+      path: params.folderName === "" ? "" : params.folderName || void 0,
       name: params.fileName,
       fileType: "file",
       suffix,
@@ -953,7 +967,9 @@ var FsXgkb = class {
     this.uploadOpts = uploadOpts;
     this.rootId = null;
     this.projectId = null;
-    this.targetFolderPath = normalizeTargetFolderPath(targetFolderName) || "Obsidian";
+    const target = resolveTargetFolderConfig(targetFolderName);
+    this.targetFolderPath = target.relativePath;
+    this.syncAtProjectRoot = target.syncAtProjectRoot;
     this.uploader = new FileUploader(api);
     this.syncExtensions = syncExtensions;
   }
@@ -962,6 +978,10 @@ var FsXgkb = class {
   }
   getProjectId() {
     return this.projectId;
+  }
+  /** 云端映射根是否为知识库空间根（rootFileId=0） */
+  isSyncAtProjectRoot() {
+    return this.syncAtProjectRoot;
   }
   /**
    * 初始化：获取 Obsidian 文件夹 ID
@@ -977,6 +997,13 @@ var FsXgkb = class {
     this.projectId = projectId;
     const source = ((_a = this.configuredProjectId) == null ? void 0 : _a.trim()) ? "\u914D\u7F6E" : "\u4E2A\u4EBA\u77E5\u8BC6\u5E93";
     console.debug(`[XGKB Sync] init: projectId=${projectId} (${source})`);
+    if (this.syncAtProjectRoot) {
+      this.rootId = KB_PROJECT_ROOT_FILE_ID;
+      console.debug(
+        `[XGKB Sync] init: \u540C\u6B65\u6839=\u77E5\u8BC6\u5E93\u7A7A\u95F4\u6839 rootFileId=${this.rootId}\uFF08\u5C06\u540C\u6B65\u6574\u4E2A project \u5B50\u6811\uFF09`
+      );
+      return { ok: true, value: this.rootId };
+    }
     const resolveResult = await this.resolveFolderIdFromPath(projectId, this.targetFolderPath);
     if (!resolveResult.ok) {
       return { ok: false, error: resolveResult.error };
@@ -992,7 +1019,7 @@ var FsXgkb = class {
   async resolveFolderIdFromPath(projectId, folderPath) {
     const segments = parseTargetFolderSegments(folderPath);
     if (segments.length === 0) {
-      return { ok: false, error: "\u4E91\u7AEF\u76EE\u6807\u76EE\u5F55\u8DEF\u5F84\u4E0D\u80FD\u4E3A\u7A7A" };
+      return { ok: false, error: "\u4E91\u7AEF\u76EE\u6807\u76EE\u5F55\u8DEF\u5F84\u4E0D\u80FD\u4E3A\u7A7A\uFF08\u7A7A\u95F4\u6839\u8BF7\u7559\u7A7A Cloud target folder\uFF09" };
     }
     const level1Result = await this.api.getLevel1Folders(projectId);
     if (!level1Result.ok) {
@@ -1238,6 +1265,9 @@ var FsXgkb = class {
     if (!this.projectId || !this.rootId)
       return { ok: false, error: "\u672A\u521D\u59CB\u5316" };
     const segments = relativeFolderPath ? relativeFolderPath.split("/").filter(Boolean) : [];
+    if (segments.length === 0) {
+      return { ok: true, value: this.rootId };
+    }
     let currentId = this.rootId;
     for (let i = 0; i < segments.length; i++) {
       const seg = segments[i];
@@ -1271,7 +1301,12 @@ var FsXgkb = class {
     const lastSlash = relativePath.lastIndexOf("/");
     const folderPath = lastSlash > 0 ? relativePath.substring(0, lastSlash) : "";
     const fileName = lastSlash > 0 ? relativePath.substring(lastSlash + 1) : relativePath;
-    const folderName = folderPath ? `${this.targetFolderPath}/${folderPath}` : this.targetFolderPath;
+    let folderName;
+    if (this.syncAtProjectRoot) {
+      folderName = folderPath;
+    } else {
+      folderName = folderPath ? `${this.targetFolderPath}/${folderPath}` : this.targetFolderPath;
+    }
     return { folderName, fileName };
   }
   async createFileViaUploadContent(relativePath, content, folderName, fileName, fileSuffix) {
@@ -1416,11 +1451,23 @@ var XgkbPluginSettingTab = class extends import_obsidian3.PluginSettingTab {
         this.plugin.settings.syncFolder = value;
       });
     });
-    new import_obsidian3.Setting(containerEl).setName("Cloud target folder").setDesc("\u77E5\u8BC6\u5E93\u4E2D\u7684\u540C\u6B65\u6839\u76EE\u5F55\uFF1B\u652F\u6301\u591A\u7EA7\u8DEF\u5F84\uFF0C\u5982 Obsidian \u6216 A/B\uFF08\u4E0D\u5B58\u5728\u65F6\u81EA\u52A8\u521B\u5EFA\uFF09").addText((text) => {
-      text.setPlaceholder("Obsidian \u6216 A/B").setValue(this.plugin.settings.targetFolderName);
+    new import_obsidian3.Setting(containerEl).setName("Cloud target folder").setDesc(
+      "\u77E5\u8BC6\u5E93\u4E2D\u7684\u540C\u6B65\u6839\u76EE\u5F55\uFF1B\u652F\u6301\u591A\u7EA7\u8DEF\u5F84\u5982 Obsidian \u6216 A/B\uFF08\u4E0D\u5B58\u5728\u65F6\u81EA\u52A8\u521B\u5EFA\uFF09\u3002\u7559\u7A7A\u8868\u793A\u6620\u5C04\u5230\u6574\u4E2A\u77E5\u8BC6\u5E93\u7A7A\u95F4\u6839\uFF08rootFileId=0\uFF09\uFF0C\u5C06\u540C\u6B65\u8BE5\u7A7A\u95F4\u4E0B\u6240\u6709\u7B26\u5408\u7C7B\u578B\u7684\u6587\u4EF6\uFF0C\u8BF7\u8C28\u614E\u4F7F\u7528\u3002"
+    ).addText((text) => {
+      text.setPlaceholder("\u7559\u7A7A=\u6574\u4E2A\u7A7A\u95F4\u6839\uFF0C\u6216 Obsidian / A/B").setValue(this.plugin.settings.targetFolderName);
+      let lastTargetFolder = normalizeTargetFolderPath(
+        this.plugin.settings.targetFolderName
+      );
       this.bindScopeIdentityText(text, (value) => {
         const normalized = normalizeTargetFolderPath(value);
-        this.plugin.settings.targetFolderName = normalized || "Obsidian";
+        if (!normalized && lastTargetFolder) {
+          new import_obsidian3.Notice(
+            "\u5DF2\u8BBE\u4E3A\u540C\u6B65\u6574\u4E2A\u77E5\u8BC6\u5E93\u7A7A\u95F4\u6839\uFF1A\u5C06\u5F71\u54CD\u8BE5\u7A7A\u95F4\u5185\u6240\u6709\u53EF\u5339\u914D\u6587\u4EF6\uFF0C\u4E0E Obsidian \u7B49\u5176\u5B83\u76EE\u5F55\u5E76\u5217\uFF0C\u8BF7\u786E\u8BA4\u540E\u518D\u540C\u6B65",
+            1e4
+          );
+        }
+        lastTargetFolder = normalized;
+        this.plugin.settings.targetFolderName = normalized;
       });
     });
     const fileTypesWrap = containerEl.createDiv({ cls: "xgkb-sync-file-types" });
@@ -1525,7 +1572,7 @@ var XgkbPluginSettingTab = class extends import_obsidian3.PluginSettingTab {
       return;
     }
     const rootId = initResult.value;
-    const displayPath = normalizeTargetFolderPath(targetFolderName) || "Obsidian";
+    const displayPath = formatTargetFolderLabel(targetFolderName);
     const filesResult = await api.getChildFiles(rootId);
     if (!filesResult.ok) {
       new import_obsidian3.Notice(`\u274C \u76EE\u5F55\u8BBF\u95EE\u5931\u8D25: ${filesResult.error}`, 5e3);
@@ -1555,7 +1602,7 @@ var XgkbPluginSettingTab = class extends import_obsidian3.PluginSettingTab {
 `];
     lines.push(`\u540C\u6B65\u65B9\u5411: ${syncDirection}`);
     lines.push(`SyncFolder: "${syncFolder || "(\u6574\u4E2AVault)"}"`);
-    lines.push(`TargetFolder: "${targetFolderName}"`);
+    lines.push(`TargetFolder: ${formatTargetFolderLabel(targetFolderName)}`);
     lines.push(`ProjectId: "${(projectId == null ? void 0 : projectId.trim()) || "(\u4E2A\u4EBA\u77E5\u8BC6\u5E93)"}"`);
     for (const line of this.plugin.getScopeDiagnosticLines()) {
       lines.push(line);
@@ -1786,6 +1833,9 @@ var SyncEngine = class {
     const initResult = await this.fsXgkb.init();
     if (!initResult.ok)
       throw new Error(`\u521D\u59CB\u5316\u5931\u8D25: ${initResult.error}`);
+    if (this.fsXgkb.isSyncAtProjectRoot()) {
+      prog("\u4E91\u7AEF\u6620\u5C04\u6839\uFF1A\u6574\u4E2A\u77E5\u8BC6\u5E93\u7A7A\u95F4\uFF08\u5C06\u540C\u6B65\u8BE5\u7A7A\u95F4\u5185\u6240\u6709\u5339\u914D\u7C7B\u578B\u7684\u6587\u4EF6\uFF09");
+    }
     prog("\u626B\u63CF\u672C\u5730\u6587\u4EF6...");
     const localFiles = await this.fsLocal.listFiles();
     prog(`\u672C\u5730: ${localFiles.length} \u4E2A\u6587\u4EF6\uFF08${formatSyncExtensionsLabel(normalizeSyncExtensions(this.settings.syncFileExtensions))}\uFF09`);
@@ -3728,7 +3778,7 @@ function buildScopeFingerprint(settings) {
   return {
     serverUrl: (settings.serverUrl || "").trim(),
     projectId: (settings.projectId || "").trim(),
-    targetFolderName: normalizeTargetFolderPath(settings.targetFolderName) || "Obsidian",
+    targetFolderName: normalizeTargetFolderPath(settings.targetFolderName),
     syncFolder: (settings.syncFolder || "").trim()
   };
 }
@@ -3748,7 +3798,7 @@ function formatScopeLabel(fingerprint) {
   if (!fingerprint)
     return "(\u672A\u77E5)";
   const proj = fingerprint.projectId || "\u4E2A\u4EBA\u5E93";
-  const folder = fingerprint.targetFolderName || "Obsidian";
+  const folder = resolveTargetFolderConfig(fingerprint.targetFolderName).syncAtProjectRoot ? "(\u6574\u4E2A\u77E5\u8BC6\u5E93\u7A7A\u95F4\u6839)" : fingerprint.targetFolderName;
   const local = fingerprint.syncFolder || "(\u6574\u4E2A Vault)";
   return `target=${folder} projectId=${proj} syncFolder=${local}`;
 }

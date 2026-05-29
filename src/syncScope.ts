@@ -1,5 +1,5 @@
 import type { XgkbPluginSettings, SyncScopeEntry, SyncScopeFingerprint } from "./types";
-import { normalizeTargetFolderPath } from "./pathSanitize";
+import { normalizeTargetFolderPath, resolveTargetFolderConfig } from "./pathSanitize";
 
 export const DATA_SCHEMA_VERSION = 2;
 
@@ -8,7 +8,7 @@ export function buildScopeFingerprint(settings: XgkbPluginSettings): SyncScopeFi
 	return {
 		serverUrl: (settings.serverUrl || "").trim(),
 		projectId: (settings.projectId || "").trim(),
-		targetFolderName: normalizeTargetFolderPath(settings.targetFolderName) || "Obsidian",
+		targetFolderName: normalizeTargetFolderPath(settings.targetFolderName),
 		syncFolder: (settings.syncFolder || "").trim(),
 	};
 }
@@ -35,7 +35,9 @@ export async function computeScopeKey(settings: XgkbPluginSettings): Promise<str
 export function formatScopeLabel(fingerprint?: SyncScopeFingerprint): string {
 	if (!fingerprint) return "(未知)";
 	const proj = fingerprint.projectId || "个人库";
-	const folder = fingerprint.targetFolderName || "Obsidian";
+	const folder = resolveTargetFolderConfig(fingerprint.targetFolderName).syncAtProjectRoot
+		? "(整个知识库空间根)"
+		: fingerprint.targetFolderName;
 	const local = fingerprint.syncFolder || "(整个 Vault)";
 	return `target=${folder} projectId=${proj} syncFolder=${local}`;
 }

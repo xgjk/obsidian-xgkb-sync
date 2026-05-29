@@ -5,7 +5,7 @@ import { DEFAULT_SETTINGS } from "./constants";
 import { XgkbApi } from "./xgkbApi";
 import { FsLocal } from "./fsLocal";
 import { FsXgkb } from "./fsXgkb";
-import { normalizeTargetFolderPath } from "./pathSanitize";
+import { formatTargetFolderLabel, normalizeTargetFolderPath } from "./pathSanitize";
 import {
 	AVAILABLE_SYNC_EXTENSIONS,
 	formatSyncExtensionsLabel,
@@ -77,14 +77,27 @@ export class XgkbPluginSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Cloud target folder")
-			.setDesc("知识库中的同步根目录；支持多级路径，如 Obsidian 或 A/B（不存在时自动创建）")
+			.setDesc(
+				"知识库中的同步根目录；支持多级路径如 Obsidian 或 A/B（不存在时自动创建）。" +
+					"留空表示映射到整个知识库空间根（rootFileId=0），将同步该空间下所有符合类型的文件，请谨慎使用。"
+			)
 			.addText((text) => {
 				text
-					.setPlaceholder("Obsidian 或 A/B")
+					.setPlaceholder("留空=整个空间根，或 Obsidian / A/B")
 					.setValue(this.plugin.settings.targetFolderName);
+				let lastTargetFolder = normalizeTargetFolderPath(
+					this.plugin.settings.targetFolderName
+				);
 				this.bindScopeIdentityText(text, (value) => {
 					const normalized = normalizeTargetFolderPath(value);
-					this.plugin.settings.targetFolderName = normalized || "Obsidian";
+					if (!normalized && lastTargetFolder) {
+						new Notice(
+							"已设为同步整个知识库空间根：将影响该空间内所有可匹配文件，与 Obsidian 等其它目录并列，请确认后再同步",
+							10000
+						);
+					}
+					lastTargetFolder = normalized;
+					this.plugin.settings.targetFolderName = normalized;
 				});
 			});
 
@@ -235,7 +248,7 @@ export class XgkbPluginSettingTab extends PluginSettingTab {
 		}
 
 		const rootId = initResult.value;
-		const displayPath = normalizeTargetFolderPath(targetFolderName) || "Obsidian";
+		const displayPath = formatTargetFolderLabel(targetFolderName);
 		const filesResult = await api.getChildFiles(rootId);
 		if (!filesResult.ok) {
 			new Notice(`❌ 目录访问失败: ${filesResult.error}`, 5000);
@@ -267,7 +280,7 @@ export class XgkbPluginSettingTab extends PluginSettingTab {
 		const lines: string[] = [`=== XGKB Sync 诊断 ===\n`];
 		lines.push(`同步方向: ${syncDirection}`);
 		lines.push(`SyncFolder: "${syncFolder || "(整个Vault)"}"`);
-		lines.push(`TargetFolder: "${targetFolderName}"`);
+		lines.push(`TargetFolder: ${formatTargetFolderLabel(targetFolderName)}`);
 		lines.push(`ProjectId: "${projectId?.trim() || "(个人知识库)"}"`);
 		for (const line of this.plugin.getScopeDiagnosticLines()) {
 			lines.push(line);

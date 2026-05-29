@@ -94,3 +94,6 @@ export function cleanContent(raw: string | null | undefined): string {
 /** 知识库节点 type：1=目录 2=文件 */
 export const XGKB_NODE_FOLDER = 1;
 export const XGKB_NODE_FILE = 2;
+
+/** 云端映射根 = 知识库空间根（parentId=0）时 listDescendantFiles / listChanges 的 rootFileId */
+export const KB_PROJECT_ROOT_FILE_ID = "0";

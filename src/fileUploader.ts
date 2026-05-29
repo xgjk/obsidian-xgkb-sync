@@ -42,7 +42,10 @@ export class FileUploader {
 
 		const saveResult = await this.api.saveFileByPath({
 			projectId: params.projectId,
-			path: params.folderName || undefined,
+			path:
+				params.folderName === ""
+					? ""
+					: params.folderName || undefined,
 			name: params.fileName,
 			fileType: "file",
 			suffix,

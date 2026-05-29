@@ -123,6 +123,9 @@ export class SyncEngine {
 		prog("连接玄关知识库...");
 		const initResult = await this.fsXgkb.init();
 		if (!initResult.ok) throw new Error(`初始化失败: ${initResult.error}`);
+		if (this.fsXgkb.isSyncAtProjectRoot()) {
+			prog("云端映射根：整个知识库空间（将同步该空间内所有匹配类型的文件）");
+		}
 
 		prog("扫描本地文件...");
 		const localFiles = await this.fsLocal.listFiles();
