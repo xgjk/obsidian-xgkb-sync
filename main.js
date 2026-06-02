@@ -118,8 +118,8 @@ var XgkbApi = class {
   async delay(ms) {
     return new Promise((resolve) => window.setTimeout(resolve, ms));
   }
-  async request(method, apiPath, params) {
-    var _a, _b;
+  async request(method, apiPath, params, retryOptions) {
+    var _a, _b, _c;
     const baseUrl = this.serverUrl + apiPath;
     const options = {
       url: baseUrl,
@@ -138,8 +138,9 @@ var XgkbApi = class {
     } else {
       options.url = baseUrl;
     }
+    const attempts = Math.max(1, (_a = retryOptions == null ? void 0 : retryOptions.attempts) != null ? _a : MAX_RETRIES);
     let lastError = "";
-    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    for (let attempt = 0; attempt < attempts; attempt++) {
       try {
         if (attempt > 0)
           await this.delay(RETRY_BASE_DELAY_MS * Math.pow(2, attempt));
@@ -147,16 +148,16 @@ var XgkbApi = class {
         const result = resp.json;
         if (result.resultCode !== 1) {
           if (result.resultCode === 401) {
-            return { ok: false, error: `\u8BA4\u8BC1\u5931\u8D25(401): ${(_a = result.resultMsg) != null ? _a : "Unknown error"}` };
+            return { ok: false, error: `\u8BA4\u8BC1\u5931\u8D25(401): ${(_b = result.resultMsg) != null ? _b : "Unknown error"}` };
           }
-          return { ok: false, error: `API error ${result.resultCode}: ${(_b = result.resultMsg) != null ? _b : "Unknown error"}` };
+          return { ok: false, error: `API error ${result.resultCode}: ${(_c = result.resultMsg) != null ? _c : "Unknown error"}` };
         }
         return { ok: true, value: result.data };
       } catch (e) {
         lastError = e instanceof Error ? e.message : String(e);
       }
     }
-    return { ok: false, error: `\u8BF7\u6C42\u5931\u8D25(\u91CD\u8BD5${MAX_RETRIES}\u6B21): ${lastError}` };
+    return { ok: false, error: `\u8BF7\u6C42\u5931\u8D25(\u5C1D\u8BD5${attempts}\u6B21): ${lastError}` };
   }
   // ==================== 空间/目录 ====================
   /** 获取个人知识库空间 ID */
@@ -244,12 +245,13 @@ var XgkbApi = class {
     return this.request(
       "POST",
       API_PATHS.uploadContent,
-      params
+      params,
+      { attempts: 1 }
     );
   }
   /** 删除文件 */
   async deleteFile(fileId) {
-    const r = await this.request("POST", API_PATHS.deleteFile, { fileId });
+    const r = await this.request("POST", API_PATHS.deleteFile, { fileId }, { attempts: 1 });
     if (!r.ok)
       return r;
     return { ok: true, value: true };
@@ -269,10 +271,10 @@ var XgkbApi = class {
   }
   // ==================== 物理文件入库 ====================
   async saveFileByPath(params) {
-    return this.request("POST", API_PATHS.saveFileByPath, { ...params });
+    return this.request("POST", API_PATHS.saveFileByPath, { ...params }, { attempts: 1 });
   }
   async updateFileVersion(params) {
-    return this.request("POST", API_PATHS.updateFileVersion, { ...params });
+    return this.request("POST", API_PATHS.updateFileVersion, { ...params }, { attempts: 1 });
   }
   async updateFileName(params) {
     return this.request("POST", API_PATHS.updateFileName, {
@@ -283,7 +285,7 @@ var XgkbApi = class {
         nameConflictStrategy: params.nameConflictStrategy
       },
       ...params.rootFileId !== void 0 && { rootFileId: params.rootFileId }
-    });
+    }, { attempts: 1 });
   }
   async moveFile(params) {
     return this.request("POST", API_PATHS.moveFile, {
@@ -294,11 +296,11 @@ var XgkbApi = class {
         nameConflictStrategy: params.nameConflictStrategy
       },
       ...params.rootFileId !== void 0 && { rootFileId: params.rootFileId }
-    });
+    }, { attempts: 1 });
   }
   /** 显式创建空目录（4.24） */
   async createFolder(params) {
-    const r = await this.request("POST", API_PATHS.createFolder, params);
+    const r = await this.request("POST", API_PATHS.createFolder, params, { attempts: 1 });
     if (!r.ok)
       return r;
     return { ok: true, value: String(r.value) };
@@ -2417,6 +2419,7 @@ var SyncEngine = class {
         newFolderName,
         remoteFolderFileId,
         affectedRecords,
+        affectedPlans: group.items,
         consumedPaths: [...consumedPaths],
         local: (_c = group.items[0]) == null ? void 0 : _c.local,
         remote: (_d = group.items[0]) == null ? void 0 : _d.remote,
@@ -3176,7 +3179,7 @@ var SyncEngine = class {
     await this.db.put(
       this.buildDbRecord(path, {
         xgkbFileId: fileId,
-        xgkbFolderId: (_c = (_b = record == null ? void 0 : record.xgkbFolderId) != null ? _b : remote == null ? void 0 : remote.xgkbFolderId) != null ? _c : "",
+        xgkbFolderId: (_c = (_b = remote == null ? void 0 : remote.xgkbFolderId) != null ? _b : record == null ? void 0 : record.xgkbFolderId) != null ? _c : "",
         localMtime: (_d = record == null ? void 0 : record.localMtime) != null ? _d : 0,
         remoteMtime: (_f = (_e = remote == null ? void 0 : remote.mtime) != null ? _e : record == null ? void 0 : record.remoteMtime) != null ? _f : 0,
         syncStatus: "failed",
@@ -3238,7 +3241,7 @@ var SyncEngine = class {
     await this.db.put(
       this.buildDbRecord(path, {
         xgkbFileId: fileId,
-        xgkbFolderId: (_e = (_d = record == null ? void 0 : record.xgkbFolderId) != null ? _d : remote == null ? void 0 : remote.xgkbFolderId) != null ? _e : "",
+        xgkbFolderId: (_e = (_d = remote == null ? void 0 : remote.xgkbFolderId) != null ? _d : record == null ? void 0 : record.xgkbFolderId) != null ? _e : "",
         localMtime: local.mtime,
         remoteMtime: interimMtime,
         syncStatus: "done"
@@ -3249,10 +3252,15 @@ var SyncEngine = class {
     this.progress(`\u2191 ${path}`);
   }
   async doRenameLocal(plan) {
-    var _a, _b, _c, _d, _e;
-    const { record, local, targetPath } = plan;
+    var _a, _b, _c;
+    const { record, local, targetPath, remote } = plan;
     if (!record || !local || !targetPath)
       throw new Error("rename-local \u53C2\u6570\u4E0D\u5B8C\u6574");
+    const remoteChanged = (remote == null ? void 0 : remote.xgkbFileId) != null && remote.mtime > record.remoteMtime + MTIME_TOLERANCE_MS;
+    const remoteBody = remoteChanged && (remote == null ? void 0 : remote.xgkbFileId) ? await this.fsXgkb.readFile(remote.xgkbFileId) : void 0;
+    if (remoteBody && !remoteBody.ok) {
+      throw new Error(`rename-local \u540E\u4E0B\u8F7D\u8FDC\u7AEF\u5185\u5BB9\u5931\u8D25: ${remoteBody.error}`);
+    }
     let actualMtime = local.mtime;
     if (record.localPath !== targetPath) {
       try {
@@ -3264,18 +3272,28 @@ var SyncEngine = class {
         actualMtime = atTarget;
       }
     }
+    if (remoteBody == null ? void 0 : remoteBody.ok) {
+      actualMtime = await this.fsLocal.writeFile(targetPath, remoteBody.value);
+    }
     await this.db.delete(this.scopeKey, record.localPath);
     await this.db.put(
       this.buildDbRecord(targetPath, {
         xgkbFileId: record.xgkbFileId,
-        xgkbFolderId: (_b = (_a = plan.remote) == null ? void 0 : _a.xgkbFolderId) != null ? _b : record.xgkbFolderId,
+        xgkbFolderId: (_a = remote == null ? void 0 : remote.xgkbFolderId) != null ? _a : record.xgkbFolderId,
         localMtime: actualMtime,
-        remoteMtime: (_d = (_c = plan.remote) == null ? void 0 : _c.mtime) != null ? _d : record.remoteMtime,
+        remoteMtime: (_b = remote == null ? void 0 : remote.mtime) != null ? _b : record.remoteMtime,
         syncStatus: "done"
       })
     );
-    this.stats.renamed = ((_e = this.stats.renamed) != null ? _e : 0) + 1;
-    this.progress(`\u21BB \u672C\u5730 ${record.localPath} \u2192 ${targetPath}`);
+    this.stats.renamed = ((_c = this.stats.renamed) != null ? _c : 0) + 1;
+    if (remoteBody == null ? void 0 : remoteBody.ok) {
+      this.stats.downloaded++;
+      if ((remote == null ? void 0 : remote.mtime) != null)
+        this.successfulRemoteMtimes.push(remote.mtime);
+      this.progress(`\u21BB\u2193 \u672C\u5730 ${record.localPath} \u2192 ${targetPath}`);
+    } else {
+      this.progress(`\u21BB \u672C\u5730 ${record.localPath} \u2192 ${targetPath}`);
+    }
   }
   async doRenameRemote(plan) {
     var _a, _b, _c, _d;
@@ -3338,26 +3356,73 @@ var SyncEngine = class {
     );
     this.queueMtimeRefresh(fileId, path);
   }
+  async prepareRemoteContentUpdates(plans) {
+    const updates = [];
+    for (const plan of plans) {
+      const { targetPath, remote, record } = plan;
+      if (!targetPath || !(remote == null ? void 0 : remote.xgkbFileId) || !record)
+        continue;
+      if (remote.mtime <= record.remoteMtime + MTIME_TOLERANCE_MS)
+        continue;
+      const bodyResult = await this.fsXgkb.readFile(remote.xgkbFileId);
+      if (!bodyResult.ok) {
+        throw new Error(`rename-local \u76EE\u5F55\u540E\u4E0B\u8F7D\u8FDC\u7AEF\u5185\u5BB9\u5931\u8D25 ${targetPath}: ${bodyResult.error}`);
+      }
+      updates.push({ path: targetPath, content: bodyResult.value, remote, record });
+    }
+    return updates;
+  }
+  async applyPreparedRemoteContentUpdates(updates) {
+    var _a, _b, _c;
+    let downloaded = 0;
+    for (const update of updates) {
+      const actualMtime = await this.fsLocal.writeFile(update.path, update.content);
+      const current = await this.db.get(this.scopeKey, update.path);
+      await this.db.put(
+        this.buildDbRecord(update.path, {
+          xgkbFileId: (_a = update.remote.xgkbFileId) != null ? _a : update.record.xgkbFileId,
+          xgkbFolderId: (_c = (_b = update.remote.xgkbFolderId) != null ? _b : current == null ? void 0 : current.xgkbFolderId) != null ? _c : update.record.xgkbFolderId,
+          localMtime: actualMtime,
+          remoteMtime: update.remote.mtime,
+          syncStatus: "done"
+        })
+      );
+      this.successfulRemoteMtimes.push(update.remote.mtime);
+      downloaded++;
+    }
+    return downloaded;
+  }
   async doRenameLocalDirectory(plan) {
-    var _a;
+    var _a, _b;
     const oldPrefix = plan.directoryOldPath;
     const newPrefix = plan.directoryNewPath;
     if (!oldPrefix || !newPrefix)
       throw new Error("rename-local(\u76EE\u5F55) \u53C2\u6570\u4E0D\u5B8C\u6574");
+    const remoteUpdates = await this.prepareRemoteContentUpdates((_a = plan.affectedPlans) != null ? _a : []);
     const oldExists = await this.fsLocal.folderExists(oldPrefix);
     if (!oldExists) {
       const newExists = await this.fsLocal.folderExists(newPrefix);
       if (newExists) {
         const moved2 = await this.db.relocateRecordsByPrefix(this.scopeKey, oldPrefix, newPrefix);
-        this.progress(`\u21BB \u672C\u5730\u76EE\u5F55 ${oldPrefix} \u2192 ${newPrefix}\uFF08\u5DF2\u5B58\u5728\u76EE\u6807\u76EE\u5F55\uFF0C\u8DF3\u8FC7\u91CD\u590D\u6267\u884C\uFF0C${moved2} \u4E2A\u6587\u4EF6\uFF09`);
+        const downloaded2 = await this.applyPreparedRemoteContentUpdates(remoteUpdates);
+        if (downloaded2 > 0)
+          this.stats.downloaded += downloaded2;
+        this.progress(
+          `\u21BB \u672C\u5730\u76EE\u5F55 ${oldPrefix} \u2192 ${newPrefix}\uFF08\u5DF2\u5B58\u5728\u76EE\u6807\u76EE\u5F55\uFF0C\u8DF3\u8FC7\u91CD\u590D\u6267\u884C\uFF0C${moved2} \u4E2A\u6587\u4EF6${downloaded2 > 0 ? `\uFF0C\u2193${downloaded2}` : ""}\uFF09`
+        );
         return;
       }
       throw new Error(`\u76EE\u5F55\u4E0D\u5B58\u5728: ${oldPrefix}`);
     }
     await this.fsLocal.renameFolder(oldPrefix, newPrefix);
     const moved = await this.db.relocateRecordsByPrefix(this.scopeKey, oldPrefix, newPrefix);
-    this.stats.renamed = ((_a = this.stats.renamed) != null ? _a : 0) + 1;
-    this.progress(`\u21BB \u672C\u5730\u76EE\u5F55 ${oldPrefix} \u2192 ${newPrefix}\uFF08${moved} \u4E2A\u6587\u4EF6\uFF09`);
+    const downloaded = await this.applyPreparedRemoteContentUpdates(remoteUpdates);
+    this.stats.renamed = ((_b = this.stats.renamed) != null ? _b : 0) + 1;
+    if (downloaded > 0)
+      this.stats.downloaded += downloaded;
+    this.progress(
+      `\u21BB \u672C\u5730\u76EE\u5F55 ${oldPrefix} \u2192 ${newPrefix}\uFF08${moved} \u4E2A\u6587\u4EF6${downloaded > 0 ? `\uFF0C\u2193${downloaded}` : ""}\uFF09`
+    );
   }
   async doRenameRemoteDirectory(plan) {
     var _a;
@@ -3470,7 +3535,7 @@ var SyncEngine = class {
     await this.db.put(
       this.buildDbRecord(path, {
         xgkbFileId: fid,
-        xgkbFolderId: (_b = (_a = record == null ? void 0 : record.xgkbFolderId) != null ? _a : remote.xgkbFolderId) != null ? _b : "",
+        xgkbFolderId: (_b = (_a = remote.xgkbFolderId) != null ? _a : record == null ? void 0 : record.xgkbFolderId) != null ? _b : "",
         localMtime: actualMtime,
         remoteMtime: remote.mtime,
         syncStatus: "done"

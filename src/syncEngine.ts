@@ -739,6 +739,7 @@ export class SyncEngine {
 				newFolderName,
 				remoteFolderFileId,
 				affectedRecords,
+				affectedPlans: group.items,
 				consumedPaths: [...consumedPaths],
 				local: group.items[0]?.local,
 				remote: group.items[0]?.remote,
@@ -1581,7 +1582,7 @@ export class SyncEngine {
 		await this.db.put(
 			this.buildDbRecord(path, {
 				xgkbFileId: fileId,
-				xgkbFolderId: record?.xgkbFolderId ?? remote?.xgkbFolderId ?? "",
+				xgkbFolderId: remote?.xgkbFolderId ?? record?.xgkbFolderId ?? "",
 				localMtime: record?.localMtime ?? 0,
 				remoteMtime: remote?.mtime ?? record?.remoteMtime ?? 0,
 				syncStatus: "failed",
@@ -1646,7 +1647,7 @@ export class SyncEngine {
 		await this.db.put(
 			this.buildDbRecord(path, {
 				xgkbFileId: fileId,
-				xgkbFolderId: record?.xgkbFolderId ?? remote?.xgkbFolderId ?? "",
+				xgkbFolderId: remote?.xgkbFolderId ?? record?.xgkbFolderId ?? "",
 				localMtime: local.mtime,
 				remoteMtime: interimMtime,
 				syncStatus: "done",
@@ -1658,8 +1659,18 @@ export class SyncEngine {
 	}
 
 	private async doRenameLocal(plan: SyncPlan): Promise<void> {
-		const { record, local, targetPath } = plan;
+		const { record, local, targetPath, remote } = plan;
 		if (!record || !local || !targetPath) throw new Error("rename-local 参数不完整");
+
+		const remoteChanged =
+			remote?.xgkbFileId != null &&
+			remote.mtime > record.remoteMtime + MTIME_TOLERANCE_MS;
+		const remoteBody = remoteChanged && remote?.xgkbFileId
+			? await this.fsXgkb.readFile(remote.xgkbFileId)
+			: undefined;
+		if (remoteBody && !remoteBody.ok) {
+			throw new Error(`rename-local 后下载远端内容失败: ${remoteBody.error}`);
+		}
 
 		let actualMtime = local.mtime;
 		if (record.localPath !== targetPath) {
@@ -1672,19 +1683,28 @@ export class SyncEngine {
 				actualMtime = atTarget;
 			}
 		}
+		if (remoteBody?.ok) {
+			actualMtime = await this.fsLocal.writeFile(targetPath, remoteBody.value);
+		}
 
 		await this.db.delete(this.scopeKey, record.localPath);
 		await this.db.put(
 			this.buildDbRecord(targetPath, {
 				xgkbFileId: record.xgkbFileId,
-				xgkbFolderId: plan.remote?.xgkbFolderId ?? record.xgkbFolderId,
+				xgkbFolderId: remote?.xgkbFolderId ?? record.xgkbFolderId,
 				localMtime: actualMtime,
-				remoteMtime: plan.remote?.mtime ?? record.remoteMtime,
+				remoteMtime: remote?.mtime ?? record.remoteMtime,
 				syncStatus: "done",
 			})
 		);
 		this.stats.renamed = (this.stats.renamed ?? 0) + 1;
-		this.progress(`↻ 本地 ${record.localPath} → ${targetPath}`);
+		if (remoteBody?.ok) {
+			this.stats.downloaded++;
+			if (remote?.mtime != null) this.successfulRemoteMtimes.push(remote.mtime);
+			this.progress(`↻↓ 本地 ${record.localPath} → ${targetPath}`);
+		} else {
+			this.progress(`↻ 本地 ${record.localPath} → ${targetPath}`);
+		}
 	}
 
 	private async doRenameRemote(plan: SyncPlan): Promise<void> {
@@ -1747,10 +1767,69 @@ export class SyncEngine {
 		this.queueMtimeRefresh(fileId, path);
 	}
 
+	private async prepareRemoteContentUpdates(
+		plans: SyncPlan[]
+	): Promise<
+		Array<{
+			path: string;
+			content: string;
+			remote: FileEntry;
+			record: SyncStateRecord;
+		}>
+	> {
+		const updates: Array<{
+			path: string;
+			content: string;
+			remote: FileEntry;
+			record: SyncStateRecord;
+		}> = [];
+		for (const plan of plans) {
+			const { targetPath, remote, record } = plan;
+			if (!targetPath || !remote?.xgkbFileId || !record) continue;
+			if (remote.mtime <= record.remoteMtime + MTIME_TOLERANCE_MS) continue;
+			const bodyResult = await this.fsXgkb.readFile(remote.xgkbFileId);
+			if (!bodyResult.ok) {
+				throw new Error(`rename-local 目录后下载远端内容失败 ${targetPath}: ${bodyResult.error}`);
+			}
+			updates.push({ path: targetPath, content: bodyResult.value, remote, record });
+		}
+		return updates;
+	}
+
+	private async applyPreparedRemoteContentUpdates(
+		updates: Array<{
+			path: string;
+			content: string;
+			remote: FileEntry;
+			record: SyncStateRecord;
+		}>
+	): Promise<number> {
+		let downloaded = 0;
+		for (const update of updates) {
+			const actualMtime = await this.fsLocal.writeFile(update.path, update.content);
+			const current = await this.db.get(this.scopeKey, update.path);
+			await this.db.put(
+				this.buildDbRecord(update.path, {
+					xgkbFileId: update.remote.xgkbFileId ?? update.record.xgkbFileId,
+					xgkbFolderId:
+						update.remote.xgkbFolderId ?? current?.xgkbFolderId ?? update.record.xgkbFolderId,
+					localMtime: actualMtime,
+					remoteMtime: update.remote.mtime,
+					syncStatus: "done",
+				})
+			);
+			this.successfulRemoteMtimes.push(update.remote.mtime);
+			downloaded++;
+		}
+		return downloaded;
+	}
+
 	private async doRenameLocalDirectory(plan: SyncPlan): Promise<void> {
 		const oldPrefix = plan.directoryOldPath;
 		const newPrefix = plan.directoryNewPath;
 		if (!oldPrefix || !newPrefix) throw new Error("rename-local(目录) 参数不完整");
+
+		const remoteUpdates = await this.prepareRemoteContentUpdates(plan.affectedPlans ?? []);
 
 		// 幂等防护：父目录计划已执行时，子目录旧路径可能已不存在。
 		// 若新目录已存在则视为成功，避免“目录不存在”导致整轮 fail。
@@ -1759,7 +1838,11 @@ export class SyncEngine {
 			const newExists = await this.fsLocal.folderExists(newPrefix);
 			if (newExists) {
 				const moved = await this.db.relocateRecordsByPrefix(this.scopeKey, oldPrefix, newPrefix);
-				this.progress(`↻ 本地目录 ${oldPrefix} → ${newPrefix}（已存在目标目录，跳过重复执行，${moved} 个文件）`);
+				const downloaded = await this.applyPreparedRemoteContentUpdates(remoteUpdates);
+				if (downloaded > 0) this.stats.downloaded += downloaded;
+				this.progress(
+					`↻ 本地目录 ${oldPrefix} → ${newPrefix}（已存在目标目录，跳过重复执行，${moved} 个文件${downloaded > 0 ? `，↓${downloaded}` : ""}）`
+				);
 				return;
 			}
 			throw new Error(`目录不存在: ${oldPrefix}`);
@@ -1767,8 +1850,12 @@ export class SyncEngine {
 
 		await this.fsLocal.renameFolder(oldPrefix, newPrefix);
 		const moved = await this.db.relocateRecordsByPrefix(this.scopeKey, oldPrefix, newPrefix);
+		const downloaded = await this.applyPreparedRemoteContentUpdates(remoteUpdates);
 		this.stats.renamed = (this.stats.renamed ?? 0) + 1;
-		this.progress(`↻ 本地目录 ${oldPrefix} → ${newPrefix}（${moved} 个文件）`);
+		if (downloaded > 0) this.stats.downloaded += downloaded;
+		this.progress(
+			`↻ 本地目录 ${oldPrefix} → ${newPrefix}（${moved} 个文件${downloaded > 0 ? `，↓${downloaded}` : ""}）`
+		);
 	}
 
 	private async doRenameRemoteDirectory(plan: SyncPlan): Promise<void> {
@@ -1899,7 +1986,7 @@ export class SyncEngine {
 		await this.db.put(
 			this.buildDbRecord(path, {
 				xgkbFileId: fid,
-				xgkbFolderId: record?.xgkbFolderId ?? remote.xgkbFolderId ?? "",
+				xgkbFolderId: remote.xgkbFolderId ?? record?.xgkbFolderId ?? "",
 				localMtime: actualMtime,
 				remoteMtime: remote.mtime,
 				syncStatus: "done",
@@ -1957,6 +2044,7 @@ type SyncPlan = {
 	newFolderName?: string;
 	remoteFolderFileId?: string;
 	affectedRecords?: SyncStateRecord[];
+	affectedPlans?: SyncPlan[];
 	consumedPaths?: string[];
 };
 

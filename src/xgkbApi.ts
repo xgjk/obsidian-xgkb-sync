@@ -52,7 +52,8 @@ export class XgkbApi {
 	private async request<T>(
 		method: "GET" | "POST",
 		apiPath: string,
-		params?: Record<string, unknown>
+		params?: Record<string, unknown>,
+		retryOptions?: { attempts?: number }
 	): Promise<Result<T>> {
 		const baseUrl = this.serverUrl + apiPath;
 		const options: RequestUrlParam = {
@@ -77,8 +78,9 @@ export class XgkbApi {
 			options.url = baseUrl;
 		}
 
+		const attempts = Math.max(1, retryOptions?.attempts ?? MAX_RETRIES);
 		let lastError = "";
-		for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+		for (let attempt = 0; attempt < attempts; attempt++) {
 			try {
 				if (attempt > 0) await this.delay(RETRY_BASE_DELAY_MS * Math.pow(2, attempt));
 				const resp = await requestUrl(options);
@@ -95,7 +97,7 @@ export class XgkbApi {
 				lastError = e instanceof Error ? e.message : String(e);
 			}
 		}
-		return { ok: false, error: `请求失败(重试${MAX_RETRIES}次): ${lastError}` };
+		return { ok: false, error: `请求失败(尝试${attempts}次): ${lastError}` };
 	}
 
 	// ==================== 空间/目录 ====================
@@ -215,13 +217,13 @@ export class XgkbApi {
 		versionRemark?: string;
 	}): Promise<Result<UploadContentResult | UpdateFileResult>> {
 		return this.request<UploadContentResult | UpdateFileResult>(
-			"POST", API_PATHS.uploadContent, params
+			"POST", API_PATHS.uploadContent, params, { attempts: 1 }
 		);
 	}
 
 	/** 删除文件 */
 	async deleteFile(fileId: string): Promise<Result<boolean>> {
-		const r = await this.request<boolean>("POST", API_PATHS.deleteFile, { fileId });
+		const r = await this.request<boolean>("POST", API_PATHS.deleteFile, { fileId }, { attempts: 1 });
 		if (!r.ok) return r;
 		return { ok: true, value: true };
 	}
@@ -245,11 +247,11 @@ export class XgkbApi {
 	// ==================== 物理文件入库 ====================
 
 	async saveFileByPath(params: SaveFileToProjectParams): Promise<Result<number>> {
-		return this.request<number>("POST", API_PATHS.saveFileByPath, { ...params });
+		return this.request<number>("POST", API_PATHS.saveFileByPath, { ...params }, { attempts: 1 });
 	}
 
 	async updateFileVersion(params: UpdateFileVersionParams): Promise<Result<number>> {
-		return this.request<number>("POST", API_PATHS.updateFileVersion, { ...params });
+		return this.request<number>("POST", API_PATHS.updateFileVersion, { ...params }, { attempts: 1 });
 	}
 
 	async updateFileName(params: UpdateFileNameParams): Promise<Result<UpdateFileNameResult>> {
@@ -261,7 +263,7 @@ export class XgkbApi {
 				nameConflictStrategy: params.nameConflictStrategy,
 			}),
 			...(params.rootFileId !== undefined && { rootFileId: params.rootFileId }),
-		});
+		}, { attempts: 1 });
 	}
 
 	async moveFile(params: MoveFileParams): Promise<Result<MoveFileResult>> {
@@ -273,7 +275,7 @@ export class XgkbApi {
 				nameConflictStrategy: params.nameConflictStrategy,
 			}),
 			...(params.rootFileId !== undefined && { rootFileId: params.rootFileId }),
-		});
+		}, { attempts: 1 });
 	}
 
 	/** 显式创建空目录（4.24） */
@@ -284,7 +286,7 @@ export class XgkbApi {
 		cover?: boolean;
 		autoRename?: boolean;
 	}): Promise<Result<string>> {
-		const r = await this.request<string | number>("POST", API_PATHS.createFolder, params);
+		const r = await this.request<string | number>("POST", API_PATHS.createFolder, params, { attempts: 1 });
 		if (!r.ok) return r;
 		return { ok: true, value: String(r.value) };
 	}
