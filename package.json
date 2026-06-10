@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "node esbuild.config.mjs",
     "sync:manifest-version": "node scripts/sync-manifest-version.mjs",
-    "build": "npm run sync:manifest-version && node esbuild.config.mjs production"
+    "build": "npm run sync:manifest-version && node esbuild.config.mjs production",
+    "test:sync-scenes": "vitest run tests/scenes/syncAbility.scenario.test.ts"
   },
   "keywords": [],
   "author": "cwei001",
@@ -20,6 +21,7 @@
     "eslint-plugin-obsidianmd": "^0.3.0",
     "obsidian": "latest",
     "tslib": "2.4.0",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "vitest": "^0.34.6"
   }
 }
