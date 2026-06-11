@@ -127,6 +127,65 @@ describe("plugin sync with real cloud smoke", () => {
 		},
 		60_000
 	);
+
+	runRealCloud(
+		"syncs operations from a real local test folder and verifies cloud state by API",
+		async () => {
+			if (!CONFIG) throw new Error("Missing real cloud test config");
+
+			const { SyncEngine } = await import("../../src/syncEngine");
+
+			const runId = `sync-folder-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+			const localRoot = path.resolve(process.cwd(), "test-results", "sync-local-folder", runId);
+			const originalPath = `${runId}-note.md`;
+			const renamedPath = `${runId}-renamed.md`;
+			const movedPath = `${runId}-archive/${runId}-moved.md`;
+
+			const local = new NodeLocalFs(localRoot);
+			const db = new MemorySyncStateDb();
+			const remote = new RealXgkbFs(CONFIG);
+			const engine = new SyncEngine(
+				local as never,
+				remote as never,
+				db as never,
+				settings(CONFIG),
+				`${SCOPE_KEY}:local-folder`
+			);
+
+			try {
+				await local.writeFile(originalPath, "local folder v1\n");
+				let stats = await engine.runSync();
+				expect(stats.failed).toBe(0);
+				await expectRemoteContent(remote, originalPath, "local folder v1\n");
+
+				await local.writeFile(originalPath, "local folder v2\n");
+				stats = await engine.runSync();
+				expect(stats.failed).toBe(0);
+				await expectRemoteContent(remote, originalPath, "local folder v2\n");
+
+				await local.renameFile(originalPath, renamedPath);
+				stats = await engine.runSync();
+				expect(stats.failed).toBe(0);
+				expect(await remoteHas(remote, originalPath)).toBe(false);
+				await expectRemoteContent(remote, renamedPath, "local folder v2\n");
+
+				await local.renameFile(renamedPath, movedPath);
+				stats = await engine.runSync();
+				expect(stats.failed).toBe(0);
+				expect(await remoteHas(remote, renamedPath)).toBe(false);
+				await expectRemoteContent(remote, movedPath, "local folder v2\n");
+
+				await local.trashFile(movedPath);
+				stats = await engine.runSync();
+				expect(stats.failed).toBe(0);
+				expect(await remoteHas(remote, movedPath)).toBe(false);
+			} finally {
+				await cleanupRunFiles(remote, runId);
+				local.cleanup();
+			}
+		},
+		60_000
+	);
 });
 
 type RealCloudConfig = {
@@ -643,6 +702,129 @@ class MemoryLocalFs {
 	private tick(): number {
 		this.nextMtime += 2_000;
 		return this.nextMtime;
+	}
+}
+
+class NodeLocalFs {
+	private nextMtime = Date.now();
+	trashedPaths: string[] = [];
+	private readonly rootDir: string;
+
+	constructor(rootDir: string) {
+		this.rootDir = path.resolve(rootDir);
+		fs.mkdirSync(this.rootDir, { recursive: true });
+	}
+
+	listFiles(): Promise<FileEntry[]> {
+		const entries: FileEntry[] = [];
+		this.walk("", entries);
+		return Promise.resolve(entries.sort((a, b) => a.path.localeCompare(b.path)));
+	}
+
+	readFile(relativePath: string): Promise<string> {
+		return Promise.resolve(fs.readFileSync(this.abs(relativePath), "utf8"));
+	}
+
+	writeFile(relativePath: string, content: string): Promise<number> {
+		const target = this.abs(relativePath);
+		fs.mkdirSync(path.dirname(target), { recursive: true });
+		fs.writeFileSync(target, content, "utf8");
+		return Promise.resolve(this.touch(relativePath));
+	}
+
+	renameFile(oldPath: string, newPath: string): Promise<number> {
+		const source = this.abs(oldPath);
+		const target = this.abs(newPath);
+		fs.mkdirSync(path.dirname(target), { recursive: true });
+		fs.renameSync(source, target);
+		return Promise.resolve(this.touch(newPath));
+	}
+
+	renameFolder(oldPrefix: string, newPrefix: string): Promise<void> {
+		const source = this.abs(oldPrefix);
+		const target = this.abs(newPrefix);
+		fs.mkdirSync(path.dirname(target), { recursive: true });
+		fs.renameSync(source, target);
+		this.touchFolderFiles(newPrefix);
+		return Promise.resolve();
+	}
+
+	folderExists(prefix: string): Promise<boolean> {
+		const dir = this.abs(prefix);
+		return Promise.resolve(fs.existsSync(dir) && fs.statSync(dir).isDirectory());
+	}
+
+	getMtime(relativePath: string): Promise<number | null> {
+		const target = this.abs(relativePath);
+		return Promise.resolve(fs.existsSync(target) ? fs.statSync(target).mtimeMs : null);
+	}
+
+	trashFile(relativePath: string): Promise<void> {
+		fs.rmSync(this.abs(relativePath), { force: true });
+		this.trashedPaths.push(relativePath);
+		return Promise.resolve();
+	}
+
+	content(relativePath: string): string | undefined {
+		const target = this.abs(relativePath);
+		return fs.existsSync(target) ? fs.readFileSync(target, "utf8") : undefined;
+	}
+
+	has(relativePath: string): boolean {
+		return fs.existsSync(this.abs(relativePath));
+	}
+
+	cleanup(): void {
+		fs.rmSync(this.rootDir, { recursive: true, force: true });
+	}
+
+	private walk(relativeDir: string, entries: FileEntry[]): void {
+		const dir = this.abs(relativeDir);
+		if (!fs.existsSync(dir)) return;
+		for (const item of fs.readdirSync(dir, { withFileTypes: true })) {
+			const relativePath = relativeDir ? `${relativeDir}/${item.name}` : item.name;
+			if (item.isDirectory()) {
+				this.walk(relativePath, entries);
+				continue;
+			}
+			if (!item.isFile() || !relativePath.endsWith(".md")) continue;
+			const stat = fs.statSync(this.abs(relativePath));
+			entries.push({
+				path: relativePath,
+				name: item.name,
+				mtime: stat.mtimeMs,
+				size: stat.size,
+			});
+		}
+	}
+
+	private touch(relativePath: string): number {
+		const target = this.abs(relativePath);
+		this.nextMtime += 2_000;
+		const touchedAt = new Date(this.nextMtime);
+		fs.utimesSync(target, touchedAt, touchedAt);
+		return fs.statSync(target).mtimeMs;
+	}
+
+	private touchFolderFiles(prefix: string): void {
+		for (const file of this.listFilesSync()) {
+			if (pathUnderPrefix(file, prefix)) this.touch(file);
+		}
+	}
+
+	private listFilesSync(): string[] {
+		const entries: FileEntry[] = [];
+		this.walk("", entries);
+		return entries.map((entry) => entry.path);
+	}
+
+	private abs(relativePath: string): string {
+		const normalized = relativePath.replace(/\\/g, "/");
+		const resolved = path.resolve(this.rootDir, normalized);
+		if (resolved !== this.rootDir && !resolved.startsWith(`${this.rootDir}${path.sep}`)) {
+			throw new Error(`Path escapes test root: ${relativePath}`);
+		}
+		return resolved;
 	}
 }
 
