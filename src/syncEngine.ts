@@ -495,8 +495,10 @@ export class SyncEngine {
 				op = "rename-remote";
 			} else {
 				// 双向：mtime 较新的一侧为权威，避免同时生成两种 rename
-				op =
-					localAtRecord.mtime >= remote.mtime
+				const localChanged = localAtRecord.mtime > record.localMtime + MTIME_TOLERANCE_MS;
+				op = !localChanged
+					? "rename-local"
+					: localAtRecord.mtime >= remote.mtime
 						? "rename-remote"
 						: "rename-local";
 			}

@@ -163,6 +163,94 @@ describe("plugin sync ability scenes", () => {
 		expect(context.local.content("conflict.md")).toBe("cloud newer\n");
 		await expectConverged(context.local, context.remote, context.db);
 	});
+
+	it("resolves first-sync same-path conflicts without duplicate files", async () => {
+		const remoteWins = scene({
+			local: { "same-path.md": "local old\n" },
+			remote: { "same-path.md": "remote newer\n" },
+		});
+
+		let stats = await remoteWins.engine.runSync();
+		expect(stats.failed).toBe(0);
+		expect(remoteWins.local.content("same-path.md")).toBe("remote newer\n");
+		expect(Object.keys(await snapshotRemote(remoteWins.remote))).toEqual(["same-path.md"]);
+		await expectConverged(remoteWins.local, remoteWins.remote, remoteWins.db);
+
+		const localWins = scene({
+			local: { "same-path.md": "local newer\n" },
+			remote: { "same-path.md": "remote old\n" },
+		});
+		while ((localWins.local.mtime("same-path.md") ?? 0) < (localWins.remote.mtime("same-path.md") ?? 0)) {
+			await localWins.local.writeFile("same-path.md", "local newer\n");
+		}
+
+		stats = await localWins.engine.runSync();
+		expect(stats.failed).toBe(0);
+		expect(localWins.remote.content("same-path.md")).toBe("local newer\n");
+		expect(Object.keys(await snapshotRemote(localWins.remote))).toEqual(["same-path.md"]);
+		await expectConverged(localWins.local, localWins.remote, localWins.db);
+	});
+
+	it("retries a failed download on the next sync and converges", async () => {
+		const context = scene({
+			remote: {
+				"cloud/a.md": "A\n",
+				"cloud/b.md": "B\n",
+				"cloud/c.md": "C\n",
+			},
+		});
+		context.remote.failNextRead("cloud/b.md");
+
+		let stats = await context.engine.runSync();
+		expect(stats.failed).toBe(1);
+		expect(context.local.has("cloud/a.md")).toBe(true);
+		expect(context.local.has("cloud/b.md")).toBe(false);
+		expect(context.local.has("cloud/c.md")).toBe(true);
+		expect(context.db.recordsFor().find((record) => record.localPath === "cloud/b.md")?.syncStatus).toBe("failed");
+
+		stats = await context.engine.runSync(undefined, stats.newSince);
+		expect(stats.failed).toBe(0);
+		expect(context.local.content("cloud/b.md")).toBe("B\n");
+		await expectConverged(context.local, context.remote, context.db);
+	});
+
+	it("accepts remote rename when local is unchanged even if local mtime is newer", async () => {
+		const context = scene({ remote: { "cloud-old.md": "cloud\n" } });
+		let stats = await context.engine.runSync();
+		expect(stats.failed).toBe(0);
+
+		const record = await context.db.get(SCOPE_KEY, "cloud-old.md");
+		expect(record).toBeTruthy();
+		const futureLocalMtime = (context.remote.mtime("cloud-old.md") ?? 0) + 10_000;
+		context.local.setMtime("cloud-old.md", futureLocalMtime);
+		await context.db.put({ ...record!, localMtime: futureLocalMtime });
+
+		await context.remote.renamePath("cloud-old.md", "cloud-new.md");
+		stats = await context.engine.runSync();
+		expect(stats.failed).toBe(0);
+		expect(context.local.has("cloud-old.md")).toBe(false);
+		expect(context.local.content("cloud-new.md")).toBe("cloud\n");
+		expect(context.remote.has("cloud-old.md")).toBe(false);
+		expect(context.remote.has("cloud-new.md")).toBe(true);
+		await expectConverged(context.local, context.remote, context.db);
+	});
+
+	it("protects local files when a remote entry is missing without confirmed delete", async () => {
+		const context = scene({ local: { "protected.md": "keep local\n" } });
+		let stats = await context.engine.runSync();
+		expect(stats.failed).toBe(0);
+
+		const remoteId = context.remote.id("protected.md");
+		expect(remoteId).toBeTruthy();
+		await context.remote.deleteFile(remoteId!);
+
+		stats = await context.engine.runSync();
+		expect(stats.failed).toBe(0);
+		expect(stats.deleted).toBe(0);
+		expect(context.local.content("protected.md")).toBe("keep local\n");
+		expect(context.remote.has("protected.md")).toBe(false);
+		expect(context.db.recordsFor().find((record) => record.localPath === "protected.md")?.syncStatus).toBe("done");
+	});
 });
 
 function scene(seed: {
@@ -372,6 +460,12 @@ class MemoryLocalFs {
 		return this.files.get(path)?.mtime;
 	}
 
+	setMtime(path: string, mtime: number): void {
+		const file = this.files.get(path);
+		if (!file) throw new Error(`Local file not found: ${path}`);
+		this.files.set(path, { ...file, mtime });
+	}
+
 	has(path: string): boolean {
 		return this.files.has(path);
 	}
@@ -387,6 +481,7 @@ class MemoryXgkbFs {
 	private folders = new Map<string, RemoteFolder>([
 		["", { id: ROOT_ID, path: "", mtime: 0 }],
 	]);
+	private failNextReadPaths = new Set<string>();
 	private nextId = 1;
 	private nextFolderId = 1;
 	private nextMtime = 20_000;
@@ -438,6 +533,10 @@ class MemoryXgkbFs {
 
 	readFile(fileId: string): Promise<Result<string>> {
 		const file = this.findById(fileId);
+		if (file && this.failNextReadPaths.has(file.path)) {
+			this.failNextReadPaths.delete(file.path);
+			return Promise.resolve({ ok: false, error: "transient read failure" });
+		}
 		return file ? Promise.resolve({ ok: true, value: file.content }) : Promise.resolve({ ok: false, error: "not found" });
 	}
 
@@ -631,6 +730,10 @@ class MemoryXgkbFs {
 
 	id(path: string): string | undefined {
 		return this.files.get(path)?.id;
+	}
+
+	failNextRead(path: string): void {
+		this.failNextReadPaths.add(path);
 	}
 
 	private setChanges(items: XgkbChangeItem[]): void {

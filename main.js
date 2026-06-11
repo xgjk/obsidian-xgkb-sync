@@ -2209,7 +2209,8 @@ var SyncEngine = class {
       } else if (dir === "push") {
         op = "rename-remote";
       } else {
-        op = localAtRecord.mtime >= remote.mtime ? "rename-remote" : "rename-local";
+        const localChanged = localAtRecord.mtime > record.localMtime + MTIME_TOLERANCE_MS;
+        op = !localChanged ? "rename-local" : localAtRecord.mtime >= remote.mtime ? "rename-remote" : "rename-local";
       }
       if (op === "rename-local") {
         syncDiagReconcile("plan", record.xgkbFileId, {

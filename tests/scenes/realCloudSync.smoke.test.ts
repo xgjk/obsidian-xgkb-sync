@@ -188,6 +188,153 @@ describe("plugin sync with real cloud smoke", () => {
 	);
 
 	runRealCloud(
+		"pulls cloud create, update, rename, move, and delete into a real local folder",
+		async () => {
+			if (!CONFIG) throw new Error("Missing real cloud test config");
+
+			const { SyncEngine } = await import("../../src/syncEngine");
+
+			const runId = `sync-pull-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+			const localRoot = path.resolve(process.cwd(), "test-results", "sync-local-folder", runId);
+			const cloudPath = `${runId}/cloud-source.md`;
+			const renamedPath = `${runId}/cloud-renamed.md`;
+			const movedFolder = `${runId}/cloud-archive`;
+			const movedPath = `${movedFolder}/cloud-renamed.md`;
+
+			const local = new NodeLocalFs(localRoot);
+			const db = new MemorySyncStateDb();
+			const remote = new RealXgkbFs(CONFIG);
+			const engine = new SyncEngine(
+				local as never,
+				remote as never,
+				db as never,
+				settings(CONFIG),
+				`${SCOPE_KEY}:cloud-to-local-folder`
+			);
+
+			try {
+				await expectOk(await remote.init());
+				await expectOk(await remote.createFile(cloudPath, "cloud pull v1\n"));
+				await settle();
+
+				let stats = await engine.runSync();
+				expect(stats.failed).toBe(0);
+				expect(local.content(cloudPath)).toBe("cloud pull v1\n");
+
+				let cloud = await expectRemoteEntry(remote, cloudPath);
+				await expectOk(await remote.updateFile(cloud.xgkbFileId!, cloud.name, "cloud pull v2\n"));
+				await settle();
+				stats = await engine.runSync();
+				expect(stats.failed).toBe(0);
+				expect(local.content(cloudPath)).toBe("cloud pull v2\n");
+
+				cloud = await expectRemoteEntry(remote, cloudPath);
+				await expectOk(await remote.renameRemoteFile(cloud.xgkbFileId!, "cloud-renamed.md"));
+				await waitForRemotePaths(remote, [renamedPath], [cloudPath]);
+				stats = await engine.runSync();
+				expect(stats.failed).toBe(0);
+				expect(local.has(cloudPath)).toBe(false);
+				expect(local.content(renamedPath)).toBe("cloud pull v2\n");
+
+				cloud = await expectRemoteEntry(remote, renamedPath);
+				const targetFolder = await remote.resolveFolderIdForRelativePath(movedFolder);
+				await expectOk(targetFolder);
+				await expectOk(await remote.moveRemoteFile(cloud.xgkbFileId!, targetFolder.value));
+				await waitForRemotePaths(remote, [movedPath], [renamedPath]);
+				stats = await engine.runSync();
+				expect(stats.failed).toBe(0);
+				expect(local.has(renamedPath)).toBe(false);
+				expect(local.content(movedPath)).toBe("cloud pull v2\n");
+
+				const since = stats.newSince;
+				cloud = await expectRemoteEntry(remote, movedPath);
+				await expectOk(await remote.deleteFile(cloud.xgkbFileId!));
+				await waitForRemotePaths(remote, [], [movedPath]);
+				stats = await engine.runSync(undefined, since);
+				expect(stats.failed).toBe(0);
+				expect(local.has(movedPath)).toBe(false);
+				expect(local.trashedPaths).toContain(movedPath);
+			} finally {
+				await cleanupRunFiles(remote, runId);
+				local.cleanup();
+			}
+		},
+		90_000
+	);
+
+	runRealCloud(
+		"syncs 20 markdown files with special names and remains idempotent",
+		async () => {
+			if (!CONFIG) throw new Error("Missing real cloud test config");
+
+			const { SyncEngine } = await import("../../src/syncEngine");
+
+			const runId = `sync-bulk-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+			const localRoot = path.resolve(process.cwd(), "test-results", "sync-local-folder", runId);
+			const numberedPaths = Array.from(
+				{ length: 15 },
+				(_, index) => `${runId}/bulk/${String(index + 1).padStart(2, "0")}-note.md`
+			);
+			const specialPaths = [
+				`${runId}/special/hash # tag.md`,
+				`${runId}/special/ampersand & parens (v1).md`,
+				`${runId}/special/dotted.name.2026.06.11.md`,
+				`${runId}/special/multi  space.md`,
+				`${runId}/special/cn-\u4f1a\u8bae.md`,
+			];
+			const allPaths = [...numberedPaths, ...specialPaths];
+			const contentByPath = new Map(
+				allPaths.map((filePath, index) => [filePath, markdownBoundaryContent(filePath, index)])
+			);
+
+			const local = new NodeLocalFs(localRoot);
+			const db = new MemorySyncStateDb();
+			const remote = new RealXgkbFs(CONFIG);
+			const engine = new SyncEngine(
+				local as never,
+				remote as never,
+				db as never,
+				settings(CONFIG),
+				`${SCOPE_KEY}:bulk-idempotent`
+			);
+
+			try {
+				for (const filePath of allPaths) {
+					await local.writeFile(filePath, contentByPath.get(filePath)!);
+				}
+
+				let stats = await engine.runSync();
+				expect(stats.failed).toBe(0);
+				expect(stats.uploaded).toBe(allPaths.length);
+				await expectRemoteRunPaths(remote, runId, allPaths);
+				await expectRemoteContent(remote, numberedPaths[0], cleanContent(contentByPath.get(numberedPaths[0])!));
+				await expectRemoteContent(remote, specialPaths[0], cleanContent(contentByPath.get(specialPaths[0])!));
+				await expectRemoteContent(remote, specialPaths[4], cleanContent(contentByPath.get(specialPaths[4])!));
+
+				stats = await engine.runSync();
+				expect(stats.failed).toBe(0);
+				expect(stats.uploaded).toBe(0);
+				expect(stats.downloaded).toBe(0);
+				expect(stats.deleted).toBe(0);
+				expect(stats.renamed ?? 0).toBe(0);
+				expect(stats.moved ?? 0).toBe(0);
+				await expectRemoteRunPaths(remote, runId, allPaths);
+
+				stats = await engine.runSync();
+				expect(stats.failed).toBe(0);
+				expect(stats.uploaded).toBe(0);
+				expect(stats.downloaded).toBe(0);
+				expect(stats.deleted).toBe(0);
+				await expectRemoteRunPaths(remote, runId, allPaths);
+			} finally {
+				await cleanupRunFiles(remote, runId);
+				local.cleanup();
+			}
+		},
+		120_000
+	);
+
+	runRealCloud(
 		"syncs batch, nested, special-name, and chained local operations to real cloud",
 		async () => {
 			if (!CONFIG) throw new Error("Missing real cloud test config");
@@ -722,6 +869,42 @@ async function expectRemoteMissing(remote: RealRemote, remotePath: string): Prom
 	expect(listed.value.some((file) => file.path === remotePath), `unexpected remote path ${remotePath}`).toBe(false);
 }
 
+async function expectRemoteRunPaths(remote: RealRemote, runId: string, expectedPaths: string[]): Promise<void> {
+	const listed = await remote.listFiles();
+	await expectOk(listed);
+	const actual = listed.value
+		.map((file) => file.path)
+		.filter((remotePath) => remotePath.includes(runId))
+		.sort((a, b) => a.localeCompare(b));
+	expect(actual).toEqual([...expectedPaths].sort((a, b) => a.localeCompare(b)));
+}
+
+async function waitForRemotePaths(
+	remote: RealRemote,
+	present: string[],
+	absent: string[],
+	timeoutMs = 10_000
+): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	let paths: string[] = [];
+	while (Date.now() < deadline) {
+		const listed = await remote.listFiles();
+		await expectOk(listed);
+		paths = listed.value.map((file) => file.path);
+		if (present.every((remotePath) => paths.includes(remotePath)) &&
+			absent.every((remotePath) => !paths.includes(remotePath))) {
+			return;
+		}
+		await settle();
+	}
+	for (const remotePath of present) {
+		expect(paths.includes(remotePath), `remote path did not appear: ${remotePath}`).toBe(true);
+	}
+	for (const remotePath of absent) {
+		expect(paths.includes(remotePath), `remote path did not disappear: ${remotePath}`).toBe(false);
+	}
+}
+
 async function cleanupRunFiles(remote: RealRemote, runId: string): Promise<void> {
 	const init = await remote.init();
 	if (!init.ok) return;
@@ -739,6 +922,32 @@ async function expectOk<T>(result: { ok: true; value: T } | { ok: false; error: 
 
 async function settle(): Promise<void> {
 	await new Promise((resolve) => setTimeout(resolve, 500));
+}
+
+function markdownBoundaryContent(filePath: string, index: number): string {
+	return [
+		"---",
+		`title: Sync boundary ${index}`,
+		"tags:",
+		"  - sync",
+		"  - cloud",
+		"---",
+		"",
+		`# ${filePath}`,
+		"",
+		"| key | value |",
+		"| --- | --- |",
+		`| index | ${index} |`,
+		"",
+		"```ts",
+		"const message = \"sync boundary\";",
+		"```",
+		"",
+		"[[Wiki Link]] and [external](https://example.test/path?a=1&b=2)",
+		"Unicode: \u4e2d\u6587 \u4f1a\u8bae",
+		"CRLF marker follows\r\nsecond CRLF line",
+		"",
+	].join("\n");
 }
 
 type RealRemote = {
