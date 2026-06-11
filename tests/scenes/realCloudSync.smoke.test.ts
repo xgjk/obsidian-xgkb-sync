@@ -186,6 +186,114 @@ describe("plugin sync with real cloud smoke", () => {
 		},
 		60_000
 	);
+
+	runRealCloud(
+		"syncs batch, nested, special-name, and chained local operations to real cloud",
+		async () => {
+			if (!CONFIG) throw new Error("Missing real cloud test config");
+
+			const { SyncEngine } = await import("../../src/syncEngine");
+
+			const runId = `sync-batch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+			const localRoot = path.resolve(process.cwd(), "test-results", "sync-local-folder", runId);
+			const firstPath = `${runId}/daily/2026-06-11.md`;
+			const secondPath = `${runId}/projects/alpha/spec.md`;
+			const deepPath = `${runId}/projects/alpha/deep/note.md`;
+			const specialNamePath = `${runId}/中文  空格/会议 记录.md`;
+			const ignoredTextPath = `${runId}/ignored.txt`;
+			const ignoredImagePath = `${runId}/assets/image.png`;
+			const finalFirstPath = `${runId}/archive/daily-renamed.md`;
+			const finalSecondPath = `${runId}/projects/beta/spec-final.md`;
+			const finalSpecialNamePath = `${runId}/中文  空格/会议 记录 final.md`;
+			const transientPath = `${runId}/transient/delete-before-sync.md`;
+
+			const local = new NodeLocalFs(localRoot);
+			const db = new MemorySyncStateDb();
+			const remote = new RealXgkbFs(CONFIG);
+			const engine = new SyncEngine(
+				local as never,
+				remote as never,
+				db as never,
+				settings(CONFIG),
+				`${SCOPE_KEY}:batch-local-folder`
+			);
+
+			try {
+				await local.writeFile(firstPath, "# Daily\nv1\n");
+				await local.writeFile(secondPath, "# Spec\nv1\n");
+				await local.writeFile(deepPath, "# Deep\nv1\n");
+				await local.writeFile(specialNamePath, "# 会议\nv1\n");
+				await local.writeFile(ignoredTextPath, "should not sync\n");
+				await local.writeFile(ignoredImagePath, "not an image, but still ignored\n");
+
+				let stats = await engine.runSync();
+				expect(stats.failed).toBe(0);
+				await expectRemoteContent(remote, firstPath, "# Daily\nv1\n");
+				await expectRemoteContent(remote, secondPath, "# Spec\nv1\n");
+				await expectRemoteContent(remote, deepPath, "# Deep\nv1\n");
+				await expectRemoteContent(remote, specialNamePath, "# 会议\nv1\n");
+				await expectRemoteMissing(remote, ignoredTextPath);
+				await expectRemoteMissing(remote, ignoredImagePath);
+
+				await local.writeFile(firstPath, "# Daily\nv2\n");
+				await local.writeFile(secondPath, "# Spec\nv2\n");
+				await local.writeFile(deepPath, "# Deep\nv2\n");
+				await local.writeFile(specialNamePath, "# 会议\nv2\n");
+
+				stats = await engine.runSync();
+				expect(stats.failed).toBe(0);
+				await expectRemoteContent(remote, firstPath, "# Daily\nv2\n");
+				await expectRemoteContent(remote, secondPath, "# Spec\nv2\n");
+				await expectRemoteContent(remote, deepPath, "# Deep\nv2\n");
+				await expectRemoteContent(remote, specialNamePath, "# 会议\nv2\n");
+
+				await local.renameFile(firstPath, `${runId}/daily/renamed.md`);
+				await local.renameFile(`${runId}/daily/renamed.md`, finalFirstPath);
+				await local.writeFile(finalFirstPath, "# Daily\nrenamed and moved\n");
+				await local.renameFile(secondPath, `${runId}/projects/beta/spec.md`);
+				await local.renameFile(`${runId}/projects/beta/spec.md`, finalSecondPath);
+				await local.writeFile(finalSecondPath, "# Spec\nrenamed and moved\n");
+				await local.renameFile(specialNamePath, finalSpecialNamePath);
+				await local.writeFile(finalSpecialNamePath, "# 会议\nrenamed\n");
+				await local.writeFile(transientPath, "gone before sync\n");
+				await local.trashFile(transientPath);
+
+				stats = await engine.runSync();
+				expect(stats.failed).toBe(0);
+				expect(await remoteHas(remote, firstPath)).toBe(false);
+				expect(await remoteHas(remote, secondPath)).toBe(false);
+				expect(await remoteHas(remote, specialNamePath)).toBe(false);
+				await expectRemoteContent(remote, finalFirstPath, "# Daily\nrenamed and moved\n");
+				await expectRemoteContent(remote, finalSecondPath, "# Spec\nrenamed and moved\n");
+				await expectRemoteContent(remote, finalSpecialNamePath, "# 会议\nrenamed\n");
+				await expectRemoteContent(remote, deepPath, "# Deep\nv2\n");
+				await expectRemoteMissing(remote, transientPath);
+
+				await local.renameFolder(`${runId}/projects/alpha`, `${runId}/projects/gamma`);
+				const movedDeepPath = `${runId}/projects/gamma/deep/note.md`;
+				await local.writeFile(movedDeepPath, "# Deep\nfolder moved\n");
+				stats = await engine.runSync();
+				expect(stats.failed).toBe(0);
+				expect(await remoteHas(remote, deepPath)).toBe(false);
+				await expectRemoteContent(remote, movedDeepPath, "# Deep\nfolder moved\n");
+
+				await local.trashFile(finalFirstPath);
+				await local.trashFile(finalSecondPath);
+				await local.trashFile(finalSpecialNamePath);
+				await local.trashFile(movedDeepPath);
+				stats = await engine.runSync();
+				expect(stats.failed).toBe(0);
+				expect(await remoteHas(remote, finalFirstPath)).toBe(false);
+				expect(await remoteHas(remote, finalSecondPath)).toBe(false);
+				expect(await remoteHas(remote, finalSpecialNamePath)).toBe(false);
+				expect(await remoteHas(remote, movedDeepPath)).toBe(false);
+			} finally {
+				await cleanupRunFiles(remote, runId);
+				local.cleanup();
+			}
+		},
+		90_000
+	);
 });
 
 type RealCloudConfig = {
@@ -290,23 +398,33 @@ class RealXgkbFs {
 	}
 
 	async listFiles(): Promise<Result<FileEntry[]>> {
+		return this.listDescendantFileEntries("md");
+	}
+
+	async listAllFiles(): Promise<Result<FileEntry[]>> {
+		return this.listDescendantFileEntries();
+	}
+
+	private async listDescendantFileEntries(suffix?: string): Promise<Result<FileEntry[]>> {
 		if (!this.rootId) return { ok: false, error: "not initialized" };
 		const entries: FileEntry[] = [];
 		const seen = new Set<string>();
 		let cursor: string | undefined;
 		do {
-			const page = await this.request<XgkbListDescendantFilesData>("GET", API_PATHS.listDescendantFiles, {
+			const params: Record<string, unknown> = {
 				rootFileId: this.rootId,
 				projectId: this.projectId || undefined,
-				suffix: "md",
 				limit: 500,
 				cursor,
 				includePath: true,
-			});
+			};
+			if (suffix) params.suffix = suffix;
+			const page = await this.request<XgkbListDescendantFilesData>("GET", API_PATHS.listDescendantFiles, params);
 			if (!page.ok) return page;
 			for (const item of page.value.files || []) {
 				const safePath = normalizeKbRelativePath(item.relativePath || item.name);
-				if (!safePath.endsWith(".md") || seen.has(safePath)) continue;
+				if (suffix && !safePath.endsWith(`.${suffix}`)) continue;
+				if (seen.has(safePath)) continue;
 				seen.add(safePath);
 				entries.push({
 					path: safePath,
@@ -598,10 +716,16 @@ async function remoteHas(remote: RealRemote, remotePath: string): Promise<boolea
 	return listed.value.some((file) => file.path === remotePath);
 }
 
+async function expectRemoteMissing(remote: RealRemote, remotePath: string): Promise<void> {
+	const listed = await remote.listAllFiles();
+	await expectOk(listed);
+	expect(listed.value.some((file) => file.path === remotePath), `unexpected remote path ${remotePath}`).toBe(false);
+}
+
 async function cleanupRunFiles(remote: RealRemote, runId: string): Promise<void> {
 	const init = await remote.init();
 	if (!init.ok) return;
-	const listed = await remote.listFiles();
+	const listed = await remote.listAllFiles();
 	if (!listed.ok) return;
 	for (const file of listed.value) {
 		if (!file.path.includes(runId) || !file.xgkbFileId) continue;
@@ -620,6 +744,7 @@ async function settle(): Promise<void> {
 type RealRemote = {
 	init(): Promise<{ ok: true; value: string } | { ok: false; error: string }>;
 	listFiles(): Promise<{ ok: true; value: FileEntry[] } | { ok: false; error: string }>;
+	listAllFiles(): Promise<{ ok: true; value: FileEntry[] } | { ok: false; error: string }>;
 	readFile(fileId: string): Promise<{ ok: true; value: string } | { ok: false; error: string }>;
 	deleteFile(fileId: string): Promise<{ ok: true; value: void } | { ok: false; error: string }>;
 };
