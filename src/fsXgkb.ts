@@ -15,7 +15,7 @@ import {
 	resolveTargetFolderConfig,
 	sanitizePathSegment,
 } from "./pathSanitize";
-import { pathMatchesSyncExtensions, splitFileNameAndSuffix } from "./syncFileTypes";
+import { pathHasDotFolder, pathMatchesSyncExtensions, splitFileNameAndSuffix } from "./syncFileTypes";
 
 /**
  * 云端文件系统操作（XGKB API 封装）
@@ -196,6 +196,7 @@ export class FsXgkb {
 						.filter(Boolean)
 						.map((seg) => sanitizePathSegment(seg))
 						.join("/");
+					if (pathHasDotFolder(safePath)) continue;
 					if (!pathMatchesSyncExtensions(safePath, this.syncExtensions)) continue;
 					if (seen.has(safePath)) continue;
 					seen.add(safePath);

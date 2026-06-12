@@ -32,6 +32,11 @@ export function pathMatchesSyncExtensions(
 	return ext !== "" && allowed.includes(ext);
 }
 
+export function pathHasDotFolder(relativePath: string): boolean {
+	const parts = relativePath.split("/").filter(Boolean);
+	return parts.slice(0, -1).some((part) => part.startsWith("."));
+}
+
 export function formatSyncExtensionsLabel(allowed: readonly string[]): string {
 	return allowed.map((ext) => `.${ext}`).join(", ");
 }

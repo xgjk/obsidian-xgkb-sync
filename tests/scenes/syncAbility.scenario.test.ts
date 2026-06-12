@@ -251,6 +251,178 @@ describe("plugin sync ability scenes", () => {
 		expect(context.remote.has("protected.md")).toBe(false);
 		expect(context.db.recordsFor().find((record) => record.localPath === "protected.md")?.syncStatus).toBe("done");
 	});
+
+	it("keeps cloud content when a local rename crosses with a cloud update", async () => {
+		const context = scene({ local: { "cross/rename.md": "v1\n" } });
+		let stats = await context.engine.runSync();
+		expect(stats.failed).toBe(0);
+
+		await renameLocalFileAsPlugin(context, "cross/rename.md", "cross/renamed.md", { preserveMtime: true });
+		await updateRemoteNewerThanLocal(context, "cross/rename.md", "cloud update after local rename\n");
+
+		stats = await context.engine.runSync();
+		expect(stats.failed).toBe(0);
+		expect(context.local.has("cross/rename.md")).toBe(false);
+		expect(context.remote.has("cross/rename.md")).toBe(false);
+		expect(context.local.content("cross/renamed.md")).toBe("cloud update after local rename\n");
+		expect(context.remote.content("cross/renamed.md")).toBe("cloud update after local rename\n");
+		await expectConverged(context.local, context.remote, context.db);
+	});
+
+	it("converges local update and cloud move conflicts without duplicate paths", async () => {
+		const localWins = scene({ local: { "move/local-wins.md": "v1\n" } });
+		let stats = await localWins.engine.runSync();
+		expect(stats.failed).toBe(0);
+
+		await localWins.local.writeFile("move/local-wins.md", "local newer content\n");
+		await localWins.remote.movePath("move/local-wins.md", "cloud/local-wins.md");
+		localWins.local.setMtime("move/local-wins.md", (localWins.remote.mtime("cloud/local-wins.md") ?? 0) + 2_000);
+
+		stats = await localWins.engine.runSync();
+		expect(stats.failed).toBe(0);
+		expect(localWins.remote.content("move/local-wins.md")).toBe("local newer content\n");
+		expect(localWins.remote.has("cloud/local-wins.md")).toBe(false);
+		await expectConverged(localWins.local, localWins.remote, localWins.db);
+
+		const cloudWins = scene({ local: { "move/cloud-wins.md": "v1\n" } });
+		stats = await cloudWins.engine.runSync();
+		expect(stats.failed).toBe(0);
+
+		await cloudWins.local.writeFile("move/cloud-wins.md", "local older content\n");
+		await cloudWins.remote.movePath("move/cloud-wins.md", "cloud/cloud-wins.md");
+
+		stats = await cloudWins.engine.runSync();
+		expect(stats.failed).toBe(0);
+		expect(cloudWins.local.has("move/cloud-wins.md")).toBe(false);
+		expect(cloudWins.local.content("cloud/cloud-wins.md")).toBe("v1\n");
+		expect(cloudWins.remote.has("move/cloud-wins.md")).toBe(false);
+		await expectConverged(cloudWins.local, cloudWins.remote, cloudWins.db);
+	});
+
+	it("resolves delete conflicts deterministically", async () => {
+		const localDeleteCloudUpdate = scene({ local: { "delete/local-delete.md": "v1\n" } });
+		let stats = await localDeleteCloudUpdate.engine.runSync();
+		expect(stats.failed).toBe(0);
+
+		await localDeleteCloudUpdate.local.trashFile("delete/local-delete.md");
+		await localDeleteCloudUpdate.remote.updatePath("delete/local-delete.md", "cloud survives local delete\n");
+
+		stats = await localDeleteCloudUpdate.engine.runSync();
+		expect(stats.failed).toBe(0);
+		expect(localDeleteCloudUpdate.local.content("delete/local-delete.md")).toBe("cloud survives local delete\n");
+		expect(localDeleteCloudUpdate.remote.content("delete/local-delete.md")).toBe("cloud survives local delete\n");
+		await expectConverged(localDeleteCloudUpdate.local, localDeleteCloudUpdate.remote, localDeleteCloudUpdate.db);
+
+		const cloudDeleteLocalUpdate = scene({ local: { "delete/cloud-delete.md": "v1\n" } });
+		stats = await cloudDeleteLocalUpdate.engine.runSync();
+		expect(stats.failed).toBe(0);
+		const since = stats.newSince;
+
+		await writeLocalNewerThanRemote(cloudDeleteLocalUpdate, "delete/cloud-delete.md", "local changed before cloud delete\n");
+		cloudDeleteLocalUpdate.remote.markDeletedChange("delete/cloud-delete.md");
+
+		stats = await cloudDeleteLocalUpdate.engine.runSync(undefined, since);
+		expect(stats.failed).toBe(0);
+		expect(cloudDeleteLocalUpdate.local.has("delete/cloud-delete.md")).toBe(false);
+		expect(cloudDeleteLocalUpdate.local.trashedPaths).toContain("delete/cloud-delete.md");
+		expect(cloudDeleteLocalUpdate.remote.has("delete/cloud-delete.md")).toBe(false);
+		await expectConverged(cloudDeleteLocalUpdate.local, cloudDeleteLocalUpdate.remote, cloudDeleteLocalUpdate.db);
+	});
+
+	it("retries a failed upload on the next sync and converges", async () => {
+		const context = scene({
+			local: {
+				"retry/a.md": "A\n",
+				"retry/b.md": "B\n",
+				"retry/c.md": "C\n",
+			},
+		});
+		context.remote.failNextCreate("retry/b.md");
+
+		let stats = await context.engine.runSync();
+		expect(stats.failed).toBe(1);
+		expect(context.remote.has("retry/a.md")).toBe(true);
+		expect(context.remote.has("retry/b.md")).toBe(false);
+		expect(context.remote.has("retry/c.md")).toBe(true);
+
+		stats = await context.engine.runSync(undefined, stats.newSince);
+		expect(stats.failed).toBe(0);
+		expect(context.remote.content("retry/b.md")).toBe("B\n");
+		await expectConverged(context.local, context.remote, context.db);
+	});
+
+	it("syncs high-volume, deep, empty, large, and special markdown paths", async () => {
+		const bulk = Object.fromEntries(
+			Array.from({ length: 100 }, (_, index) => [
+				`bulk/${String(index + 1).padStart(3, "0")}.md`,
+				`# Bulk ${index + 1}\n`,
+			])
+		);
+		const deepPath = `${Array.from({ length: 12 }, (_, index) => `level-${index + 1}`).join("/")}/deep.md`;
+		const largeContent = `${"large line\n".repeat(120_000)}end\n`;
+		const files = {
+			...bulk,
+			[deepPath]: "# Deep\n",
+			"empty.md": "",
+			"large/large.md": largeContent,
+			"special/hash # tag.md": "# Hash\n",
+			"special/ampersand & parens (v1).md": "# Ampersand\n",
+			"special/dotted.name.2026.06.11.md": "# Dotted\n",
+			"special/multi  space.md": "# Spaces\n",
+			"special/cn-\u4f1a\u8bae.md": "# Unicode\n",
+		};
+		const context = scene({ local: files });
+
+		const stats = await context.engine.runSync();
+
+		expect(stats.failed).toBe(0);
+		expect(stats.uploaded).toBe(Object.keys(files).length);
+		expect(context.remote.content(deepPath)).toBe("# Deep\n");
+		expect(context.remote.content("empty.md")).toBe("");
+		expect(context.remote.content("large/large.md")).toBe(largeContent);
+		expect(context.remote.content("special/cn-\u4f1a\u8bae.md")).toBe("# Unicode\n");
+		await expectConverged(context.local, context.remote, context.db);
+	}, 20_000);
+
+	it("syncs case-only local renames without recreating the old path", async () => {
+		const context = scene({ local: { "Case/Note.md": "case content\n" } });
+		let stats = await context.engine.runSync();
+		expect(stats.failed).toBe(0);
+
+		await renameLocalFileAsPlugin(context, "Case/Note.md", "Case/note.md", { preserveMtime: true });
+
+		stats = await context.engine.runSync();
+		expect(stats.failed).toBe(0);
+		expect(context.remote.has("Case/Note.md")).toBe(false);
+		expect(context.remote.content("Case/note.md")).toBe("case content\n");
+		await expectConverged(context.local, context.remote, context.db);
+	});
+
+	it("ignores attachments and Obsidian config folders outside the sync scope", async () => {
+		const context = scene({
+			local: {
+				"keep.md": "keep\n",
+				"assets/image.png": "not markdown\n",
+				".obsidian/plugins/state.md": "local config\n",
+			},
+			remote: {
+				"cloud.md": "cloud\n",
+				".obsidian/cloud.md": "remote config\n",
+				"remote.txt": "remote text\n",
+			},
+		});
+
+		const stats = await context.engine.runSync();
+
+		expect(stats.failed).toBe(0);
+		expect(context.remote.content("keep.md")).toBe("keep\n");
+		expect(context.local.content("cloud.md")).toBe("cloud\n");
+		expect(context.remote.has("assets/image.png")).toBe(false);
+		expect(context.remote.has(".obsidian/plugins/state.md")).toBe(false);
+		expect(context.local.has(".obsidian/cloud.md")).toBe(false);
+		expect(context.local.has("remote.txt")).toBe(false);
+		await expectConverged(context.local, context.remote, context.db);
+	});
 });
 
 function scene(seed: {
@@ -258,17 +430,33 @@ function scene(seed: {
 	remote?: Record<string, string>;
 	settings?: Partial<XgkbPluginSettings>;
 } = {}) {
-	const local = new MemoryLocalFs(seed.local);
-	const remote = new MemoryXgkbFs(seed.remote);
+	const resolvedSettings = settings(seed.settings);
+	const local = new MemoryLocalFs(seed.local, resolvedSettings.syncFileExtensions);
+	const remote = new MemoryXgkbFs(seed.remote, resolvedSettings.syncFileExtensions);
 	const db = new MemorySyncStateDb();
 	const engine = new SyncEngine(
 		local as never,
 		remote as never,
 		db as never,
-		settings(seed.settings),
+		resolvedSettings,
 		SCOPE_KEY
 	);
 	return { local, remote, db, engine };
+}
+
+async function renameLocalFileAsPlugin(
+	context: ReturnType<typeof scene>,
+	oldPath: string,
+	newPath: string,
+	options: { preserveMtime?: boolean } = {}
+): Promise<void> {
+	const oldMtime = context.local.mtime(oldPath);
+	await context.local.renameFile(oldPath, newPath);
+	if (options.preserveMtime && oldMtime != null) {
+		context.local.setMtime(newPath, oldMtime);
+	}
+	expect(await context.db.relocateRecord(SCOPE_KEY, oldPath, newPath)).toBe(true);
+	expect(await context.db.markPendingRemoteRenameOrMove(SCOPE_KEY, newPath, oldPath, newPath)).toBe(true);
 }
 
 async function renameLocalFolder(
@@ -390,7 +578,10 @@ class MemoryLocalFs {
 	private nextMtime = 10_000;
 	trashedPaths: string[] = [];
 
-	constructor(seed: Record<string, string> = {}) {
+	constructor(
+		seed: Record<string, string> = {},
+		private syncExtensions: readonly string[] = ["md"]
+	) {
 		for (const [path, content] of Object.entries(seed)) {
 			this.files.set(path, { content, mtime: this.tick() });
 		}
@@ -398,12 +589,14 @@ class MemoryLocalFs {
 
 	listFiles(): Promise<FileEntry[]> {
 		return Promise.resolve(
-			[...this.files.entries()].map(([path, file]) => ({
-				path,
-				name: basename(path),
-				mtime: file.mtime,
-				size: file.content.length,
-			}))
+			[...this.files.entries()]
+				.filter(([path]) => isSyncCandidatePath(path, this.syncExtensions))
+				.map(([path, file]) => ({
+					path,
+					name: basename(path),
+					mtime: file.mtime,
+					size: file.content.length,
+				}))
 		);
 	}
 
@@ -482,13 +675,17 @@ class MemoryXgkbFs {
 		["", { id: ROOT_ID, path: "", mtime: 0 }],
 	]);
 	private failNextReadPaths = new Set<string>();
+	private failNextCreatePaths = new Set<string>();
 	private nextId = 1;
 	private nextFolderId = 1;
 	private nextMtime = 20_000;
 	private changes: XgkbChangeItem[] = [];
 	serverTime = 30_000;
 
-	constructor(seed: Record<string, string> = {}) {
+	constructor(
+		seed: Record<string, string> = {},
+		private syncExtensions: readonly string[] = ["md"]
+	) {
 		for (const [path, content] of Object.entries(seed)) {
 			const folderId = this.ensureFolder(parentPathOf(path));
 			this.files.set(path, {
@@ -516,7 +713,9 @@ class MemoryXgkbFs {
 	listFiles(): Promise<Result<FileEntry[]>> {
 		return Promise.resolve({
 			ok: true,
-			value: [...this.files.values()].map((file) => this.toEntry(file)),
+			value: [...this.files.values()]
+				.filter((file) => isSyncCandidatePath(file.path, this.syncExtensions))
+				.map((file) => this.toEntry(file)),
 		});
 	}
 
@@ -541,6 +740,10 @@ class MemoryXgkbFs {
 	}
 
 	createFile(path: string, content: string): Promise<Result<{ fileId: string; folderId: string }>> {
+		if (this.failNextCreatePaths.has(path)) {
+			this.failNextCreatePaths.delete(path);
+			return Promise.resolve({ ok: false, error: "transient create failure" });
+		}
 		const folderId = this.ensureFolder(parentPathOf(path));
 		const file: RemoteFile = {
 			id: this.allocFileId(),
@@ -736,6 +939,10 @@ class MemoryXgkbFs {
 		this.failNextReadPaths.add(path);
 	}
 
+	failNextCreate(path: string): void {
+		this.failNextCreatePaths.add(path);
+	}
+
 	private setChanges(items: XgkbChangeItem[]): void {
 		this.changes = items;
 		this.serverTime += 2_000;
@@ -877,6 +1084,26 @@ class MemorySyncStateDb {
 		return Promise.resolve(true);
 	}
 
+	markPendingRemoteRenameOrMove(
+		scopeKey: string,
+		localPath: string,
+		oldPath: string,
+		newPath: string
+	): Promise<boolean> {
+		const record = this.records.get(key(scopeKey, localPath));
+		if (!record) return Promise.resolve(false);
+		const now = Date.now();
+		this.records.set(key(scopeKey, localPath), {
+			...record,
+			pendingRemoteOp: "rename-or-move",
+			pendingOldPath: oldPath,
+			pendingNewPath: newPath,
+			pendingSetAt: now,
+			pendingRemoteOps: [{ op: "rename-or-move", oldPath, newPath, setAt: now }],
+		});
+		return Promise.resolve(true);
+	}
+
 	relocateRecordsByPrefix(scopeKey: string, oldPrefix: string, newPrefix: string): Promise<number> {
 		let moved = 0;
 		for (const record of [...this.records.values()]) {
@@ -926,6 +1153,21 @@ async function snapshotRemote(remote: MemoryXgkbFs): Promise<Record<string, stri
 	return Object.fromEntries(
 		listed.value.map((file) => [file.path, remote.content(file.path) ?? ""]).sort(([a], [b]) => a.localeCompare(b))
 	);
+}
+
+function isSyncCandidatePath(path: string, syncExtensions: readonly string[]): boolean {
+	return !pathHasDotFolder(path) && syncExtensions.includes(extensionOfPath(path));
+}
+
+function pathHasDotFolder(path: string): boolean {
+	const parts = path.split("/").filter(Boolean);
+	return parts.slice(0, -1).some((part) => part.startsWith("."));
+}
+
+function extensionOfPath(path: string): string {
+	const name = basename(path);
+	const dot = name.lastIndexOf(".");
+	return dot <= 0 || dot === name.length - 1 ? "" : name.slice(dot + 1).toLowerCase();
 }
 
 function key(scopeKey: string, localPath: string): string {

@@ -1745,7 +1745,15 @@ export class SyncEngine {
 
 		// rename/move 完成后检查内容是否在此次操作前已被修改（先 move 再上传，顺序不能颠倒）
 		const localChanged = local.mtime > record.localMtime + MTIME_TOLERANCE_MS;
-		if (localChanged) {
+		const remoteMtime = remote?.mtime ?? record.remoteMtime;
+		const remoteChanged =
+			remote?.xgkbFileId != null &&
+			remoteMtime > record.remoteMtime + MTIME_TOLERANCE_MS;
+		const shouldUploadLocal = localChanged && (!remoteChanged || local.mtime >= remoteMtime);
+		const shouldDownloadRemote = remoteChanged && !shouldUploadLocal;
+		let actualLocalMtime = local.mtime;
+		let actualRemoteMtime = remoteMtime;
+		if (shouldUploadLocal) {
 			const content = await this.fsLocal.readFile(path);
 			const fileName = path.split("/").pop() || path;
 			const updateResult = await this.fsXgkb.updateFile(fileId, fileName, content);
@@ -1756,13 +1764,21 @@ export class SyncEngine {
 			this.progress(`↻ 远端 → ${path}`);
 		}
 
-		const interimMtime = plan.remote?.mtime ?? record.remoteMtime;
+		if (shouldDownloadRemote && remote?.xgkbFileId) {
+			const bodyResult = await this.fsXgkb.readFile(remote.xgkbFileId);
+			if (!bodyResult.ok) throw new Error(`rename-remote remote content download failed: ${bodyResult.error}`);
+			actualLocalMtime = await this.fsLocal.writeFile(path, bodyResult.value);
+			actualRemoteMtime = remoteMtime;
+			this.successfulRemoteMtimes.push(remoteMtime);
+			this.stats.downloaded++;
+			this.progress(`Remote moved and content downloaded -> ${path}`);
+		}
 		await this.db.put(
 			this.buildDbRecord(path, {
 				xgkbFileId: fileId,
 				xgkbFolderId: record.xgkbFolderId,
-				localMtime: local.mtime,
-				remoteMtime: interimMtime,
+				localMtime: actualLocalMtime,
+				remoteMtime: actualRemoteMtime,
 				syncStatus: "done",
 			})
 		);
