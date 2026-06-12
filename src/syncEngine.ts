@@ -76,6 +76,8 @@ export class SyncEngine {
 	private remoteDeletedFileIds = new Set<string>();
 	private remoteDeletedFolderIds = new Set<string>();
 	private remoteDeletedLocalPaths = new Set<string>();
+	/** 本轮因跨目录 move / delete-remote 而可能被腾空的远端源目录 id（结束后确认为空再清理） */
+	private vacatedRemoteFolderIds = new Set<string>();
 
 	constructor(
 		fsLocal: FsLocal,
@@ -118,6 +120,7 @@ export class SyncEngine {
 		this.remoteDeletedFileIds = new Set();
 		this.remoteDeletedFolderIds = new Set();
 		this.remoteDeletedLocalPaths = new Set();
+		this.vacatedRemoteFolderIds = new Set();
 		this.progress = onProgress || (() => {});
 		const prog = (msg: string) => {
 			console.debug(`[XGKB Sync] ${msg}`);
@@ -152,6 +155,8 @@ export class SyncEngine {
 		const executionPlan = await this.planSync(localMap, remoteMap, prog);
 		await this.applyPlannedOps(executionPlan, prog);
 		this.emitTraceSnapshot(prog);
+
+		await this.cleanupVacatedRemoteFolders(prog);
 
 		await this.flushMtimeRefreshQueue();
 
@@ -1305,6 +1310,11 @@ export class SyncEngine {
 	}
 
 	private remotePathForRecord(record: SyncStateRecord, folderIdToPath: Map<string, string>): string {
+		// pending 远端 rename/move 时，远端文件仍停留在旧路径（本地已改名/移动，云端未变）。
+		// 必须用 pending.oldPath 还原真实云端路径，否则会用已改名的 localPath 重建，
+		// 导致同目录改名/目录移动被自身本地状态掩盖（reconcile 判定“已对齐”→ rename 永不推送）。
+		const pending = this.getEffectivePendingRemoteRename(this.getPendingRemoteRenameOps(record));
+		if (pending?.oldPath) return pending.oldPath;
 		const fileName = record.localPath.split("/").pop() || record.localPath;
 		const folderPath = this.resolveParentFolderPath(record.xgkbFolderId, folderIdToPath);
 		if (folderPath === undefined) return record.localPath;
@@ -1727,6 +1737,7 @@ export class SyncEngine {
 			if (!r.ok) throw new Error(r.error);
 			this.stats.renamed = (this.stats.renamed ?? 0) + 1;
 		} else {
+			const sourceFolderId = record.xgkbFolderId;
 			const folderResult = await this.fsXgkb.resolveFolderIdForRelativePath(newParent);
 			if (!folderResult.ok) throw new Error(folderResult.error);
 			const targetFolderId = folderResult.value;
@@ -1738,6 +1749,10 @@ export class SyncEngine {
 				if (!renameResult.ok) throw new Error(renameResult.error);
 			}
 			this.stats.moved = (this.stats.moved ?? 0) + 1;
+			// 文件移出后，源父目录可能变空，记入候选，本轮结束确认为空再清理。
+			if (sourceFolderId && sourceFolderId !== targetFolderId) {
+				this.vacatedRemoteFolderIds.add(sourceFolderId);
+			}
 			record = { ...record, xgkbFolderId: targetFolderId };
 		}
 
@@ -2013,8 +2028,34 @@ export class SyncEngine {
 		const result = await this.fsXgkb.deleteFile(record.xgkbFileId);
 		if (!result.ok) throw new Error(`删除云端失败: ${result.error}`);
 		await this.db.delete(this.scopeKey, record.localPath);
+		if (record.xgkbFolderId) this.vacatedRemoteFolderIds.add(record.xgkbFolderId);
 		this.stats.deleted++;
 		this.progress(`✗ 云端删除 ${record.localPath}`);
+	}
+
+	/** 本轮腾空的远端源目录：确认为空才删（逻辑删除，可恢复）。best-effort，不影响本轮成败。 */
+	private async cleanupVacatedRemoteFolders(prog: (msg: string) => void): Promise<void> {
+		if (this.vacatedRemoteFolderIds.size === 0) return;
+		const rootId = this.fsXgkb.getRootId();
+		const candidates = [...this.vacatedRemoteFolderIds];
+		this.vacatedRemoteFolderIds.clear();
+		for (const folderId of candidates) {
+			if (!folderId) continue;
+			// 不删同步根 / 知识库空间根
+			if (folderId === rootId || isKbSpaceParentId(folderId)) continue;
+			const emptyResult = await this.fsXgkb.isRemoteFolderEmpty(folderId);
+			if (!emptyResult.ok) {
+				console.warn(`[XGKB Sync] 空目录检查失败 folderId=${folderId}: ${emptyResult.error}`);
+				continue;
+			}
+			if (!emptyResult.value) continue; // 非空，确认条件不满足，跳过
+			const del = await this.fsXgkb.deleteRemoteFolder(folderId);
+			if (del.ok) {
+				prog(`✗ 清理空目录(远端) folderId=${folderId}`);
+			} else {
+				console.warn(`[XGKB Sync] 清理空目录失败 folderId=${folderId}: ${del.error}`);
+			}
+		}
 	}
 }
 

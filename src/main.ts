@@ -104,6 +104,16 @@ export default class XgkbSyncPlugin extends Plugin {
 						`[XGKB Sync] Vault 文件夹 rename: ${oldRel} → ${newRel}（已更新 ${moved} 条状态）`
 					);
 				}
+				// push/bidirectional：为子文件标记待推送远端动作，与文件级 rename 对称，
+				// 否则增量模式下目录移动会被本地状态掩盖（云端不动，残留空目录）。
+				if (this.settings.syncDirection !== "pull") {
+					const marked = await db.markPendingRemoteRenameByPrefix(scopeKey, oldRel, newRel);
+					if (marked > 0) {
+						console.debug(
+							`[XGKB Sync] Vault 文件夹 rename: 已标记 ${marked} 条待推送远端 rename/move`
+						);
+					}
+				}
 				return;
 			}
 

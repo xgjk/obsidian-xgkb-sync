@@ -460,6 +460,20 @@ export class FsXgkb {
 		);
 	}
 
+	/** 远端目录是否为空（无任何子文件/子目录） */
+	async isRemoteFolderEmpty(folderId: string): Promise<Result<boolean>> {
+		const r = await this.api.getChildFiles(folderId);
+		if (!r.ok) return { ok: false, error: r.error };
+		return { ok: true, value: (r.value || []).length === 0 };
+	}
+
+	/** 删除远端目录（逻辑删除，进回收站，幂等） */
+	async deleteRemoteFolder(folderId: string): Promise<Result<void>> {
+		return this.api.deleteFile(folderId).then((r) =>
+			r.ok ? { ok: true as const, value: undefined } : r
+		);
+	}
+
 	/**
 	 * 拉取所有增量变更（4.22）自动翻页，直到 nextCursor 为空。
 	 * @param since 毫秒时间戳（已含安全回拨）

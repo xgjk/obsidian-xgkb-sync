@@ -160,6 +160,33 @@ export class SyncStateDb {
 		return true;
 	}
 
+	/** 文件夹 rename/move：为 newPrefix 下每个 record 标记待推送远端动作（push/bidirectional）。
+	 *  与文件级 rename 对称，使目录移动在增量模式下也能被 reconcile 检测并推送到远端。
+	 */
+	async markPendingRemoteRenameByPrefix(
+		scopeKey: string,
+		oldPrefix: string,
+		newPrefix: string
+	): Promise<number> {
+		if (!oldPrefix || oldPrefix === newPrefix) return 0;
+		const all = await this.getAll(scopeKey);
+		let marked = 0;
+		for (const record of all) {
+			if (!pathUnderPrefix(record.localPath, newPrefix)) continue;
+			const suffix = record.localPath.slice(newPrefix.length);
+			const oldPath = `${oldPrefix}${suffix}`;
+			if (oldPath === record.localPath) continue;
+			const ok = await this.markPendingRemoteRenameOrMove(
+				scopeKey,
+				record.localPath,
+				oldPath,
+				record.localPath
+			);
+			if (ok) marked++;
+		}
+		return marked;
+	}
+
 	/** 文件夹 rename/move：批量更新 oldPrefix 下所有 record 的路径前缀 */
 	async relocateRecordsByPrefix(
 		scopeKey: string,

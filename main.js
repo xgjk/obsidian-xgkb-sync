@@ -1383,6 +1383,19 @@ var FsXgkb = class {
       (r) => r.ok ? { ok: true, value: void 0 } : r
     );
   }
+  /** 远端目录是否为空（无任何子文件/子目录） */
+  async isRemoteFolderEmpty(folderId) {
+    const r = await this.api.getChildFiles(folderId);
+    if (!r.ok)
+      return { ok: false, error: r.error };
+    return { ok: true, value: (r.value || []).length === 0 };
+  }
+  /** 删除远端目录（逻辑删除，进回收站，幂等） */
+  async deleteRemoteFolder(folderId) {
+    return this.api.deleteFile(folderId).then(
+      (r) => r.ok ? { ok: true, value: void 0 } : r
+    );
+  }
   /**
    * 拉取所有增量变更（4.22）自动翻页，直到 nextCursor 为空。
    * @param since 毫秒时间戳（已含安全回拨）
@@ -1839,6 +1852,8 @@ var SyncEngine = class {
     this.remoteDeletedFileIds = /* @__PURE__ */ new Set();
     this.remoteDeletedFolderIds = /* @__PURE__ */ new Set();
     this.remoteDeletedLocalPaths = /* @__PURE__ */ new Set();
+    /** 本轮因跨目录 move / delete-remote 而可能被腾空的远端源目录 id（结束后确认为空再清理） */
+    this.vacatedRemoteFolderIds = /* @__PURE__ */ new Set();
     this.fsLocal = fsLocal;
     this.fsXgkb = fsXgkb;
     this.db = db;
@@ -1871,6 +1886,7 @@ var SyncEngine = class {
     this.remoteDeletedFileIds = /* @__PURE__ */ new Set();
     this.remoteDeletedFolderIds = /* @__PURE__ */ new Set();
     this.remoteDeletedLocalPaths = /* @__PURE__ */ new Set();
+    this.vacatedRemoteFolderIds = /* @__PURE__ */ new Set();
     this.progress = onProgress || (() => {
     });
     const prog = (msg) => {
@@ -1903,6 +1919,7 @@ var SyncEngine = class {
     const executionPlan = await this.planSync(localMap, remoteMap, prog);
     await this.applyPlannedOps(executionPlan, prog);
     this.emitTraceSnapshot(prog);
+    await this.cleanupVacatedRemoteFolders(prog);
     await this.flushMtimeRefreshQueue();
     this.stats.newSince = this.computeCommittedWatermark(remoteBuild);
     prog(
@@ -2921,6 +2938,9 @@ var SyncEngine = class {
     return folderIdToPath.get(parentId);
   }
   remotePathForRecord(record, folderIdToPath) {
+    const pending = this.getEffectivePendingRemoteRename(this.getPendingRemoteRenameOps(record));
+    if (pending == null ? void 0 : pending.oldPath)
+      return pending.oldPath;
     const fileName = record.localPath.split("/").pop() || record.localPath;
     const folderPath = this.resolveParentFolderPath(record.xgkbFolderId, folderIdToPath);
     if (folderPath === void 0)
@@ -3316,6 +3336,7 @@ var SyncEngine = class {
         throw new Error(r.error);
       this.stats.renamed = ((_a = this.stats.renamed) != null ? _a : 0) + 1;
     } else {
+      const sourceFolderId = record.xgkbFolderId;
       const folderResult = await this.fsXgkb.resolveFolderIdForRelativePath(newParent);
       if (!folderResult.ok)
         throw new Error(folderResult.error);
@@ -3330,6 +3351,9 @@ var SyncEngine = class {
           throw new Error(renameResult.error);
       }
       this.stats.moved = ((_b = this.stats.moved) != null ? _b : 0) + 1;
+      if (sourceFolderId && sourceFolderId !== targetFolderId) {
+        this.vacatedRemoteFolderIds.add(sourceFolderId);
+      }
       record = { ...record, xgkbFolderId: targetFolderId };
     }
     const localChanged = local.mtime > record.localMtime + MTIME_TOLERANCE_MS;
@@ -3561,8 +3585,37 @@ var SyncEngine = class {
     if (!result.ok)
       throw new Error(`\u5220\u9664\u4E91\u7AEF\u5931\u8D25: ${result.error}`);
     await this.db.delete(this.scopeKey, record.localPath);
+    if (record.xgkbFolderId)
+      this.vacatedRemoteFolderIds.add(record.xgkbFolderId);
     this.stats.deleted++;
     this.progress(`\u2717 \u4E91\u7AEF\u5220\u9664 ${record.localPath}`);
+  }
+  /** 本轮腾空的远端源目录：确认为空才删（逻辑删除，可恢复）。best-effort，不影响本轮成败。 */
+  async cleanupVacatedRemoteFolders(prog) {
+    if (this.vacatedRemoteFolderIds.size === 0)
+      return;
+    const rootId = this.fsXgkb.getRootId();
+    const candidates = [...this.vacatedRemoteFolderIds];
+    this.vacatedRemoteFolderIds.clear();
+    for (const folderId of candidates) {
+      if (!folderId)
+        continue;
+      if (folderId === rootId || isKbSpaceParentId(folderId))
+        continue;
+      const emptyResult = await this.fsXgkb.isRemoteFolderEmpty(folderId);
+      if (!emptyResult.ok) {
+        console.warn(`[XGKB Sync] \u7A7A\u76EE\u5F55\u68C0\u67E5\u5931\u8D25 folderId=${folderId}: ${emptyResult.error}`);
+        continue;
+      }
+      if (!emptyResult.value)
+        continue;
+      const del = await this.fsXgkb.deleteRemoteFolder(folderId);
+      if (del.ok) {
+        prog(`\u2717 \u6E05\u7406\u7A7A\u76EE\u5F55(\u8FDC\u7AEF) folderId=${folderId}`);
+      } else {
+        console.warn(`[XGKB Sync] \u6E05\u7406\u7A7A\u76EE\u5F55\u5931\u8D25 folderId=${folderId}: ${del.error}`);
+      }
+    }
   }
 };
 function parentPathOf(relativePath) {
@@ -3799,6 +3852,32 @@ var SyncStateDb = class {
       lastSyncAt: Date.now()
     });
     return true;
+  }
+  /** 文件夹 rename/move：为 newPrefix 下每个 record 标记待推送远端动作（push/bidirectional）。
+   *  与文件级 rename 对称，使目录移动在增量模式下也能被 reconcile 检测并推送到远端。
+   */
+  async markPendingRemoteRenameByPrefix(scopeKey, oldPrefix, newPrefix) {
+    if (!oldPrefix || oldPrefix === newPrefix)
+      return 0;
+    const all = await this.getAll(scopeKey);
+    let marked = 0;
+    for (const record of all) {
+      if (!pathUnderPrefix2(record.localPath, newPrefix))
+        continue;
+      const suffix = record.localPath.slice(newPrefix.length);
+      const oldPath = `${oldPrefix}${suffix}`;
+      if (oldPath === record.localPath)
+        continue;
+      const ok = await this.markPendingRemoteRenameOrMove(
+        scopeKey,
+        record.localPath,
+        oldPath,
+        record.localPath
+      );
+      if (ok)
+        marked++;
+    }
+    return marked;
   }
   /** 文件夹 rename/move：批量更新 oldPrefix 下所有 record 的路径前缀 */
   async relocateRecordsByPrefix(scopeKey, oldPrefix, newPrefix) {
@@ -4102,6 +4181,14 @@ var XgkbSyncPlugin = class extends import_obsidian5.Plugin {
           console.debug(
             `[XGKB Sync] Vault \u6587\u4EF6\u5939 rename: ${oldRel} \u2192 ${newRel}\uFF08\u5DF2\u66F4\u65B0 ${moved2} \u6761\u72B6\u6001\uFF09`
           );
+        }
+        if (this.settings.syncDirection !== "pull") {
+          const marked = await db.markPendingRemoteRenameByPrefix(scopeKey, oldRel, newRel);
+          if (marked > 0) {
+            console.debug(
+              `[XGKB Sync] Vault \u6587\u4EF6\u5939 rename: \u5DF2\u6807\u8BB0 ${marked} \u6761\u5F85\u63A8\u9001\u8FDC\u7AEF rename/move`
+            );
+          }
         }
         return;
       }

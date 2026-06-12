@@ -1,1 +1,10 @@
 node_modules/
+
+# 本地机密与测试产物（切勿提交）
+.env
+.env.*
+test-results/
+.xgkb-sync-debug.log
+
+# 本地构建部署目标（各自机器不同，不进仓库）
+.deploy-target
