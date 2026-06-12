@@ -7,6 +7,7 @@ import {
 	DEFAULT_MOVE_NAME_CONFLICT_STRATEGY,
 	DEFAULT_RENAME_NAME_CONFLICT_STRATEGY,
 	KB_PROJECT_ROOT_FILE_ID,
+	MTIME_TOLERANCE_MS,
 } from "../../src/constants";
 import {
 	normalizeKbRelativePath,
@@ -86,8 +87,9 @@ describe("plugin sync with real cloud smoke", () => {
 				await expectRemoteContent(remote, localPath, "local v2\n");
 
 				let cloud = await expectRemoteEntry(remote, cloudPath);
+				await spaceForMtimeAdvance();
 				await expectOk(await remote.updateFile(cloud.xgkbFileId!, cloud.name, "cloud v2\n"));
-				await settle();
+				await waitForRemoteUpdate(remote, cloudPath, "cloud v2\n", cloud.mtime);
 				stats = await runSyncWithTransientRetry(engine);
 				expect(stats.failed).toBe(0);
 				expect(local.content(cloudPath)).toBe("cloud v2\n");
@@ -224,8 +226,9 @@ describe("plugin sync with real cloud smoke", () => {
 				expect(local.content(cloudPath)).toBe("cloud pull v1\n");
 
 				let cloud = await expectRemoteEntry(remote, cloudPath);
+				await spaceForMtimeAdvance();
 				await expectOk(await remote.updateFile(cloud.xgkbFileId!, cloud.name, "cloud pull v2\n"));
-				await settle();
+				await waitForRemoteUpdate(remote, cloudPath, "cloud pull v2\n", cloud.mtime);
 				stats = await runSyncWithTransientRetry(engine);
 				expect(stats.failed).toBe(0);
 				expect(local.content(cloudPath)).toBe("cloud pull v2\n");
@@ -862,6 +865,41 @@ async function expectRemoteEntry(remote: RealRemote, remotePath: string): Promis
 	return entry!;
 }
 
+// 内容更新后，引擎靠 listFiles 的 mtime(updateTime) 判定 download-update：
+// remote.mtime > record.remoteMtime + MTIME_TOLERANCE_MS。正文(readFile)反映 v2 早于
+// 列表 mtime 推进，因此必须轮询到列表 mtime 越过基线+容差，才与引擎触发条件对齐。
+async function waitForRemoteUpdate(
+	remote: RealRemote,
+	remotePath: string,
+	expected: string,
+	sinceMtime: number,
+	timeoutMs = 20_000
+): Promise<void> {
+	const minMtime = sinceMtime + MTIME_TOLERANCE_MS;
+	const deadline = Date.now() + timeoutMs;
+	let actual = "";
+	let listedMtime = sinceMtime;
+	while (Date.now() < deadline) {
+		const listed = await remote.listFiles();
+		await expectOk(listed);
+		const entry = listed.value.find((file) => file.path === remotePath);
+		if (entry?.xgkbFileId) {
+			listedMtime = entry.mtime;
+			const body = await remote.readFile(entry.xgkbFileId);
+			if (body.ok) {
+				actual = body.value;
+				if (actual === expected && listedMtime > minMtime) return;
+			}
+		}
+		await settle();
+	}
+	expect(actual, `remote content did not reach expected for ${remotePath}`).toBe(expected);
+	expect(
+		listedMtime > minMtime,
+		`remote listed mtime ${listedMtime} did not advance past ${minMtime} for ${remotePath}`
+	).toBe(true);
+}
+
 async function remoteHas(remote: RealRemote, remotePath: string): Promise<boolean> {
 	const listed = await remote.listFiles();
 	await expectOk(listed);
@@ -927,6 +965,13 @@ async function expectOk<T>(result: { ok: true; value: T } | { ok: false; error: 
 
 async function settle(): Promise<void> {
 	await new Promise((resolve) => setTimeout(resolve, 500));
+}
+
+// 云端 updateTime 为秒级粒度，且引擎下载判定为 remote.mtime > record.remoteMtime + 容差(=1000ms)。
+// 紧邻上次同步发生的更新，其 updateTime 只比基线高一个粒度，恰好落在 baseline+容差 上而被判为未变更。
+// 在更新前留出 >2×容差 的间隔，确保新的 updateTime 严格越过 baseline+容差。
+async function spaceForMtimeAdvance(): Promise<void> {
+	await new Promise((resolve) => setTimeout(resolve, 2 * MTIME_TOLERANCE_MS + 200));
 }
 
 async function runSyncWithTransientRetry(
