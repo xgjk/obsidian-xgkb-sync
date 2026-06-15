@@ -1,4 +1,4 @@
-import type { XgkbPluginSettings, SyncScopeEntry, SyncScopeFingerprint } from "./types";
+import type { XgkbPluginSettings, SyncScopeFingerprint } from "./types";
 import { normalizeTargetFolderPath, resolveTargetFolderConfig } from "./pathSanitize";
 
 export const DATA_SCHEMA_VERSION = 2;

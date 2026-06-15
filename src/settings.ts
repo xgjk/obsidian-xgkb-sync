@@ -84,7 +84,7 @@ export class XgkbPluginSettingTab extends PluginSettingTab {
 			)
 			.addText((text) => {
 				text
-					.setPlaceholder("留空=整个空间根，或 Obsidian / A/B")
+					.setPlaceholder("留空=整个空间根，或 Obsidian / a/b")
 					.setValue(this.plugin.settings.targetFolderName);
 				let lastTargetFolder = normalizeTargetFolderPath(
 					this.plugin.settings.targetFolderName
@@ -150,7 +150,7 @@ export class XgkbPluginSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-			.setName("保护本地文件（Pull / 双向）")
+			.setName("保护本地文件（pull / 双向）")
 			.setDesc(
 				"开启（推荐）：仅当云端明确删除该文件时才删本地；删除时移入 Obsidian 回收站（含点文件）。" +
 					"关闭：远端列表缺项时也可能删本地（有误删风险）。仅影响 Pull / 双向，Push 不受影响。"

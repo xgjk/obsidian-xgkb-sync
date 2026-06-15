@@ -1,5 +1,4 @@
 import type { XgkbPluginSettings } from "./types";
-import { normalizeSyncExtensions } from "./syncFileTypes";
 
 export const DEFAULT_SETTINGS: XgkbPluginSettings = {
 	appKey: "",

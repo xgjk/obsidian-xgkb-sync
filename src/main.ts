@@ -19,8 +19,12 @@ import { normalizeSyncExtensions } from "./syncFileTypes";
 import { SyncProgressNotice } from "./syncProgressNotice";
 
 function stripPersistedMeta(raw: Record<string, unknown>): Partial<XgkbPluginSettings> {
-	const { lastSyncTime, dataSchemaVersion, activeScopeKey, syncScopes, ...rest } = raw;
-	return rest as Partial<XgkbPluginSettings>;
+	const rest = { ...raw };
+	delete rest.lastSyncTime;
+	delete rest.dataSchemaVersion;
+	delete rest.activeScopeKey;
+	delete rest.syncScopes;
+	return rest;
 }
 
 export default class XgkbSyncPlugin extends Plugin {
@@ -292,7 +296,7 @@ export default class XgkbSyncPlugin extends Plugin {
 		if (this.isSyncing) {
 			console.debug("[XGKB Sync] 上次同步仍在进行，跳过本次触发");
 			if (!options?.quietIfBusy) {
-				new Notice("XGKB Sync: 同步进行中，请勿重复点击", 5000);
+				new Notice("Xgkb sync: 同步进行中，请勿重复点击", 5000);
 			}
 			return;
 		}

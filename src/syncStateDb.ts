@@ -216,15 +216,7 @@ export class SyncStateDb {
 			if (!record.pendingRemoteOp && (!record.pendingRemoteOps || record.pendingRemoteOps.length === 0)) {
 				continue;
 			}
-			const {
-				pendingRemoteOp,
-				pendingOldPath,
-				pendingNewPath,
-				pendingSetAt,
-				pendingRemoteOps,
-				...rest
-			} = record;
-			await this.put({ ...rest, lastSyncAt: Date.now() });
+			await this.put({ ...clearPendingRemoteFields(record), lastSyncAt: Date.now() });
 		}
 	}
 
@@ -235,15 +227,7 @@ export class SyncStateDb {
 		if (!record.pendingRemoteOp && (!record.pendingRemoteOps || record.pendingRemoteOps.length === 0)) {
 			return;
 		}
-		const {
-			pendingRemoteOp,
-			pendingOldPath,
-			pendingNewPath,
-			pendingSetAt,
-			pendingRemoteOps,
-			...rest
-		} = record;
-		await this.put({ ...rest, lastSyncAt: Date.now() });
+		await this.put({ ...clearPendingRemoteFields(record), lastSyncAt: Date.now() });
 	}
 
 	private normalizePendingQueue(record: SyncStateRecord): PendingRemoteRenameOp[] {
@@ -335,4 +319,14 @@ export class SyncStateDb {
 
 function pathUnderPrefix(localPath: string, prefix: string): boolean {
 	return localPath === prefix || localPath.startsWith(`${prefix}/`);
+}
+
+function clearPendingRemoteFields(record: SyncStateRecord): SyncStateRecord {
+	const next = { ...record };
+	delete next.pendingRemoteOp;
+	delete next.pendingOldPath;
+	delete next.pendingNewPath;
+	delete next.pendingSetAt;
+	delete next.pendingRemoteOps;
+	return next;
 }

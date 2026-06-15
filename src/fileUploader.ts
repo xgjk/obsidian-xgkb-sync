@@ -1,3 +1,4 @@
+import { requestUrl } from "obsidian";
 import { XgkbApi } from "./xgkbApi";
 import type { Result } from "./types";
 import {
@@ -159,10 +160,16 @@ export class FileUploader {
 
 	private async putToMinIO(url: string, data: Uint8Array): Promise<Result<void>> {
 		try {
-			const resp = await fetch(url, { method: "PUT", body: data as BodyInit });
-			if (!resp.ok) {
-				const text = await resp.text().catch(() => "");
-				return { ok: false, error: `HTTP ${resp.status}: ${text.slice(0, 200)}` };
+			const body = new ArrayBuffer(data.byteLength);
+			new Uint8Array(body).set(data);
+			const resp = await requestUrl({
+				url,
+				method: "PUT",
+				body,
+				throw: false,
+			});
+			if (resp.status < 200 || resp.status >= 300) {
+				return { ok: false, error: `HTTP ${resp.status}: ${resp.text.slice(0, 200)}` };
 			}
 			return { ok: true, value: undefined };
 		} catch (e) {

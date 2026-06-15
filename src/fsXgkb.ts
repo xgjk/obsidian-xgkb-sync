@@ -1,3 +1,4 @@
+import { requestUrl } from "obsidian";
 import { XgkbApi } from "./xgkbApi";
 import { FileUploader } from "./fileUploader";
 import type { FileEntry, Result, XgkbChangeItem, XgkbMetaItem, MoveFileResult } from "./types";
@@ -233,14 +234,13 @@ export class FsXgkb {
 				await this.delay(RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1));
 			}
 			try {
-				const resp = await fetch(downloadUrl);
-				if (!resp.ok) {
-					lastError = `OSS HTTP ${resp.status}: ${resp.statusText}`;
+				const resp = await requestUrl({ url: downloadUrl, method: "GET", throw: false });
+				if (resp.status < 200 || resp.status >= 300) {
+					lastError = `OSS HTTP ${resp.status}`;
 					if (this.isRetriableHttp(resp.status)) continue;
 					return { ok: false, error: lastError };
 				}
-				const text = await resp.text();
-				return { ok: true, value: text };
+				return { ok: true, value: resp.text };
 			} catch (e) {
 				lastError = e instanceof Error ? e.message : String(e);
 			}

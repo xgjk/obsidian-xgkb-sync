@@ -13,21 +13,6 @@ function isDotHiddenRelativePath(relativePath: string): boolean {
 	return base.startsWith(".");
 }
 
-/** FileSystemAdapter：vault 相对路径 → 磁盘绝对路径 */
-interface FileSystemAdapterLike {
-	getFullPath(normalizedPath: string): string;
-}
-
-function tryRequireFs(): typeof import("fs") | null {
-	try {
-		// 动态加载：移动端无 fs，避免插件启动失败
-		// eslint-disable-next-line @typescript-eslint/no-require-imports
-		return require("fs") as typeof import("fs");
-	} catch {
-		return null;
-	}
-}
-
 /**
  * 本地文件系统操作（Vault API 封装）
  */
@@ -102,17 +87,6 @@ export class FsLocal {
 	 * 列举目录下文件名。子目录中的点文件 Obsidian adapter.list 常漏报，桌面端改读磁盘。
 	 */
 	private async listFileNamesInVaultDir(normalizedDir: string): Promise<string[]> {
-		const adapter = this.app.vault.adapter as Partial<FileSystemAdapterLike>;
-		const fs = tryRequireFs();
-		if (typeof adapter.getFullPath === "function" && fs?.promises?.readdir) {
-			try {
-				const diskDir = adapter.getFullPath(normalizedDir);
-				const dirents = await fs.promises.readdir(diskDir, { withFileTypes: true });
-				return dirents.filter((d) => d.isFile()).map((d) => d.name);
-			} catch {
-				// 回退 adapter.list
-			}
-		}
 		try {
 			const listed = await this.app.vault.adapter.list(normalizedDir);
 			return listed.files;
@@ -370,7 +344,7 @@ export class FsLocal {
 		if (!lock) {
 			lock = this.createFolderSegment(normalized);
 			this.folderEnsureLocks.set(normalized, lock);
-			lock.finally(() => {
+			void lock.finally(() => {
 				if (this.folderEnsureLocks.get(normalized) === lock) {
 					this.folderEnsureLocks.delete(normalized);
 				}
